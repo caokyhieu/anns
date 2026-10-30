@@ -1,0 +1,358 @@
+{
+ "config": {
+  "n": 200000,
+  "dim": 64,
+  "clusters": 400,
+  "M": 16,
+  "ef_construction": 200,
+  "k": 100,
+  "beams": [
+   200,
+   800
+  ],
+  "entries": 8,
+  "queries": 30,
+  "partitions": 256,
+  "nprobes": 16,
+  "seed": 7,
+  "output": "filtered-graph-results.json"
+ },
+ "results": [
+  {
+   "filter": "none",
+   "relation": "uncorrelated",
+   "selectivity": 1.0,
+   "passing_rows": 200000,
+   "flat_work": 200000,
+   "ivf_planner_work": 12500,
+   "hnswlib@200": {
+    "recall": 0.999,
+    "filter_calls": 326,
+    "ms": 0.3
+   },
+   "traverse@200": {
+    "recall": 0.999,
+    "work": 797
+   },
+   "strict@200": {
+    "recall": 0.999,
+    "work": 800
+   },
+   "acorn@200": {
+    "recall": 0.999,
+    "work": 782
+   },
+   "hnswlib@800": {
+    "recall": 0.999,
+    "filter_calls": 1211,
+    "ms": 1.1
+   },
+   "traverse@800": {
+    "recall": 0.999,
+    "work": 2391
+   },
+   "strict@800": {
+    "recall": 0.999,
+    "work": 2386
+   },
+   "acorn@800": {
+    "recall": 0.999,
+    "work": 2379
+   }
+  },
+  {
+   "filter": "weather = 'rain'",
+   "relation": "uncorrelated",
+   "selectivity": 0.20006,
+   "passing_rows": 40013,
+   "flat_work": 40013,
+   "ivf_planner_work": 62500,
+   "hnswlib@200": {
+    "recall": 0.999,
+    "filter_calls": 1483,
+    "ms": 1.4
+   },
+   "traverse@200": {
+    "recall": 0.999,
+    "work": 3043
+   },
+   "strict@200": {
+    "recall": 0.693,
+    "work": 464
+   },
+   "acorn@200": {
+    "recall": 0.999,
+    "work": 1418
+   },
+   "hnswlib@800": {
+    "recall": 0.999,
+    "filter_calls": 6263,
+    "ms": 5.1
+   },
+   "traverse@800": {
+    "recall": 0.999,
+    "work": 12490
+   },
+   "strict@800": {
+    "recall": 0.851,
+    "work": 1333
+   },
+   "acorn@800": {
+    "recall": 0.999,
+    "work": 4856
+   }
+  },
+  {
+   "filter": "pedestrian (10%)",
+   "relation": "uncorrelated",
+   "selectivity": 0.10003,
+   "passing_rows": 20007,
+   "flat_work": 20007,
+   "ivf_planner_work": 125000,
+   "hnswlib@200": {
+    "recall": 0.998,
+    "filter_calls": 3223,
+    "ms": 2.6
+   },
+   "traverse@200": {
+    "recall": 0.998,
+    "work": 6710
+   },
+   "strict@200": {
+    "recall": 0.096,
+    "work": 295
+   },
+   "acorn@200": {
+    "recall": 0.986,
+    "work": 997
+   },
+   "hnswlib@800": {
+    "recall": 1.0,
+    "filter_calls": 12240,
+    "ms": 10.5
+   },
+   "traverse@800": {
+    "recall": 1.0,
+    "work": 22564
+   },
+   "strict@800": {
+    "recall": 0.145,
+    "work": 956
+   },
+   "acorn@800": {
+    "recall": 1.0,
+    "work": 3188
+   }
+  },
+  {
+   "filter": "cut_in (1%)",
+   "relation": "uncorrelated",
+   "selectivity": 0.00984,
+   "passing_rows": 1969,
+   "flat_work": 1969,
+   "ivf_planner_work": 200000,
+   "hnswlib@200": {
+    "recall": 0.999,
+    "filter_calls": 29520,
+    "ms": 25.4
+   },
+   "traverse@200": {
+    "recall": 0.999,
+    "work": 48079
+   },
+   "strict@200": {
+    "recall": 0.007,
+    "work": 10
+   },
+   "acorn@200": {
+    "recall": 0.293,
+    "work": 272
+   },
+   "hnswlib@800": {
+    "recall": 1.0,
+    "filter_calls": 99073,
+    "ms": 103.0
+   },
+   "traverse@800": {
+    "recall": 1.0,
+    "work": 125577
+   },
+   "strict@800": {
+    "recall": 0.005,
+    "work": 9
+   },
+   "acorn@800": {
+    "recall": 0.502,
+    "work": 815
+   }
+  },
+  {
+   "filter": "rain AND cut_in",
+   "relation": "uncorrelated",
+   "selectivity": 0.00199,
+   "passing_rows": 399,
+   "flat_work": 399,
+   "ivf_planner_work": 200000,
+   "hnswlib@200": {
+    "recall": 1.0,
+    "filter_calls": 117541,
+    "ms": 105.6
+   },
+   "traverse@200": {
+    "recall": 1.0,
+    "work": 142300
+   },
+   "strict@200": {
+    "recall": 0.019,
+    "work": 8
+   },
+   "acorn@200": {
+    "recall": 0.033,
+    "work": 12
+   },
+   "hnswlib@800": {
+    "recall": 1.0,
+    "filter_calls": 199896,
+    "ms": 198.1
+   },
+   "traverse@800": {
+    "recall": 1.0,
+    "work": 199896
+   },
+   "strict@800": {
+    "recall": 0.023,
+    "work": 8
+   },
+   "acorn@800": {
+    "recall": 0.03,
+    "work": 12
+   }
+  },
+  {
+   "filter": "emergency_vehicle (0.1%)",
+   "relation": "uncorrelated",
+   "selectivity": 0.00097,
+   "passing_rows": 193,
+   "flat_work": 193,
+   "ivf_planner_work": 200000,
+   "hnswlib@200": {
+    "recall": 1.0,
+    "filter_calls": 199896,
+    "ms": 192.9
+   },
+   "traverse@200": {
+    "recall": 1.0,
+    "work": 199896
+   },
+   "strict@200": {
+    "recall": 0.045,
+    "work": 8
+   },
+   "acorn@200": {
+    "recall": 0.052,
+    "work": 9
+   },
+   "hnswlib@800": {
+    "recall": 1.0,
+    "filter_calls": 199896,
+    "ms": 187.3
+   },
+   "traverse@800": {
+    "recall": 1.0,
+    "work": 199896
+   },
+   "strict@800": {
+    "recall": 0.039,
+    "work": 8
+   },
+   "acorn@800": {
+    "recall": 0.044,
+    "work": 9
+   }
+  },
+  {
+   "filter": "tunnel, query inside",
+   "relation": "correlated",
+   "selectivity": 0.00995,
+   "passing_rows": 1989,
+   "flat_work": 1989,
+   "ivf_planner_work": 200000,
+   "hnswlib@200": {
+    "recall": 1.0,
+    "filter_calls": 337,
+    "ms": 0.2
+   },
+   "traverse@200": {
+    "recall": 1.0,
+    "work": 785
+   },
+   "strict@200": {
+    "recall": 0.966,
+    "work": 507
+   },
+   "acorn@200": {
+    "recall": 1.0,
+    "work": 513
+   },
+   "hnswlib@800": {
+    "recall": 1.0,
+    "filter_calls": 29281,
+    "ms": 19.6
+   },
+   "traverse@800": {
+    "recall": 1.0,
+    "work": 47364
+   },
+   "strict@800": {
+    "recall": 1.0,
+    "work": 1034
+   },
+   "acorn@800": {
+    "recall": 1.0,
+    "work": 1045
+   }
+  },
+  {
+   "filter": "tunnel, query outside",
+   "relation": "anti-correlated",
+   "selectivity": 0.00995,
+   "passing_rows": 1989,
+   "flat_work": 1989,
+   "ivf_planner_work": 200000,
+   "hnswlib@200": {
+    "recall": 0.987,
+    "filter_calls": 34657,
+    "ms": 26.0
+   },
+   "traverse@200": {
+    "recall": 0.987,
+    "work": 50721
+   },
+   "strict@200": {
+    "recall": 0.833,
+    "work": 614
+   },
+   "acorn@200": {
+    "recall": 0.951,
+    "work": 635
+   },
+   "hnswlib@800": {
+    "recall": 1.0,
+    "filter_calls": 76122,
+    "ms": 64.8
+   },
+   "traverse@800": {
+    "recall": 1.0,
+    "work": 100718
+   },
+   "strict@800": {
+    "recall": 0.995,
+    "work": 1231
+   },
+   "acorn@800": {
+    "recall": 1.0,
+    "work": 1336
+   }
+  }
+ ]
+}

@@ -194,11 +194,104 @@ queries people actually run.
 | Rare scenarios found by filtering the main table | Materialized per-label sub-tables, rebuilt per annotation release |
 | "Hybrid" = vector + metadata | Labels are hard constraints; text and vectors are fused only inside them |
 | Batch lookup after the vector search | Batch mining jobs evaluate the constraint first, then score |
+| One vector index type per column | Add a filtered graph (in-search or ACORN-style) on the hot tier for broad filters (§6) |
+
+## 6. Filtered search inside a graph index (HNSW, DiskANN, ACORN)
+
+Graph indexes offer filtering in three different ways, and they behave very differently:
+
+| Approach | Where | How it filters | What it needs |
+| --- | --- | --- | --- |
+| **In-search filter** | hnswlib `filter=`, FAISS `IDSelector`, most vector DBs | Walks the normal graph through every node, keeps only passing nodes as results, stops once it holds `ef` passing nodes | Nothing at build time; any predicate |
+| **Predicate-agnostic denser graph (ACORN)** | ACORN (SIGMOD 2024); Weaviate implements it | Walks only passing nodes, plus 2-hop expansion through failing neighbors; the graph is built γ× denser so the passing subgraph stays connected down to s ≈ 1/γ | γ× more edges; any predicate |
+| **Label-aware construction (Filtered-DiskANN)** | FilteredVamana / StitchedVamana (WWW 2023); Qdrant's payload-aware extra edges are similar | Edges are kept per label during build, and each label has its own entry point | Labels known at build time; equality on one label (or an OR of labels); graph edits when a label changes |
+
+### Measured (`filtered_graph_experiment.py`)
+
+Same 200,000 rows and filters as §2. hnswlib builds an HNSW graph (M = 16,
+ef_construction = 200). `hnswlib` is the library's own filtered search. The other three
+are re-implemented on hnswlib's base-layer graph so their work can be counted in
+**distance computations**: `traverse` (hnswlib's rule), `strict` (walk passing nodes
+only, i.e. the graph is not built for the filter), and `acorn` (strict plus 2-hop
+expansion, ACORN-1 on an ordinary HNSW graph, γ = 1). Strict and acorn start from 8
+passing nodes, as Filtered-DiskANN's per-label entry points would. Cells are
+**recall@100 / distance computations per query** at ef = 200; for hnswlib the second
+number is filter-callback calls, followed by median ms. The two right columns are the
+work of the plans from §2 (flat = passing rows; IVF planner = rows in 16/s probed
+partitions of 256).
+
+| Filter | hnswlib | traverse | strict | acorn (γ = 1) | flat | IVF planner |
+| --- | --- | --- | --- | --- | ---: | ---: |
+| none | 0.999 / 326 / 0.3 ms | 0.999 / 797 | 0.999 / 800 | 0.999 / 782 | 200,000 | 12,500 |
+| `weather = 'rain'` (20%) | 0.999 / 1,483 / 1.4 ms | 0.999 / 3,043 | 0.69 / 464 | 0.999 / 1,418 | 40,013 | 62,500 |
+| `pedestrian` (10%) | 0.998 / 3,223 / 2.6 ms | 0.998 / 6,710 | 0.10 / 295 | 0.986 / 997 | 20,007 | 125,000 |
+| `cut_in` (1%) | 0.999 / 29,520 / 25 ms | 0.999 / 48,079 | 0.01 / 10 | 0.29 / 272 | 1,969 | 200,000 |
+| `rain AND cut_in` (0.2%) | 1.00 / 117,541 / 106 ms | 1.00 / 142,300 | 0.02 / 8 | 0.03 / 12 | 399 | 200,000 |
+| `emergency_vehicle` (0.1%) | 1.00 / 199,896 / 193 ms | 1.00 / 199,896 | 0.05 / 8 | 0.05 / 9 | 193 | 200,000 |
+| `tunnel` (1%), query inside | 1.00 / 337 / 0.2 ms | 1.00 / 785 | 0.97 / 507 | 1.00 / 513 | 1,989 | 200,000 |
+| `tunnel` (1%), query outside | 0.987 / 34,657 / 26 ms | 0.987 / 50,721 | 0.83 / 614 | 0.95 / 635 | 1,989 | 200,000 |
+
+With ef = 800 (in `filtered-graph-results.json`), acorn reaches 0.50 on `cut_in`
+and 1.00 on `tunnel` outside, while hnswlib's work on `cut_in` grows to 99,073.
+
+### What it shows
+
+1. **For broad filters (≥ ~10%), a filtered graph is the best plan by far.** hnswlib keeps
+   recall ≈ 1.0 with 1.5–3k evaluations, against 40–125k rows for the IVF planner.
+   ACORN-style search is cheaper still (1.0k at 10%). This is the range where Lance's
+   prefiltered IVF lost recall in §2.
+2. **In-search filtering never loses recall, but its work grows as about ef / s.** It
+   stops only after collecting `ef` passing nodes, so at 1% it evaluates 30k nodes, and
+   when fewer than `ef` rows pass at all (0.1%) it walks **the entire graph**:
+   200k evaluations to return 193 rows that a bitmap plus flat scan finds with 193
+   distance computations.
+3. **Walking only the passing subgraph breaks on uncorrelated labels.** An ordinary HNSW
+   graph has no reason to connect rows that share `pedestrian`, so strict search finds
+   0.10 recall at 10%. It works when the label is correlated with the embedding
+   (`tunnel`: rows that share the label are also neighbors), especially with a passing
+   entry point, which is exactly the Filtered-DiskANN observation.
+4. **2-hop expansion (ACORN) fixes the 10–20% range on an ordinary graph, not the 1%
+   range.** ACORN gets to low selectivity by building the graph γ× denser (γ ≈ 1/s_min),
+   which multiplies the graph's memory by γ: for s_min = 1%, roughly 100× the edges of a
+   normal graph, or an aggressive compromise between γ and a flat fallback. The ACORN
+   paper itself falls back to pre-filtering below 1/γ.
+
+### Can we just use it in the indexing layer?
+
+Yes, as **one of the planner's plans**, not as a replacement for the planner:
+
+| Selectivity of the filter | Best plan |
+| --- | --- |
+| ≥ ~10% (weather, road type, day/night, verified, region) | Filtered graph search (in-search filter, or ACORN-style) |
+| ~1–10% | ACORN with γ sized for this range, a per-label sub-index (§4.3), or IVF with nprobes ∝ 1/s |
+| below the flat threshold | Bitmap → exact scan of the passing rows |
+| Time and geography ranges | Partition pruning (§4.2); range-filtered graphs exist (SeRF, iRangeGraph) but are not needed when data is written in time order |
+
+Things specific to this workload that limit graph filtering:
+- **Labels change; vectors do not.** Every annotation release edits labels. In-search
+  filtering and ACORN do not use labels at build time, so a label edit only changes the
+  bitmap. Label-aware graphs (Filtered-DiskANN, payload-edge schemes) must re-link
+  nodes on every label change, and only support single-label or OR filters, not the
+  conjunctions (`rain AND cut_in AND verified`) the queries actually use. For this
+  dataset, choose the predicate-agnostic kind.
+- **Graphs want RAM or local NVMe.** Each hop is a dependent random read. On object
+  storage (where the Lance tables live) that is one round trip per hop. A filtered
+  graph belongs on the hot, interactive tier (per-shard graphs held in memory or on
+  NVMe, as in Lance Enterprise's cache), not on the cold petabyte table. DISTRIBUTED.md
+  covers why a single graph across shards is hard.
+- **Batch mining jobs still prefer posting lists.** A graph walk serves one query at a
+  time; a training job with thousands of seed queries and k in the thousands is cheaper
+  as filter-first plus a posting-major scan (§4.5, RETRIEVAL_DESIGN.md §4.3).
+- **On Lance, check what `IVF_HNSW_SQ` / `IVF_HNSW_PQ` do with a prefilter before relying
+  on it.** There HNSW lives inside each IVF partition, so the partitions to probe are
+  still chosen without looking at the filter (the §2 problem), whatever the HNSW search
+  inside them does.
 
 ## Run
 
 ```bash
 uv run --locked --extra lance python filtered_search_experiment.py   # writes filtered-search-results.json
+uv run --locked --extra lance --extra compare python filtered_graph_experiment.py   # writes filtered-graph-results.json
 ```
 
 Options: `--n`, `--dim`, `--clusters`, `--partitions`, `--nprobes`, `--k`, `--queries`,

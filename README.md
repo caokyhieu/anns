@@ -210,7 +210,8 @@ partition assignment (same recall and QPS, up to 33x faster assignment);
 ivf_build_experiment.py measures it against pylance, and hier_build_experiment.py
 tests local leaf training and boundary spilling. FILTERED_SEARCH.md measures hybrid
 (label filter + vector) search on Lance against filter selectivity and correlation, and
-lists the planner, layout and sub-index changes it implies (filtered_search_experiment.py):
+lists the planner, layout and sub-index changes it implies (filtered_search_experiment.py);
+filtered_graph_experiment.py compares in-graph filtering (hnswlib, strict, ACORN-style):
 
 ```bash
 uv run --locked python -m unittest -v test_dpipnn
@@ -220,6 +221,7 @@ uv run --locked --extra lance python lance_pipeline_demo.py
 uv run --locked --extra compare --extra lance python ivf_build_experiment.py --lance
 uv run --locked python hier_build_experiment.py    # writes hier-build-results.json
 uv run --locked --extra lance python filtered_search_experiment.py
+uv run --locked --extra lance --extra compare python filtered_graph_experiment.py
 ```
 
 ## Limitations
