@@ -1,0 +1,190 @@
+{
+  "parameters": {
+    "seeds": [
+      7,
+      19
+    ],
+    "n": 500,
+    "dim": 16,
+    "queries": 40,
+    "batch": 25,
+    "beam": 48,
+    "output": "results.json"
+  },
+  "python": "3.12.3",
+  "numpy": "2.5.4",
+  "runs": [
+    {
+      "seed": 7,
+      "rows": [
+        {
+          "stage": "build",
+          "n": 500,
+          "operations": 0,
+          "operation_seconds": 0.733187620062381,
+          "mean_mutation_ms": null,
+          "recall_at_10": 1.0,
+          "rebuilt_recall_at_10": 1.0,
+          "rebuild_seconds": 0.7402408770285547,
+          "query_ms": 1.1506006238050759,
+          "mean_graph_distance_evaluations": 269.825,
+          "max_degree": 24,
+          "max_leaf_size": 61,
+          "invariant_checks": "passed"
+        },
+        {
+          "stage": "add",
+          "n": 525,
+          "operations": 25,
+          "operation_seconds": 1.8670492232777178,
+          "mean_mutation_ms": 74.68196893110871,
+          "recall_at_10": 1.0,
+          "rebuilt_recall_at_10": 1.0,
+          "rebuild_seconds": 0.7795224250294268,
+          "query_ms": 1.160826871637255,
+          "mean_graph_distance_evaluations": 274.9,
+          "max_degree": 24,
+          "max_leaf_size": 64,
+          "invariant_checks": "passed"
+        },
+        {
+          "stage": "delete",
+          "n": 500,
+          "operations": 25,
+          "operation_seconds": 1.8432430592365563,
+          "mean_mutation_ms": 73.72972236946225,
+          "recall_at_10": 1.0,
+          "rebuilt_recall_at_10": 1.0,
+          "rebuild_seconds": 0.7111711781471968,
+          "query_ms": 1.1520766303874552,
+          "mean_graph_distance_evaluations": 270.425,
+          "max_degree": 24,
+          "max_leaf_size": 63,
+          "invariant_checks": "passed"
+        },
+        {
+          "stage": "update",
+          "n": 500,
+          "operations": 25,
+          "operation_seconds": 2.729954117909074,
+          "mean_mutation_ms": 109.19816471636295,
+          "recall_at_10": 1.0,
+          "rebuilt_recall_at_10": 1.0,
+          "rebuild_seconds": 0.7188442349433899,
+          "query_ms": 1.1472843820229173,
+          "mean_graph_distance_evaluations": 270.1,
+          "max_degree": 24,
+          "max_leaf_size": 71,
+          "invariant_checks": "passed"
+        },
+        {
+          "stage": "churn",
+          "n": 501,
+          "operations": 25,
+          "operation_seconds": 1.696882243733853,
+          "mean_mutation_ms": 67.87528974935412,
+          "recall_at_10": 1.0,
+          "rebuilt_recall_at_10": 1.0,
+          "rebuild_seconds": 0.7317603779956698,
+          "query_ms": 1.1524301255121827,
+          "mean_graph_distance_evaluations": 268.025,
+          "max_degree": 24,
+          "max_leaf_size": 77,
+          "invariant_checks": "passed"
+        }
+      ],
+      "monitoring": {
+        "recall": 1.0,
+        "mean_distance_evaluations": 268.025,
+        "rebuild_recommended": false,
+        "rebuilt": false
+      }
+    },
+    {
+      "seed": 19,
+      "rows": [
+        {
+          "stage": "build",
+          "n": 500,
+          "operations": 0,
+          "operation_seconds": 0.7148728603497148,
+          "mean_mutation_ms": null,
+          "recall_at_10": 1.0,
+          "rebuilt_recall_at_10": 1.0,
+          "rebuild_seconds": 0.7077185730449855,
+          "query_ms": 1.132008375134319,
+          "mean_graph_distance_evaluations": 263.35,
+          "max_degree": 24,
+          "max_leaf_size": 61,
+          "invariant_checks": "passed"
+        },
+        {
+          "stage": "add",
+          "n": 525,
+          "operations": 25,
+          "operation_seconds": 2.100723478011787,
+          "mean_mutation_ms": 84.02893912047148,
+          "recall_at_10": 1.0,
+          "rebuilt_recall_at_10": 1.0,
+          "rebuild_seconds": 0.7111264360137284,
+          "query_ms": 1.147069118451327,
+          "mean_graph_distance_evaluations": 268.35,
+          "max_degree": 24,
+          "max_leaf_size": 67,
+          "invariant_checks": "passed"
+        },
+        {
+          "stage": "delete",
+          "n": 500,
+          "operations": 25,
+          "operation_seconds": 2.105160901322961,
+          "mean_mutation_ms": 84.20643605291843,
+          "recall_at_10": 1.0,
+          "rebuilt_recall_at_10": 1.0,
+          "rebuild_seconds": 0.717912623193115,
+          "query_ms": 1.1215936043299735,
+          "mean_graph_distance_evaluations": 260.775,
+          "max_degree": 24,
+          "max_leaf_size": 64,
+          "invariant_checks": "passed"
+        },
+        {
+          "stage": "update",
+          "n": 500,
+          "operations": 25,
+          "operation_seconds": 3.206724578049034,
+          "mean_mutation_ms": 128.26898312196136,
+          "recall_at_10": 1.0,
+          "rebuilt_recall_at_10": 1.0,
+          "rebuild_seconds": 0.6991094537079334,
+          "query_ms": 1.1232318240217865,
+          "mean_graph_distance_evaluations": 261.125,
+          "max_degree": 24,
+          "max_leaf_size": 68,
+          "invariant_checks": "passed"
+        },
+        {
+          "stage": "churn",
+          "n": 501,
+          "operations": 25,
+          "operation_seconds": 1.706534659024328,
+          "mean_mutation_ms": 68.26138636097312,
+          "recall_at_10": 1.0,
+          "rebuilt_recall_at_10": 1.0,
+          "rebuild_seconds": 0.6637834892608225,
+          "query_ms": 1.1272041010670364,
+          "mean_graph_distance_evaluations": 257.95,
+          "max_degree": 24,
+          "max_leaf_size": 67,
+          "invariant_checks": "passed"
+        }
+      ],
+      "monitoring": {
+        "recall": 1.0,
+        "mean_distance_evaluations": 257.95,
+        "rebuild_recommended": false,
+        "rebuilt": false
+      }
+    }
+  ]
+}

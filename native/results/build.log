@@ -1,0 +1,61 @@
+CMake Deprecation Warning at third_party/highway/CMakeLists.txt:28 (cmake_policy):
+  The OLD behavior for policy CMP0111 will be removed from a future version
+  of CMake.
+
+  The cmake-policies(7) manual explains that the OLD behaviors of all
+  policies are deprecated and that a policy should be set to OLD only under
+  specific short-term circumstances.  Projects should be ported to the NEW
+  behavior and not rely on setting a policy to OLD.
+
+
+-- Configuring done (0.1s)
+-- Generating done (0.2s)
+-- Build files have been written to: /mnt/dtgroupstorage/extra_storage/Hieu_Cao/anns/native/build
+[  0%] Built target absl_spinlock_wait
+[  1%] Built target absl_log_severity
+[  3%] Built target absl_utf8_for_code_point
+[  6%] Built target absl_exponential_biased
+[  6%] Built target absl_civil_time
+[ 12%] Built target hwy
+[ 16%] Built target absl_time_zone
+[ 18%] Built target absl_raw_logging_internal
+[ 21%] Built target absl_throw_delegate
+[ 21%] Built target absl_cordz_functions
+[ 24%] Built target absl_debugging_internal
+[ 27%] Built target absl_base
+[ 29%] Built target absl_tracing_internal
+[ 35%] Built target absl_stacktrace
+[ 44%] Built target hwy_contrib
+[ 46%] Built target absl_decode_rust_punycode
+[ 49%] Built target absl_int128
+[ 49%] Built target absl_malloc_internal
+[ 53%] Built target absl_strings_internal
+[ 53%] Built target absl_string_view
+[ 53%] Built target absl_crc_cpu_detect
+[ 55%] Built target absl_demangle_rust
+[ 55%] Built target absl_city
+[ 56%] Built target absl_graphcycles_internal
+[ 56%] Built target absl_low_level_hash
+[ 56%] Built target absl_demangle_internal
+[ 58%] Built target absl_crc_internal
+[ 66%] Built target absl_strings
+[ 66%] Built target absl_symbolize
+[ 67%] Built target absl_hash
+[ 72%] Built target absl_str_format_internal
+[ 75%] Built target absl_time
+[ 75%] Built target absl_kernel_timeout_internal
+[ 78%] Built target absl_crc32c
+[ 80%] Built target absl_crc_cord_state
+[ 87%] Built target absl_synchronization
+[ 90%] Built target absl_cord_internal
+[ 92%] Built target absl_hashtablez_sampler
+[ 93%] Built target absl_cordz_handle
+[ 95%] Built target absl_cordz_info
+[ 96%] Built target absl_cord
+[ 96%] Built target absl_raw_hash_set
+[ 96%] Building CXX object CMakeFiles/mutation_test.dir/src/mutation_test.cpp.o
+[ 98%] Building CXX object CMakeFiles/ann_bench.dir/src/bench.cpp.o
+[100%] Linking CXX executable mutation_test
+[100%] Built target mutation_test
+[100%] Linking CXX executable ann_bench
+[100%] Built target ann_bench

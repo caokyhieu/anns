@@ -1,0 +1,174 @@
+{
+  "parameters": {
+    "base": "native/results/synthetic/base.u8bin",
+    "queries": "native/results/synthetic/query.u8bin",
+    "gt": "native/results/synthetic/gt.ibin",
+    "threads": 8,
+    "query_threads": 1,
+    "query_count": 200,
+    "repeats": 1,
+    "beams": "16,32,64,128,256,512",
+    "output": "native/results/smoke",
+    "m": 32,
+    "ef_construction": 200,
+    "alpha": 1.2,
+    "degree": 64,
+    "allow_small": true
+  },
+  "dataset_label": "custom/smoke",
+  "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.31",
+  "cpu": "x86_64",
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "start_load_average": [
+    1.4,
+    1.57,
+    1.67
+  ],
+  "sources": {
+    "PiPNN": {
+      "url": "https://github.com/ParAlg/PiPNN.git",
+      "commit": "443a328dc71a3b7be753d52ca2b3c9a4ba77f3fd"
+    },
+    "PiPNN/parlaylib": {
+      "url": "https://github.com/cmuparlay/parlaylib.git",
+      "commit": "7cdb4cae8f020525f5eb4ad82e2565d1e38cfbc3"
+    },
+    "hnswlib": {
+      "url": "https://github.com/nmslib/hnswlib.git",
+      "commit": "3f3429661187e4c24a490a0f148fc6bc89042b3d"
+    },
+    "eigen": {
+      "url": "https://github.com/eigen-mirror/eigen.git",
+      "commit": "3147391d946bb4b6c68edd901f2add6ac1f31f8c"
+    },
+    "abseil": {
+      "url": "https://github.com/abseil/abseil-cpp.git",
+      "commit": "bc257a88f7c1939f24e0379f14a3589e926c950c"
+    },
+    "highway": {
+      "url": "https://github.com/google/highway.git",
+      "commit": "ac0d5d297b13ab1b89f48484fc7911082d76a93f"
+    }
+  },
+  "inputs": [
+    {
+      "path": "/mnt/dtgroupstorage/extra_storage/Hieu_Cao/anns/native/results/synthetic/base.u8bin",
+      "bytes": 2560008,
+      "sha256": "ae1de26211b1deeb5f9af79ddcd1aff0994f6109b876a5907223148db418fbcc"
+    },
+    {
+      "path": "/mnt/dtgroupstorage/extra_storage/Hieu_Cao/anns/native/results/synthetic/query.u8bin",
+      "bytes": 25608,
+      "sha256": "13390ed9bac08064db7679ccbd2b12d1001acc9a07acf8f891282ad5316b0e01"
+    },
+    {
+      "path": "/mnt/dtgroupstorage/extra_storage/Hieu_Cao/anns/native/results/synthetic/gt.ibin",
+      "bytes": 80008,
+      "sha256": "f2ed91f2d2d845b96a97c90b8f356a625aaa8e65f16fddee7611efc4033511fd"
+    }
+  ],
+  "binary_sha256": "6872ee460f4e9a54f7488d923d5d9ae543e051ba54618ad1d8034014bc8ab0b5",
+  "commands": [
+    [
+      "/mnt/dtgroupstorage/extra_storage/Hieu_Cao/anns/native/build/ann_bench",
+      "--algorithm",
+      "pipnn",
+      "--base",
+      "/mnt/dtgroupstorage/extra_storage/Hieu_Cao/anns/native/results/synthetic/base.u8bin",
+      "--queries",
+      "/mnt/dtgroupstorage/extra_storage/Hieu_Cao/anns/native/results/synthetic/query.u8bin",
+      "--gt",
+      "/mnt/dtgroupstorage/extra_storage/Hieu_Cao/anns/native/results/synthetic/gt.ibin",
+      "--threads",
+      "8",
+      "--query-threads",
+      "1",
+      "--query-count",
+      "200",
+      "--beams",
+      "16,32,64,128,256,512",
+      "--m",
+      "32",
+      "--ef-construction",
+      "200",
+      "--alpha",
+      "1.2",
+      "--degree",
+      "64",
+      "--reservoir",
+      "160",
+      "--output",
+      "/mnt/dtgroupstorage/extra_storage/Hieu_Cao/anns/native/results/smoke/pipnn-0.json"
+    ],
+    [
+      "/mnt/dtgroupstorage/extra_storage/Hieu_Cao/anns/native/build/ann_bench",
+      "--algorithm",
+      "hnsw",
+      "--base",
+      "/mnt/dtgroupstorage/extra_storage/Hieu_Cao/anns/native/results/synthetic/base.u8bin",
+      "--queries",
+      "/mnt/dtgroupstorage/extra_storage/Hieu_Cao/anns/native/results/synthetic/query.u8bin",
+      "--gt",
+      "/mnt/dtgroupstorage/extra_storage/Hieu_Cao/anns/native/results/synthetic/gt.ibin",
+      "--threads",
+      "8",
+      "--query-threads",
+      "1",
+      "--query-count",
+      "200",
+      "--beams",
+      "16,32,64,128,256,512",
+      "--m",
+      "32",
+      "--ef-construction",
+      "200",
+      "--alpha",
+      "1.2",
+      "--degree",
+      "64",
+      "--reservoir",
+      "160",
+      "--output",
+      "/mnt/dtgroupstorage/extra_storage/Hieu_Cao/anns/native/results/smoke/hnsw-0.json"
+    ]
+  ],
+  "status": "complete",
+  "end_load_average": [
+    1.4,
+    1.57,
+    1.67
+  ]
+}

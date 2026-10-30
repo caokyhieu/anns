@@ -1,0 +1,201 @@
+{
+  "results": [
+    {
+      "algorithm": "pipnn",
+      "n": 20000,
+      "dimension": 128,
+      "query_count": 200,
+      "threads": 8,
+      "query_threads": 1,
+      "load_seconds": 0.012505381,
+      "build_seconds": 0.194626536,
+      "build_peak_mib": 369.9296875,
+      "degree": 64,
+      "leaf_size": 1024,
+      "local_k": 2,
+      "reservoir": 160,
+      "hash_bits": 12,
+      "alpha": 1.2,
+      "fanout": "10,3,1",
+      "leaders": 1000,
+      "m": 32,
+      "ef_construction": 200,
+      "distance": "squared_l2_uint8",
+      "queries": [
+        {
+          "beam": 16,
+          "recall_at_10": 0.741,
+          "qps": 85815.54806,
+          "median_seconds": 0.00233058
+        },
+        {
+          "beam": 32,
+          "recall_at_10": 0.9045,
+          "qps": 50898.48552,
+          "median_seconds": 0.00392939
+        },
+        {
+          "beam": 64,
+          "recall_at_10": 0.9945,
+          "qps": 33386.85803,
+          "median_seconds": 0.005990381
+        },
+        {
+          "beam": 128,
+          "recall_at_10": 1,
+          "qps": 23697.04466,
+          "median_seconds": 0.008439871
+        },
+        {
+          "beam": 256,
+          "recall_at_10": 1,
+          "qps": 12221.42708,
+          "median_seconds": 0.016364701
+        },
+        {
+          "beam": 512,
+          "recall_at_10": 1,
+          "qps": 5731.082206,
+          "median_seconds": 0.034897423
+        }
+      ],
+      "peak_mib": 369.9296875,
+      "repeat": 0,
+      "process_wall_seconds": 0.5005341400392354
+    },
+    {
+      "algorithm": "hnsw",
+      "n": 20000,
+      "dimension": 128,
+      "query_count": 200,
+      "threads": 8,
+      "query_threads": 1,
+      "load_seconds": 0.012911021,
+      "build_seconds": 0.384296191,
+      "build_peak_mib": 18.25,
+      "degree": 64,
+      "leaf_size": 1024,
+      "local_k": 2,
+      "reservoir": 160,
+      "hash_bits": 12,
+      "alpha": 1.2,
+      "fanout": "10,3,1",
+      "leaders": 1000,
+      "m": 32,
+      "ef_construction": 200,
+      "distance": "squared_l2_uint8",
+      "queries": [
+        {
+          "beam": 16,
+          "recall_at_10": 0.9685,
+          "qps": 111793.6736,
+          "median_seconds": 0.00178901
+        },
+        {
+          "beam": 32,
+          "recall_at_10": 0.996,
+          "qps": 68199.10045,
+          "median_seconds": 0.00293259
+        },
+        {
+          "beam": 64,
+          "recall_at_10": 1,
+          "qps": 41318.21638,
+          "median_seconds": 0.00484048
+        },
+        {
+          "beam": 128,
+          "recall_at_10": 1,
+          "qps": 24274.37815,
+          "median_seconds": 0.00823914
+        },
+        {
+          "beam": 256,
+          "recall_at_10": 1,
+          "qps": 10233.58097,
+          "median_seconds": 0.019543501
+        },
+        {
+          "beam": 512,
+          "recall_at_10": 1,
+          "qps": 4663.917738,
+          "median_seconds": 0.042882403
+        }
+      ],
+      "peak_mib": 18.25,
+      "repeat": 0,
+      "process_wall_seconds": 0.6854469049721956
+    }
+  ],
+  "matched_recall": [
+    {
+      "target_recall": 0.9,
+      "measurements": [
+        {
+          "algorithm": "pipnn",
+          "repeat": 0,
+          "build_seconds": 0.194626536,
+          "beam": 32,
+          "recall_at_10": 0.9045,
+          "qps": 50898.48552,
+          "median_seconds": 0.00392939
+        },
+        {
+          "algorithm": "hnsw",
+          "repeat": 0,
+          "build_seconds": 0.384296191,
+          "beam": 16,
+          "recall_at_10": 0.9685,
+          "qps": 111793.6736,
+          "median_seconds": 0.00178901
+        }
+      ]
+    },
+    {
+      "target_recall": 0.95,
+      "measurements": [
+        {
+          "algorithm": "pipnn",
+          "repeat": 0,
+          "build_seconds": 0.194626536,
+          "beam": 64,
+          "recall_at_10": 0.9945,
+          "qps": 33386.85803,
+          "median_seconds": 0.005990381
+        },
+        {
+          "algorithm": "hnsw",
+          "repeat": 0,
+          "build_seconds": 0.384296191,
+          "beam": 16,
+          "recall_at_10": 0.9685,
+          "qps": 111793.6736,
+          "median_seconds": 0.00178901
+        }
+      ]
+    },
+    {
+      "target_recall": 0.99,
+      "measurements": [
+        {
+          "algorithm": "pipnn",
+          "repeat": 0,
+          "build_seconds": 0.194626536,
+          "beam": 64,
+          "recall_at_10": 0.9945,
+          "qps": 33386.85803,
+          "median_seconds": 0.005990381
+        },
+        {
+          "algorithm": "hnsw",
+          "repeat": 0,
+          "build_seconds": 0.384296191,
+          "beam": 32,
+          "recall_at_10": 0.996,
+          "qps": 68199.10045,
+          "median_seconds": 0.00293259
+        }
+      ]
+    }
+  ]
+}

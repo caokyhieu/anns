@@ -1,0 +1,26 @@
+{
+  "PiPNN": {
+    "url": "https://github.com/ParAlg/PiPNN.git",
+    "commit": "443a328dc71a3b7be753d52ca2b3c9a4ba77f3fd"
+  },
+  "PiPNN/parlaylib": {
+    "url": "https://github.com/cmuparlay/parlaylib.git",
+    "commit": "7cdb4cae8f020525f5eb4ad82e2565d1e38cfbc3"
+  },
+  "hnswlib": {
+    "url": "https://github.com/nmslib/hnswlib.git",
+    "commit": "3f3429661187e4c24a490a0f148fc6bc89042b3d"
+  },
+  "eigen": {
+    "url": "https://github.com/eigen-mirror/eigen.git",
+    "commit": "3147391d946bb4b6c68edd901f2add6ac1f31f8c"
+  },
+  "abseil": {
+    "url": "https://github.com/abseil/abseil-cpp.git",
+    "commit": "bc257a88f7c1939f24e0379f14a3589e926c950c"
+  },
+  "highway": {
+    "url": "https://github.com/google/highway.git",
+    "commit": "ac0d5d297b13ab1b89f48484fc7911082d76a93f"
+  }
+}

@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+
+data/
+native/build*/
+native/third_party/
