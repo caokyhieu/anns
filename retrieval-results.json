@@ -1,0 +1,613 @@
+{
+ "config": {
+  "n": 100000,
+  "dim": 32,
+  "clusters": 512,
+  "queries": 1000,
+  "graph_queries": 100,
+  "posting": 128,
+  "seed": 7,
+  "output": "retrieval-results.json"
+ },
+ "params": {
+  "leaf_size": 256,
+  "local_k": 4,
+  "fanout": [
+   4,
+   2
+  ],
+  "leaders_per_leaf": 2.0,
+  "max_leaders": 1000,
+  "max_depth": 12,
+  "hash_bits": 12,
+  "reservoir": 64,
+  "degree": 32,
+  "alpha": 1.2,
+  "seed": 7
+ },
+ "fast_params": {
+  "leaf_size": 256,
+  "local_k": 4,
+  "fanout": [
+   2,
+   1
+  ],
+  "leaders_per_leaf": 2.0,
+  "max_leaders": 1000,
+  "max_depth": 12,
+  "hash_bits": 12,
+  "reservoir": 32,
+  "degree": 32,
+  "alpha": 1.2,
+  "seed": 7
+ },
+ "python": "3.13.17",
+ "numpy": "2.5.4",
+ "builds": [
+  {
+   "index": "pipnn graph",
+   "fanout": [
+    4,
+    2
+   ],
+   "reservoir": 64,
+   "build_seconds": 45.88393587799999,
+   "mean_degree": 16.50499
+  },
+  {
+   "index": "pipnn graph (fast build)",
+   "fanout": [
+    2,
+    1
+   ],
+   "reservoir": 32,
+   "build_seconds": 8.033273326000085,
+   "mean_degree": 8.12902
+  },
+  {
+   "index": "postings (brute router)",
+   "build_seconds": 4.558630913000002,
+   "lists": 781,
+   "replication": 1.05568
+  },
+  {
+   "index": "postings (PiPNN router)",
+   "build_seconds": 4.189408135999997,
+   "lists": 781,
+   "replication": 1.05568,
+   "router_build_seconds": 0.12656934400001774
+  }
+ ],
+ "searches": [
+  {
+   "index": "pipnn graph",
+   "k": 10,
+   "beam": 16,
+   "recall": 0.9420000000000001,
+   "random_reads": 18.01,
+   "vectors_touched": 256.44
+  },
+  {
+   "index": "pipnn graph",
+   "k": 10,
+   "beam": 32,
+   "recall": 0.9700000000000002,
+   "random_reads": 33.58,
+   "vectors_touched": 378.62
+  },
+  {
+   "index": "pipnn graph",
+   "k": 10,
+   "beam": 64,
+   "recall": 0.9889999999999999,
+   "random_reads": 65.09,
+   "vectors_touched": 583.11
+  },
+  {
+   "index": "pipnn graph (fast build)",
+   "k": 10,
+   "beam": 16,
+   "recall": 0.738,
+   "random_reads": 19.06,
+   "vectors_touched": 156.51
+  },
+  {
+   "index": "pipnn graph (fast build)",
+   "k": 10,
+   "beam": 32,
+   "recall": 0.8740000000000001,
+   "random_reads": 35.36,
+   "vectors_touched": 227.51
+  },
+  {
+   "index": "pipnn graph (fast build)",
+   "k": 10,
+   "beam": 64,
+   "recall": 0.9410000000000001,
+   "random_reads": 68.04,
+   "vectors_touched": 326.99
+  },
+  {
+   "index": "postings (brute router)",
+   "k": 10,
+   "probes": 8,
+   "recall": 0.99,
+   "random_reads": 8.0,
+   "vectors_touched": 1190.89
+  },
+  {
+   "index": "postings (brute router)",
+   "k": 10,
+   "probes": 16,
+   "recall": 0.9940000000000001,
+   "random_reads": 16.0,
+   "vectors_touched": 2342.68
+  },
+  {
+   "index": "postings (brute router)",
+   "k": 10,
+   "probes": 32,
+   "recall": 0.998,
+   "random_reads": 32.0,
+   "vectors_touched": 4620.98
+  },
+  {
+   "index": "postings (brute router)",
+   "k": 10,
+   "probes": 64,
+   "recall": 1.0,
+   "random_reads": 64.0,
+   "vectors_touched": 9269.13
+  },
+  {
+   "index": "postings (brute router)",
+   "k": 10,
+   "probes": 128,
+   "recall": 1.0,
+   "random_reads": 128.0,
+   "vectors_touched": 18431.99
+  },
+  {
+   "index": "postings (brute router)",
+   "k": 10,
+   "probes": 256,
+   "recall": 1.0,
+   "random_reads": 256.0,
+   "vectors_touched": 36753.0
+  },
+  {
+   "index": "postings (PiPNN router)",
+   "k": 10,
+   "probes": 8,
+   "recall": 0.99,
+   "random_reads": 8.0,
+   "vectors_touched": 1190.44
+  },
+  {
+   "index": "postings (PiPNN router)",
+   "k": 10,
+   "probes": 16,
+   "recall": 0.993,
+   "random_reads": 16.0,
+   "vectors_touched": 2348.26
+  },
+  {
+   "index": "postings (PiPNN router)",
+   "k": 10,
+   "probes": 32,
+   "recall": 0.998,
+   "random_reads": 32.0,
+   "vectors_touched": 4620.59
+  },
+  {
+   "index": "postings (PiPNN router)",
+   "k": 10,
+   "probes": 64,
+   "recall": 1.0,
+   "random_reads": 64.0,
+   "vectors_touched": 9268.75
+  },
+  {
+   "index": "postings (PiPNN router)",
+   "k": 10,
+   "probes": 128,
+   "recall": 1.0,
+   "random_reads": 128.0,
+   "vectors_touched": 18431.9
+  },
+  {
+   "index": "postings (PiPNN router)",
+   "k": 10,
+   "probes": 256,
+   "recall": 1.0,
+   "random_reads": 256.0,
+   "vectors_touched": 36753.0
+  },
+  {
+   "index": "pipnn graph",
+   "k": 100,
+   "beam": 100,
+   "recall": 0.953,
+   "random_reads": 100.72,
+   "vectors_touched": 816.24
+  },
+  {
+   "index": "pipnn graph",
+   "k": 100,
+   "beam": 200,
+   "recall": 0.9822000000000002,
+   "random_reads": 200.57,
+   "vectors_touched": 1644.86
+  },
+  {
+   "index": "pipnn graph",
+   "k": 100,
+   "beam": 400,
+   "recall": 0.9952000000000001,
+   "random_reads": 400.31,
+   "vectors_touched": 4280.15
+  },
+  {
+   "index": "pipnn graph (fast build)",
+   "k": 100,
+   "beam": 100,
+   "recall": 0.8868999999999998,
+   "random_reads": 103.62,
+   "vectors_touched": 409.14
+  },
+  {
+   "index": "pipnn graph (fast build)",
+   "k": 100,
+   "beam": 200,
+   "recall": 0.9359999999999999,
+   "random_reads": 203.59,
+   "vectors_touched": 751.81
+  },
+  {
+   "index": "pipnn graph (fast build)",
+   "k": 100,
+   "beam": 400,
+   "recall": 0.9662,
+   "random_reads": 403.89,
+   "vectors_touched": 2006.22
+  },
+  {
+   "index": "postings (brute router)",
+   "k": 100,
+   "probes": 8,
+   "recall": 0.9477000000000001,
+   "random_reads": 8.0,
+   "vectors_touched": 1190.89
+  },
+  {
+   "index": "postings (brute router)",
+   "k": 100,
+   "probes": 16,
+   "recall": 0.9712999999999998,
+   "random_reads": 16.0,
+   "vectors_touched": 2342.68
+  },
+  {
+   "index": "postings (brute router)",
+   "k": 100,
+   "probes": 32,
+   "recall": 0.9871000000000001,
+   "random_reads": 32.0,
+   "vectors_touched": 4620.98
+  },
+  {
+   "index": "postings (brute router)",
+   "k": 100,
+   "probes": 64,
+   "recall": 0.9959,
+   "random_reads": 64.0,
+   "vectors_touched": 9269.13
+  },
+  {
+   "index": "postings (brute router)",
+   "k": 100,
+   "probes": 128,
+   "recall": 0.9986,
+   "random_reads": 128.0,
+   "vectors_touched": 18431.99
+  },
+  {
+   "index": "postings (brute router)",
+   "k": 100,
+   "probes": 256,
+   "recall": 0.9997,
+   "random_reads": 256.0,
+   "vectors_touched": 36753.0
+  },
+  {
+   "index": "postings (PiPNN router)",
+   "k": 100,
+   "probes": 8,
+   "recall": 0.9470000000000002,
+   "random_reads": 8.0,
+   "vectors_touched": 1190.44
+  },
+  {
+   "index": "postings (PiPNN router)",
+   "k": 100,
+   "probes": 16,
+   "recall": 0.9703999999999998,
+   "random_reads": 16.0,
+   "vectors_touched": 2348.26
+  },
+  {
+   "index": "postings (PiPNN router)",
+   "k": 100,
+   "probes": 32,
+   "recall": 0.9869,
+   "random_reads": 32.0,
+   "vectors_touched": 4620.59
+  },
+  {
+   "index": "postings (PiPNN router)",
+   "k": 100,
+   "probes": 64,
+   "recall": 0.9959,
+   "random_reads": 64.0,
+   "vectors_touched": 9268.75
+  },
+  {
+   "index": "postings (PiPNN router)",
+   "k": 100,
+   "probes": 128,
+   "recall": 0.9986,
+   "random_reads": 128.0,
+   "vectors_touched": 18431.9
+  },
+  {
+   "index": "postings (PiPNN router)",
+   "k": 100,
+   "probes": 256,
+   "recall": 0.9997,
+   "random_reads": 256.0,
+   "vectors_touched": 36753.0
+  },
+  {
+   "index": "pipnn graph",
+   "k": 1000,
+   "beam": 1000,
+   "recall": 0.9540299999999999,
+   "random_reads": 1000.15,
+   "vectors_touched": 10867.66
+  },
+  {
+   "index": "pipnn graph",
+   "k": 1000,
+   "beam": 2000,
+   "recall": 0.99189,
+   "random_reads": 2000.18,
+   "vectors_touched": 19340.99
+  },
+  {
+   "index": "pipnn graph",
+   "k": 1000,
+   "beam": 4000,
+   "recall": 0.9992700000000001,
+   "random_reads": 4000.11,
+   "vectors_touched": 31928.2
+  },
+  {
+   "index": "pipnn graph (fast build)",
+   "k": 1000,
+   "beam": 1000,
+   "recall": 0.7960999999999998,
+   "random_reads": 1002.27,
+   "vectors_touched": 5446.45
+  },
+  {
+   "index": "pipnn graph (fast build)",
+   "k": 1000,
+   "beam": 2000,
+   "recall": 0.9180400000000002,
+   "random_reads": 2000.8,
+   "vectors_touched": 10499.3
+  },
+  {
+   "index": "pipnn graph (fast build)",
+   "k": 1000,
+   "beam": 4000,
+   "recall": 0.9775099999999999,
+   "random_reads": 4000.35,
+   "vectors_touched": 19029.59
+  },
+  {
+   "index": "postings (brute router)",
+   "k": 1000,
+   "probes": 8,
+   "recall": 0.4395100000000001,
+   "random_reads": 8.0,
+   "vectors_touched": 1190.89
+  },
+  {
+   "index": "postings (brute router)",
+   "k": 1000,
+   "probes": 16,
+   "recall": 0.58142,
+   "random_reads": 16.0,
+   "vectors_touched": 2342.68
+  },
+  {
+   "index": "postings (brute router)",
+   "k": 1000,
+   "probes": 32,
+   "recall": 0.7362299999999999,
+   "random_reads": 32.0,
+   "vectors_touched": 4620.98
+  },
+  {
+   "index": "postings (brute router)",
+   "k": 1000,
+   "probes": 64,
+   "recall": 0.8749300000000001,
+   "random_reads": 64.0,
+   "vectors_touched": 9269.13
+  },
+  {
+   "index": "postings (brute router)",
+   "k": 1000,
+   "probes": 128,
+   "recall": 0.9627599999999998,
+   "random_reads": 128.0,
+   "vectors_touched": 18431.99
+  },
+  {
+   "index": "postings (brute router)",
+   "k": 1000,
+   "probes": 256,
+   "recall": 0.99539,
+   "random_reads": 256.0,
+   "vectors_touched": 36753.0
+  },
+  {
+   "index": "postings (PiPNN router)",
+   "k": 1000,
+   "probes": 8,
+   "recall": 0.4387100000000001,
+   "random_reads": 8.0,
+   "vectors_touched": 1190.44
+  },
+  {
+   "index": "postings (PiPNN router)",
+   "k": 1000,
+   "probes": 16,
+   "recall": 0.58045,
+   "random_reads": 16.0,
+   "vectors_touched": 2348.26
+  },
+  {
+   "index": "postings (PiPNN router)",
+   "k": 1000,
+   "probes": 32,
+   "recall": 0.73556,
+   "random_reads": 32.0,
+   "vectors_touched": 4620.59
+  },
+  {
+   "index": "postings (PiPNN router)",
+   "k": 1000,
+   "probes": 64,
+   "recall": 0.8745900000000002,
+   "random_reads": 64.0,
+   "vectors_touched": 9268.75
+  },
+  {
+   "index": "postings (PiPNN router)",
+   "k": 1000,
+   "probes": 128,
+   "recall": 0.9627599999999998,
+   "random_reads": 128.0,
+   "vectors_touched": 18431.9
+  },
+  {
+   "index": "postings (PiPNN router)",
+   "k": 1000,
+   "probes": 256,
+   "recall": 0.99539,
+   "random_reads": 256.0,
+   "vectors_touched": 36753.0
+  }
+ ],
+ "batching": [
+  {
+   "probes": 32,
+   "recall_at_1000": 0.7362299999999999,
+   "batch": 1,
+   "vectors_read_per_query": 4636.575,
+   "fraction_of_data_per_query": 0.04636575,
+   "full_scan_vectors_per_query": 100000.0
+  },
+  {
+   "probes": 32,
+   "recall_at_1000": 0.7362299999999999,
+   "batch": 10,
+   "vectors_read_per_query": 3478.223,
+   "fraction_of_data_per_query": 0.03478223,
+   "full_scan_vectors_per_query": 10000.0
+  },
+  {
+   "probes": 32,
+   "recall_at_1000": 0.7362299999999999,
+   "batch": 100,
+   "vectors_read_per_query": 945.99,
+   "fraction_of_data_per_query": 0.0094599,
+   "full_scan_vectors_per_query": 1000.0
+  },
+  {
+   "probes": 32,
+   "recall_at_1000": 0.7362299999999999,
+   "batch": 1000,
+   "vectors_read_per_query": 105.568,
+   "fraction_of_data_per_query": 0.00105568,
+   "full_scan_vectors_per_query": 100.0
+  },
+  {
+   "probes": 64,
+   "recall_at_1000": 0.8749300000000001,
+   "batch": 1,
+   "vectors_read_per_query": 9259.048,
+   "fraction_of_data_per_query": 0.09259048,
+   "full_scan_vectors_per_query": 100000.0
+  },
+  {
+   "probes": 64,
+   "recall_at_1000": 0.8749300000000001,
+   "batch": 10,
+   "vectors_read_per_query": 5566.036999999999,
+   "fraction_of_data_per_query": 0.055660369999999994,
+   "full_scan_vectors_per_query": 10000.0
+  },
+  {
+   "probes": 64,
+   "recall_at_1000": 0.8749300000000001,
+   "batch": 100,
+   "vectors_read_per_query": 1023.4680000000001,
+   "fraction_of_data_per_query": 0.010234680000000001,
+   "full_scan_vectors_per_query": 1000.0
+  },
+  {
+   "probes": 64,
+   "recall_at_1000": 0.8749300000000001,
+   "batch": 1000,
+   "vectors_read_per_query": 105.568,
+   "fraction_of_data_per_query": 0.00105568,
+   "full_scan_vectors_per_query": 100.0
+  },
+  {
+   "probes": 128,
+   "recall_at_1000": 0.9627599999999998,
+   "batch": 1,
+   "vectors_read_per_query": 18445.468,
+   "fraction_of_data_per_query": 0.18445468,
+   "full_scan_vectors_per_query": 100000.0
+  },
+  {
+   "probes": 128,
+   "recall_at_1000": 0.9627599999999998,
+   "batch": 10,
+   "vectors_read_per_query": 7909.323999999999,
+   "fraction_of_data_per_query": 0.07909323999999998,
+   "full_scan_vectors_per_query": 10000.0
+  },
+  {
+   "probes": 128,
+   "recall_at_1000": 0.9627599999999998,
+   "batch": 100,
+   "vectors_read_per_query": 1050.008,
+   "fraction_of_data_per_query": 0.01050008,
+   "full_scan_vectors_per_query": 1000.0
+  },
+  {
+   "probes": 128,
+   "recall_at_1000": 0.9627599999999998,
+   "batch": 1000,
+   "vectors_read_per_query": 105.568,
+   "fraction_of_data_per_query": 0.00105568,
+   "full_scan_vectors_per_query": 100.0
+  }
+ ]
+}

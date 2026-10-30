@@ -199,11 +199,15 @@ autonomous-driving data lake), drawing on DistributedANN, SPIRE and SPANN:
 scale arithmetic, a MapReduce-shaped distributed build (balanced shards, closure
 replicas, per-shard leaf k-NN, exactly mergeable HashPrune combiner, owner-side
 RobustPrune), serving, and graph vs. inverted lists. dpipnn.py simulates it in one
-process, counting reads, shards touched and shuffle bytes:
+process, counting reads, shards touched and shuffle bytes. RETRIEVAL_DESIGN.md is the
+recommended design for training-data retrieval (large k, batched jobs, fast indexing),
+with a literature survey; retrieval_experiment.py measures large-k recall, build time
+and batch amortization for graph vs. posting lists:
 
 ```bash
 uv run --locked python -m unittest -v test_dpipnn
 uv run --locked python distributed_experiment.py   # writes distributed-results.json
+uv run --locked python retrieval_experiment.py     # writes retrieval-results.json
 ```
 
 ## Limitations
