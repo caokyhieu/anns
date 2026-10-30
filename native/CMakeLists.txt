@@ -31,6 +31,12 @@ target_include_directories(fastpipnn_test PRIVATE third_party/eigen)
 target_compile_definitions(fastpipnn_test PRIVATE EIGEN_DONT_PARALLELIZE)
 target_compile_options(fastpipnn_test PRIVATE -O3 -march=native -ffast-math)
 target_link_libraries(fastpipnn_test PRIVATE Threads::Threads)
+# Graph export for the Python filtered-search experiments.
+add_executable(pipnn_graph src/pipnn_graph.cpp)
+target_include_directories(pipnn_graph PRIVATE third_party/eigen)
+target_compile_definitions(pipnn_graph PRIVATE EIGEN_DONT_PARALLELIZE)
+target_compile_options(pipnn_graph PRIVATE -O3 -march=native -ffast-math)
+target_link_libraries(pipnn_graph PRIVATE Threads::Threads)
 
 enable_testing()
 add_test(NAME native_mutations COMMAND mutation_test)
