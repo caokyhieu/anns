@@ -1,0 +1,8 @@
+BUILD fastpipnn n=1000000 seconds=26.8803 peak_mib=1901.89
+PHASES sketch=0.0634138 partition=4.07351 leaves=17.8852 prune=4.85814 leaf_count=87060 leaf_points=29997656 depth=4 mean_reservoir=44.7077 mean_degree=35.143
+QUERY beam=16 recall=0.6355 qps=8319.28
+QUERY beam=32 recall=0.836 qps=5147.64
+QUERY beam=64 recall=0.936 qps=2946.23
+QUERY beam=128 recall=0.9875 qps=1328.69
+QUERY beam=256 recall=1 qps=1101.21
+QUERY beam=512 recall=1 qps=662.729

@@ -25,12 +25,20 @@ target_include_directories(mutation_test PRIVATE third_party/PiPNN/algorithms th
 target_compile_definitions(mutation_test PRIVATE EIGEN_DONT_PARALLELIZE)
 target_compile_options(mutation_test PRIVATE -O3 -march=native -ffast-math)
 target_link_libraries(mutation_test PRIVATE Threads::Threads absl::synchronization absl::flat_hash_set absl::span hwy hwy_contrib)
+# From-scratch PiPNN: needs only Eigen and threads.
+add_executable(fastpipnn_test src/fastpipnn_test.cpp)
+target_include_directories(fastpipnn_test PRIVATE third_party/eigen)
+target_compile_definitions(fastpipnn_test PRIVATE EIGEN_DONT_PARALLELIZE)
+target_compile_options(fastpipnn_test PRIVATE -O3 -march=native -ffast-math)
+target_link_libraries(fastpipnn_test PRIVATE Threads::Threads)
+
 enable_testing()
 add_test(NAME native_mutations COMMAND mutation_test)
+add_test(NAME fastpipnn COMMAND fastpipnn_test)
 
 option(NATIVE_SANITIZERS "Instrument native targets for correctness checks" OFF)
 if(NATIVE_SANITIZERS)
-  foreach(target ann_bench mutation_test)
+  foreach(target ann_bench mutation_test fastpipnn_test)
     target_compile_options(${target} PRIVATE -O1 -fno-fast-math -fsanitize=address,undefined -fno-omit-frame-pointer)
     target_link_options(${target} PRIVATE -fsanitize=address,undefined)
   endforeach()

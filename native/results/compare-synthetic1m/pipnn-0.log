@@ -1,0 +1,37 @@
+Parlay time: SketchHash construction time: 0.2243
+Size of SketchHash (bytes): 48006144
+Allocate = 0
+Set MSTDeg to: 2 fanout: 1
+Sizeof indexType = 4
+Fanout scheme: 10 3 1 
+Allocating: 1288000000 bytes of space for the candidates lists.
+Sizeof T = 8
+Cleared degree
+FANOUT = 1 FANOUT_PER_LEVEL = 0
+number of levels to fanout: 1
+fanout per level: 1
+total fanout: 1
+total fanout allowance: 1
+leader method: random
+Parlay time: first level assign time: 0.6579
+Parlay time: buckets time: 4.6326
+buckets size (bytes): 121379828
+Total buckets: 86699
+Total points: 29998161
+Computed buckets!
+Building leaves:
+Parlay time: build leaf time: 28.7685
+Built cluster 0 of 1
+Leaf count: 86699
+# of comparisons during clustering: 2298696645
+Allocating graph, prune_degree = 64
+Average table size: 44
+Parlay time: Final prune time: 5.5839
+Average distance traversed: 39
+BUILD pipnn n=1000000 seconds=44.32 peak_mib=2181
+QUERY beam=16 recall=0.648 qps=6671
+QUERY beam=32 recall=0.8315 qps=4386
+QUERY beam=64 recall=0.942 qps=2244
+QUERY beam=128 recall=0.9895 qps=1514
+QUERY beam=256 recall=1 qps=854.8
+QUERY beam=512 recall=1 qps=715.6

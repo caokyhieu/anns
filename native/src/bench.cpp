@@ -1,6 +1,7 @@
 #include "common.hpp"
 #include "PipNN/pipnn.h"
 #include "hnswlib/hnswlib.h"
+#include "fastpipnn.hpp"
 #include <functional>
 #include <map>
 #include <memory>
@@ -28,7 +29,7 @@ int main(int argc,char** argv) {
   auto get=[&](std::string name,std::string fallback=""){return args.count(name)?args[name]:fallback;};
   auto number=[&](std::string name,int fallback){return std::stoi(get(name,std::to_string(fallback)));};
   std::string algorithm=get("--algorithm","pipnn"), output=get("--output","metrics.json");
-  require(algorithm=="pipnn"||algorithm=="hnsw","algorithm must be pipnn or hnsw");
+  require(algorithm=="pipnn"||algorithm=="hnsw"||algorithm=="fastpipnn","algorithm must be pipnn, hnsw, or fastpipnn");
   size_t threads=number("--threads",32), query_threads=number("--query-threads",1);
   require(threads>0 && threads<=256 && query_threads>0 && query_threads<=threads,"invalid thread counts");
   auto thread_text=std::to_string(threads);
@@ -73,12 +74,21 @@ int main(int argc,char** argv) {
   parlayANN::Graph<Id> graph;
   ByteSpace space(data.dim);
   std::unique_ptr<hnswlib::HierarchicalNSW<float>> hnsw;
+  fastpipnn::Index<uint8_t> fast;
   double start=now();
   if(algorithm=="pipnn") {
     commandLine command(argc,argv);
     parlayANN::pipnn_index<Point,Data,Id> index;
     index.build_index(graph,command,data,1,leaf,local_k,true,true,alpha,degree,
                       top_leaders,1,0,.005,fanout,bits,reservoir,false,0);
+  } else if(algorithm=="fastpipnn") {
+    fastpipnn::Params fp;
+    fp.leaf_size=leaf; fp.local_k=local_k; fp.degree=degree; fp.reservoir=reservoir;
+    fp.hash_bits=bits; fp.alpha=alpha; fp.top_leaders=top_leaders; fp.threads=threads;
+    fp.fanout.clear();
+    std::istringstream levels(fanout);
+    for(std::string f;std::getline(levels,f,',');) fp.fanout.push_back(std::stoul(f));
+    fast.build(data.location(0),data.n,data.dim,data.stride,fp);
   } else {
     hnsw=std::make_unique<hnswlib::HierarchicalNSW<float>>(&space,data.n,m,efc,100);
     hnsw->addPoint(data.location(0),0);
@@ -93,8 +103,21 @@ int main(int argc,char** argv) {
       for(size_t j=0;j<ns.size();++j) require(ns[j]<data.n&&ns[j]!=p,"invalid graph edge");
     });
   }
+  if(algorithm=="fastpipnn") {
+    auto& s=fast.stats;
+    std::cout<<"PHASES sketch="<<s.sketch_seconds<<" partition="<<s.partition_seconds
+             <<" leaves="<<s.leaf_seconds<<" prune="<<s.prune_seconds<<" leaf_count="<<s.leaves
+             <<" leaf_points="<<s.leaf_points<<" depth="<<s.depth<<" mean_reservoir="<<s.mean_reservoir
+             <<" mean_degree="<<s.mean_degree<<std::endl;
+  }
+  // Both PiPNN variants search from the same entry: the point nearest the mean (or 0).
+  std::string entry_mode=get("--entry","medoid");
+  require(entry_mode=="medoid"||entry_mode=="zero","entry must be medoid or zero");
+  Id entry=0;
+  if(entry_mode=="medoid") entry=fastpipnn::medoid(data.location(0),data.n,data.dim,data.stride,threads);
   std::string save=get("--save");
   if(!save.empty()) {
+    require(algorithm!="fastpipnn","--save is not implemented for fastpipnn");
     if(algorithm=="pipnn") graph.save(save.data());
     else hnsw->saveIndex(save);
   }
@@ -115,7 +138,16 @@ int main(int argc,char** argv) {
      <<",\"reservoir\":"<<reservoir<<",\"hash_bits\":"<<bits
      <<",\"alpha\":"<<alpha<<",\"fanout\":\""<<fanout<<"\",\"leaders\":"<<top_leaders
      <<",\"m\":"<<m<<",\"ef_construction\":"<<efc
-     <<",\"distance\":\"squared_l2_uint8\",\"queries\":[\n";
+     <<",\"entry\":\""<<entry_mode<<"\",\"distance\":\"squared_l2_uint8\"";
+  if(algorithm=="fastpipnn") {
+    auto& s=fast.stats;
+    out<<",\"phases\":{\"sketch_seconds\":"<<s.sketch_seconds<<",\"partition_seconds\":"<<s.partition_seconds
+       <<",\"leaf_seconds\":"<<s.leaf_seconds<<",\"prune_seconds\":"<<s.prune_seconds
+       <<",\"leaves\":"<<s.leaves<<",\"leaf_points\":"<<s.leaf_points<<",\"depth\":"<<s.depth
+       <<",\"random_splits\":"<<s.random_splits<<",\"mean_reservoir\":"<<s.mean_reservoir
+       <<",\"mean_degree\":"<<s.mean_degree<<"}";
+  }
+  out<<",\"queries\":[\n";
   for(size_t bi=0;bi<beams.size();++bi) {
     int beam=beams[bi];
     if(hnsw) hnsw->setEf(beam);
@@ -126,9 +158,11 @@ int main(int argc,char** argv) {
         while(!result.empty()){ids.push_back(result.top().second);result.pop();}
         return ids;
       }
+      if(algorithm=="fastpipnn")
+        return graph_search(data,queries.location(i),beam,10,[&](Id p){return fast.neighbors(p);},{entry});
       return graph_search(data,queries.location(i),beam,10,[&](Id p){
         auto ns=graph[p]; return Span{ns.begin(),ns.size()};
-      },{0});
+      },{entry});
     };
     for(size_t i=0;i<std::min<size_t>(nq,100);++i) search(i);
     std::vector<double> times;

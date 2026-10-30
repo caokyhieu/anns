@@ -1,0 +1,7 @@
+BUILD hnsw n=1000000 seconds=130.578 peak_mib=629.418
+QUERY beam=16 recall=0.609 qps=10384.7
+QUERY beam=32 recall=0.791 qps=6396.66
+QUERY beam=64 recall=0.923 qps=3928.25
+QUERY beam=128 recall=0.98 qps=1948.4
+QUERY beam=256 recall=0.993 qps=1411.01
+QUERY beam=512 recall=1 qps=737.091

@@ -140,6 +140,58 @@ descends from a single entry point, which helps PiPNN at small beams.
 For a compiled, static comparison against upstream PiPNN use native/
 (`native/scripts/run_benchmark.py`).
 
+## Native from-scratch PiPNN (fastpipnn)
+
+native/src/fastpipnn.hpp is a standalone C++17 PiPNN builder (Eigen + std::thread only),
+written against the paper and the authors' reference code but sharing no code with it:
+randomized ball carving with fanout 10,3,1 and small-cluster merging, one Gram GEMM per
+leaf with bidirected 2-NN candidates, HashPrune reservoirs (12-bit hash of q - p, 160
+slots), and RobustPrune to degree 64. The build is deterministic: HashPrune uses a total
+(distance, ID) order, so the final graph does not depend on thread interleaving.
+
+Engineering beyond the reference implementation:
+- leaf k-NN: branchless AVX-512 masked-blend insertion updates 16 top-k lists per step;
+- uint8 data: exact bfloat16 dot-product Gram kernel (`vdpbf16ps`); 0..255 are exact
+  in bf16 and fp32 accumulation is exact below 2^24, so graphs match the fp32 path bit for bit;
+- HashPrune: unsorted structure-of-arrays reservoirs with SIMD hash lookup, one
+  hash compare instruction per offer, and offers grouped per target (one lock per leaf)
+  with software prefetch.
+
+```bash
+python3 native/scripts/bootstrap.py
+cmake -S native -B native/build -DCMAKE_BUILD_TYPE=Release
+cmake --build native/build -j --target ann_bench fastpipnn_test
+native/build/fastpipnn_test
+python3 native/scripts/run_benchmark.py --base native/results/synthetic1m/base.u8bin \
+  --queries native/results/synthetic1m/query.u8bin --gt native/results/synthetic1m/gt.ibin \
+  --threads 4 --query-count 200 --allow-small --output native/results/my-run
+```
+
+Recorded run: clustered synthetic uint8 data (native/scripts/synthetic.py), 128
+dimensions, 200 queries, 4 threads (Xeon @ 2.1 GHz, AVX-512), same parameters for both
+PiPNN builds, single-threaded queries. Both PiPNN graphs are searched from the medoid.
+Raw records: native/results/compare-synthetic100k and compare-synthetic1m.
+
+| n | Algorithm | Build s | recall@10 beam 32 / 64 / 128 / 256 |
+| ---: | --- | ---: | --- |
+| 100k | fastpipnn | 1.67 | 0.957 / 0.995 / 1.000 / 1.000 |
+| 100k | upstream PiPNN | 3.69 | 0.948 / 0.990 / 0.995 / 1.000 |
+| 100k | hnswlib (M=32, efC=200) | 4.81 | 0.976 / 0.999 / 1.000 / 1.000 |
+| 1M | fastpipnn | 26.9 | 0.836 / 0.936 / 0.988 / 1.000 |
+| 1M | upstream PiPNN | 44.3 | 0.832 / 0.942 / 0.990 / 1.000 |
+| 1M | hnswlib (M=32, efC=200) | 130.6 | 0.791 / 0.923 / 0.980 / 0.993 |
+
+At 1M, fastpipnn builds 1.65x faster than upstream PiPNN and 4.9x faster than hnswlib at
+similar recall. Build phases at 1M: partition 4.1 s, leaves 17.9 s, prune 4.9 s. HNSW
+uses far less build memory (630 vs 1902 MiB peak; PiPNN reservoirs dominate) and gives
+higher QPS at matched recall on the 100k set. Timings are from a shared 4-core cloud VM;
+they are one run each, not a controlled benchmark.
+
+Differences from the reference code: small-cluster merging is a single greedy pass; the
+duplicate guard splits randomly at depth 8 (reference: 3) or when a child equals its
+parent; distances in reservoirs are bfloat16 like the reference, but final pruning
+recomputes exact distances. No graph save/load, no MIPS, no int8/float benchmarks yet.
+
 ## Limitations
 
 - Python dictionaries and retained local candidate lists use more memory than

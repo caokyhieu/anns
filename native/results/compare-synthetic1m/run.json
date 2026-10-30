@@ -1,0 +1,178 @@
+{
+  "parameters": {
+    "base": "native/results/synthetic1m/base.u8bin",
+    "queries": "native/results/synthetic1m/query.u8bin",
+    "gt": "native/results/synthetic1m/gt.ibin",
+    "threads": 4,
+    "query_threads": 1,
+    "query_count": 200,
+    "repeats": 1,
+    "beams": "16,32,64,128,256,512",
+    "output": "native/results/compare-synthetic1m",
+    "m": 32,
+    "ef_construction": 200,
+    "alpha": 1.2,
+    "degree": 64,
+    "algorithms": "pipnn,hnsw,fastpipnn",
+    "allow_small": true
+  },
+  "dataset_label": "custom/smoke",
+  "platform": "Linux-6.18.44-fc-v185-x86_64-with-glibc2.39",
+  "cpu": "x86_64",
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "start_load_average": [
+    1.0224609375,
+    0.4287109375,
+    0.5029296875
+  ],
+  "sources": {
+    "PiPNN": {
+      "url": "https://github.com/ParAlg/PiPNN.git",
+      "commit": "443a328dc71a3b7be753d52ca2b3c9a4ba77f3fd"
+    },
+    "PiPNN/parlaylib": {
+      "url": "https://github.com/cmuparlay/parlaylib.git",
+      "commit": "7cdb4cae8f020525f5eb4ad82e2565d1e38cfbc3"
+    },
+    "hnswlib": {
+      "url": "https://github.com/nmslib/hnswlib.git",
+      "commit": "3f3429661187e4c24a490a0f148fc6bc89042b3d"
+    },
+    "eigen": {
+      "url": "https://github.com/eigen-mirror/eigen.git",
+      "commit": "3147391d946bb4b6c68edd901f2add6ac1f31f8c"
+    },
+    "abseil": {
+      "url": "https://github.com/abseil/abseil-cpp.git",
+      "commit": "bc257a88f7c1939f24e0379f14a3589e926c950c"
+    },
+    "highway": {
+      "url": "https://github.com/google/highway.git",
+      "commit": "ac0d5d297b13ab1b89f48484fc7911082d76a93f"
+    }
+  },
+  "inputs": [
+    {
+      "path": "/home/user/anns/native/results/synthetic1m/base.u8bin",
+      "bytes": 128000008,
+      "sha256": "d4dfd9abb6b171620feedfc96355d596c2220f203fd1c73f24b12592acc4bd6c"
+    },
+    {
+      "path": "/home/user/anns/native/results/synthetic1m/query.u8bin",
+      "bytes": 25608,
+      "sha256": "7e20ce892b8aba14dd1e43a4711d556ece8850245a08b98147f6c8e1da491465"
+    },
+    {
+      "path": "/home/user/anns/native/results/synthetic1m/gt.ibin",
+      "bytes": 80008,
+      "sha256": "1904ea839d7b59dfd690868f0445cece2ea9854c63f345ddc186869096aed932"
+    }
+  ],
+  "binary_sha256": "04f068e0ce6e520e1b3d3ea6708bc1755e2ab30514686c0b5548d54cf88130f9",
+  "commands": [
+    [
+      "/home/user/anns/native/build/ann_bench",
+      "--algorithm",
+      "pipnn",
+      "--base",
+      "/home/user/anns/native/results/synthetic1m/base.u8bin",
+      "--queries",
+      "/home/user/anns/native/results/synthetic1m/query.u8bin",
+      "--gt",
+      "/home/user/anns/native/results/synthetic1m/gt.ibin",
+      "--threads",
+      "4",
+      "--query-threads",
+      "1",
+      "--query-count",
+      "200",
+      "--beams",
+      "16,32,64,128,256,512",
+      "--m",
+      "32",
+      "--ef-construction",
+      "200",
+      "--alpha",
+      "1.2",
+      "--degree",
+      "64",
+      "--reservoir",
+      "160",
+      "--output",
+      "/home/user/anns/native/results/compare-synthetic1m/pipnn-0.json"
+    ],
+    [
+      "/home/user/anns/native/build/ann_bench",
+      "--algorithm",
+      "hnsw",
+      "--base",
+      "/home/user/anns/native/results/synthetic1m/base.u8bin",
+      "--queries",
+      "/home/user/anns/native/results/synthetic1m/query.u8bin",
+      "--gt",
+      "/home/user/anns/native/results/synthetic1m/gt.ibin",
+      "--threads",
+      "4",
+      "--query-threads",
+      "1",
+      "--query-count",
+      "200",
+      "--beams",
+      "16,32,64,128,256,512",
+      "--m",
+      "32",
+      "--ef-construction",
+      "200",
+      "--alpha",
+      "1.2",
+      "--degree",
+      "64",
+      "--reservoir",
+      "160",
+      "--output",
+      "/home/user/anns/native/results/compare-synthetic1m/hnsw-0.json"
+    ],
+    [
+      "/home/user/anns/native/build/ann_bench",
+      "--algorithm",
+      "fastpipnn",
+      "--base",
+      "/home/user/anns/native/results/synthetic1m/base.u8bin",
+      "--queries",
+      "/home/user/anns/native/results/synthetic1m/query.u8bin",
+      "--gt",
+      "/home/user/anns/native/results/synthetic1m/gt.ibin",
+      "--threads",
+      "4",
+      "--query-threads",
+      "1",
+      "--query-count",
+      "200",
+      "--beams",
+      "16,32,64,128,256,512",
+      "--m",
+      "32",
+      "--ef-construction",
+      "200",
+      "--alpha",
+      "1.2",
+      "--degree",
+      "64",
+      "--reservoir",
+      "160",
+      "--output",
+      "/home/user/anns/native/results/compare-synthetic1m/fastpipnn-0.json"
+    ]
+  ],
+  "status": "complete",
+  "end_load_average": [
+    3.30615234375,
+    2.09375,
+    1.171875
+  ]
+}

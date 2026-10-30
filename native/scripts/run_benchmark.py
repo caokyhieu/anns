@@ -23,9 +23,12 @@ p.add_argument("--m",type=int,default=32)
 p.add_argument("--ef-construction",type=int,default=200)
 p.add_argument("--alpha",type=float,default=1.2)
 p.add_argument("--degree",type=int,default=64)
+p.add_argument("--algorithms",default="pipnn,hnsw,fastpipnn",help="comma-separated subset of pipnn,hnsw,fastpipnn")
 p.add_argument("--allow-small",action="store_true",help="explicitly label a smoke dataset; never claim it is BIGANN 10M")
 a=p.parse_args()
 if a.repeats<1:p.error("repeats must be positive")
+algorithms=a.algorithms.split(",")
+if not algorithms or any(x not in ("pipnn","hnsw","fastpipnn") for x in algorithms):p.error("unknown algorithm")
 paths=[Path(name).resolve() for name in (a.base,a.queries,a.gt)]
 for path in paths:
     if not path.is_file():p.error(f"missing input: {path}; use prepare_bigann.py or supply local paths")
@@ -52,7 +55,7 @@ metadata={"parameters":vars(a),"dataset_label":"custom/smoke" if a.allow_small e
 results=[]
 try:
     for repeat in range(a.repeats):
-        order=["pipnn","hnsw"] if repeat%2==0 else ["hnsw","pipnn"]
+        order=algorithms if repeat%2==0 else algorithms[::-1]
         for algorithm in order:
             target=out/f"{algorithm}-{repeat}.json"
             command=[str(binary),"--algorithm",algorithm,"--base",str(paths[0]),

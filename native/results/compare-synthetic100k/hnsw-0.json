@@ -1,0 +1,9 @@
+{
+"algorithm":"hnsw","n":100000,"dimension":128,"query_count":200,"threads":4,"query_threads":1,"load_seconds":0.024824301,"build_seconds":4.813023871,"build_peak_mib":80.0859375,"degree":64,"leaf_size":1024,"local_k":2,"reservoir":160,"hash_bits":12,"alpha":1.2,"fanout":"10,3,1","leaders":1000,"m":32,"ef_construction":200,"entry":"medoid","distance":"squared_l2_uint8","queries":[
+{"beam":16,"recall_at_10":0.8915,"qps":34719.71469,"median_seconds":0.005760416},
+{"beam":32,"recall_at_10":0.976,"qps":22235.43007,"median_seconds":0.008994654},
+{"beam":64,"recall_at_10":0.999,"qps":11020.08217,"median_seconds":0.018148685},
+{"beam":128,"recall_at_10":0.9995,"qps":5298.531027,"median_seconds":0.037746311},
+{"beam":256,"recall_at_10":1,"qps":3542.165164,"median_seconds":0.056462641},
+{"beam":512,"recall_at_10":1,"qps":2943.381626,"median_seconds":0.067949055}
+],"peak_mib":80.34765625}
