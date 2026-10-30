@@ -8,6 +8,17 @@ resolution-markers = [
 ]
 
 [[package]]
+name = "hnswlib"
+version = "0.8.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/cf/7a/1a9b1405f2eb59515f06c3074750b03e0e96edf7fee0f6dd6df81d9c21d7/hnswlib-0.8.0.tar.gz", hash = "sha256:cb6d037eedebb34a7134e7dc78966441dfd04c9cf5ee93911be911ced951c44c", size = 36206, upload-time = "2023-12-03T04:16:17.55Z" }
+
+[[package]]
 name = "mutable-pipnn-demo"
 version = "0.1.0"
 source = { virtual = "." }
@@ -17,8 +28,17 @@ dependencies = [
     { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 
+[package.optional-dependencies]
+compare = [
+    { name = "hnswlib" },
+]
+
 [package.metadata]
-requires-dist = [{ name = "numpy", specifier = ">=1.24" }]
+requires-dist = [
+    { name = "hnswlib", marker = "extra == 'compare'", specifier = ">=0.8.0" },
+    { name = "numpy", specifier = ">=1.24" },
+]
+provides-extras = ["compare"]
 
 [[package]]
 name = "numpy"

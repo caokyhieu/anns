@@ -5,5 +5,10 @@ description = "Readable PiPNN prototype with local graph mutations"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]
 
+[project.optional-dependencies]
+compare = [
+    "hnswlib>=0.8.0",
+]
+
 [tool.uv]
 package = false

@@ -100,6 +100,46 @@ percentiles. No speedup or large-scale claim follows from this experiment.
 The navigation graph intentionally favors directional diversity; its adjacency
 lists are not exact top-k lists. Reported recall measures search results.
 
+## Comparing with HNSW
+
+compare_hnsw.py runs this PiPNN and hnswlib (installed by the optional
+`compare` extra) on identical vectors, queries, and a pre-generated
+build/add/delete/update/churn workload. After each stage it recomputes exact
+top-10 neighbors once and sweeps beam width (PiPNN `beam`, HNSW `ef`).
+
+```bash
+uv sync --locked --extra compare
+uv run --locked --extra compare python compare_hnsw.py --seeds 7 19
+```
+
+Defaults: 1,000 vectors, 32 dimensions, 100 queries, 50 operations per stage,
+beams 10/16/32/64/128. PiPNN uses degree 24; HNSW uses M=12 (layer-0 degree 24)
+and ef_construction=200. Both run single-threaded. HNSW deletion is a tombstone
+(`mark_deleted`); HNSW update re-adds the existing label.
+
+Smallest beam reaching mean recall@10 targets over seeds 7 and 19
+(raw records in compare-results.json):
+
+| Stage | Algorithm | mutation ms/op | beam@90% | beam@95% | beam@99% |
+| --- | --- | ---: | ---: | ---: | ---: |
+| build | pipnn | — | 16 | 16 | 32 |
+| build | hnsw | — | 16 | 16 | 32 |
+| add | pipnn | 147.05 | 16 | 16 | 32 |
+| add | hnsw | 0.10 | 16 | 32 | 32 |
+| delete | pipnn | 158.24 | 16 | 16 | 32 |
+| delete | hnsw | 0.00 | 16 | 32 | 32 |
+| update | pipnn | 268.70 | 16 | 16 | 32 |
+| update | hnsw | 0.59 | 16 | 32 | 64 |
+| churn | pipnn | 156.21 | 16 | 16 | 32 |
+| churn | hnsw | 0.20 | 16 | 32 | 32 |
+
+Read recall, not time: this is pure Python against C++ hnswlib, so timings are
+three orders of magnitude apart for reasons unrelated to the algorithms.
+PiPNN search also starts from one representative per routed leaf, while HNSW
+descends from a single entry point, which helps PiPNN at small beams.
+For a compiled, static comparison against upstream PiPNN use native/
+(`native/scripts/run_benchmark.py`).
+
 ## Limitations
 
 - Python dictionaries and retained local candidate lists use more memory than
