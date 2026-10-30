@@ -53,7 +53,7 @@ def search(graph, emb, q, mask, k, beam, policy, entries):
     for d, i in cand:
         if mask[i]:
             heapq.heappush(top, (-d, i))
-    top = heapq.nsmallest(beam, top)
+    top = heapq.nlargest(beam, top)  # (-d, i): the nearest `beam`
     heapq.heapify(top)
     while cand:
         d, i = heapq.heappop(cand)

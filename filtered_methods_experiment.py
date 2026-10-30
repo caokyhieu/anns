@@ -99,7 +99,7 @@ def graph_search(graph, emb, q, mask, k, beam, policy, entries):
     cand = list(zip(dist(entries).tolist(), entries.tolist()))
     heapq.heapify(cand)
     top = [(-d, i) for d, i in cand]
-    top = heapq.nsmallest(beam, top)
+    top = heapq.nlargest(beam, top)  # (-d, i): the nearest `beam`
     heapq.heapify(top)
     while cand:
         d, i = heapq.heappop(cand)
@@ -330,6 +330,7 @@ def main():
     ap.add_argument("--k", type=int, default=100)
     ap.add_argument("--beam", type=int, default=200)
     ap.add_argument("--entries", type=int, default=64)
+    ap.add_argument("--beam-sweep", type=int, nargs="+", default=[100, 400])
     ap.add_argument("--entry-sweep", type=int, nargs="+", default=[1, 8, 64, 512])
     ap.add_argument("--queries", type=int, default=20)
     ap.add_argument("--partitions", type=int, default=256)
@@ -487,6 +488,9 @@ def main():
             for policy in ("acorn", "navix"):
                 score(f"{policy}/{gname}", lambda q: graph_search(gr, emb, q, m, k, a.beam, policy, entries(a.entries)))
         for gname in ("hnsw-d64", "pipnn-d64-dense"):
+            for beam in a.beam_sweep:
+                for policy in ("acorn", "navix"):
+                    score(f"{policy}/{gname}/beam={beam}", lambda q: graph_search(graphs[gname], emb, q, m, k, beam, policy, entries(a.entries)))
             for cnt in a.entry_sweep:
                 score(f"navix/{gname}/entries={cnt}", lambda q: graph_search(graphs[gname], emb, q, m, k, a.beam, "navix", entries(cnt)))
         for gname in ("hnsw-d32", "pipnn-d64"):
