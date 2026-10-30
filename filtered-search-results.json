@@ -1,0 +1,255 @@
+{
+ "config": {
+  "root": "lance-filtered",
+  "n": 200000,
+  "dim": 64,
+  "clusters": 400,
+  "partitions": 256,
+  "nprobes": 16,
+  "k": 100,
+  "queries": 50,
+  "flat_rows": 10000,
+  "seed": 7,
+  "output": "filtered-search-results.json"
+ },
+ "results": [
+  {
+   "filter": "none",
+   "relation": "uncorrelated",
+   "selectivity": 1.0,
+   "passing_rows": 200000,
+   "pre_fixed": {
+    "recall": 1.0,
+    "returned": 100.0,
+    "ms": 8.9
+   },
+   "pre_expand": {
+    "recall": 1.0,
+    "returned": 100.0,
+    "ms": 7.2
+   },
+   "flat": {
+    "recall": 1.0,
+    "returned": 100.0,
+    "ms": 24.2
+   }
+  },
+  {
+   "filter": "weather = 'rain'",
+   "relation": "uncorrelated",
+   "selectivity": 0.20006,
+   "passing_rows": 40013,
+   "post": {
+    "recall": 0.2,
+    "returned": 20.0,
+    "ms": 7.8
+   },
+   "pre_fixed": {
+    "recall": 0.996,
+    "returned": 100.0,
+    "ms": 6.6
+   },
+   "pre_expand": {
+    "recall": 0.996,
+    "returned": 100.0,
+    "ms": 6.6
+   },
+   "flat": {
+    "recall": 1.0,
+    "returned": 100.0,
+    "ms": 34.6
+   },
+   "planner": {
+    "recall": 1.0,
+    "returned": 100.0,
+    "ms": 12.4
+   }
+  },
+  {
+   "filter": "pedestrian (10%)",
+   "relation": "uncorrelated",
+   "selectivity": 0.10003,
+   "passing_rows": 20007,
+   "post": {
+    "recall": 0.098,
+    "returned": 9.8,
+    "ms": 8.0
+   },
+   "pre_fixed": {
+    "recall": 0.934,
+    "returned": 100.0,
+    "ms": 6.0
+   },
+   "pre_expand": {
+    "recall": 0.934,
+    "returned": 100.0,
+    "ms": 6.4
+   },
+   "flat": {
+    "recall": 1.0,
+    "returned": 100.0,
+    "ms": 52.7
+   },
+   "planner": {
+    "recall": 1.0,
+    "returned": 100.0,
+    "ms": 17.1
+   }
+  },
+  {
+   "filter": "cut_in (1%)",
+   "relation": "uncorrelated",
+   "selectivity": 0.00984,
+   "passing_rows": 1969,
+   "post": {
+    "recall": 0.01,
+    "returned": 1.0,
+    "ms": 8.2
+   },
+   "pre_fixed": {
+    "recall": 0.569,
+    "returned": 100.0,
+    "ms": 5.5
+   },
+   "pre_expand": {
+    "recall": 0.569,
+    "returned": 100.0,
+    "ms": 6.0
+   },
+   "flat": {
+    "recall": 1.0,
+    "returned": 100.0,
+    "ms": 26.2
+   },
+   "planner": {
+    "recall": 1.0,
+    "returned": 100.0,
+    "ms": 25.6
+   }
+  },
+  {
+   "filter": "rain AND cut_in",
+   "relation": "uncorrelated",
+   "selectivity": 0.00199,
+   "passing_rows": 399,
+   "post": {
+    "recall": 0.001,
+    "returned": 0.1,
+    "ms": 8.4
+   },
+   "pre_fixed": {
+    "recall": 0.317,
+    "returned": 55.2,
+    "ms": 5.3
+   },
+   "pre_expand": {
+    "recall": 0.503,
+    "returned": 100.0,
+    "ms": 6.6
+   },
+   "flat": {
+    "recall": 1.0,
+    "returned": 100.0,
+    "ms": 10.3
+   },
+   "planner": {
+    "recall": 1.0,
+    "returned": 100.0,
+    "ms": 11.4
+   }
+  },
+  {
+   "filter": "emergency_vehicle (0.1%)",
+   "relation": "uncorrelated",
+   "selectivity": 0.00097,
+   "passing_rows": 193,
+   "post": {
+    "recall": 0.001,
+    "returned": 0.1,
+    "ms": 7.0
+   },
+   "pre_fixed": {
+    "recall": 0.245,
+    "returned": 31.2,
+    "ms": 4.5
+   },
+   "pre_expand": {
+    "recall": 0.674,
+    "returned": 100.0,
+    "ms": 7.7
+   },
+   "flat": {
+    "recall": 1.0,
+    "returned": 100.0,
+    "ms": 7.5
+   },
+   "planner": {
+    "recall": 1.0,
+    "returned": 100.0,
+    "ms": 8.2
+   }
+  },
+  {
+   "filter": "tunnel, query inside",
+   "relation": "correlated",
+   "selectivity": 0.00995,
+   "passing_rows": 1989,
+   "post": {
+    "recall": 1.0,
+    "returned": 100.0,
+    "ms": 8.3
+   },
+   "pre_fixed": {
+    "recall": 1.0,
+    "returned": 100.0,
+    "ms": 4.9
+   },
+   "pre_expand": {
+    "recall": 1.0,
+    "returned": 100.0,
+    "ms": 4.9
+   },
+   "flat": {
+    "recall": 1.0,
+    "returned": 100.0,
+    "ms": 23.3
+   },
+   "planner": {
+    "recall": 1.0,
+    "returned": 100.0,
+    "ms": 24.1
+   }
+  },
+  {
+   "filter": "tunnel, query outside",
+   "relation": "anti-correlated",
+   "selectivity": 0.00995,
+   "passing_rows": 1989,
+   "post": {
+    "recall": 0.0,
+    "returned": 0.0,
+    "ms": 6.6
+   },
+   "pre_fixed": {
+    "recall": 0.171,
+    "returned": 34.0,
+    "ms": 3.7
+   },
+   "pre_expand": {
+    "recall": 0.509,
+    "returned": 100.0,
+    "ms": 5.4
+   },
+   "flat": {
+    "recall": 1.0,
+    "returned": 100.0,
+    "ms": 28.4
+   },
+   "planner": {
+    "recall": 1.0,
+    "returned": 100.0,
+    "ms": 27.1
+   }
+  }
+ ]
+}

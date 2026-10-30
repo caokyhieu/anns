@@ -208,7 +208,9 @@ lance_pipeline_demo.py runs it end to end (`uv sync --locked --extra lance` firs
 LANCE_VS_PIPNN_BUILD.md compares Lance's IVF build with a PiPNN-style hierarchical
 partition assignment (same recall and QPS, up to 33x faster assignment);
 ivf_build_experiment.py measures it against pylance, and hier_build_experiment.py
-tests local leaf training and boundary spilling:
+tests local leaf training and boundary spilling. FILTERED_SEARCH.md measures hybrid
+(label filter + vector) search on Lance against filter selectivity and correlation, and
+lists the planner, layout and sub-index changes it implies (filtered_search_experiment.py):
 
 ```bash
 uv run --locked python -m unittest -v test_dpipnn
@@ -217,6 +219,7 @@ uv run --locked python retrieval_experiment.py     # writes retrieval-results.js
 uv run --locked --extra lance python lance_pipeline_demo.py
 uv run --locked --extra compare --extra lance python ivf_build_experiment.py --lance
 uv run --locked python hier_build_experiment.py    # writes hier-build-results.json
+uv run --locked --extra lance python filtered_search_experiment.py
 ```
 
 ## Limitations
