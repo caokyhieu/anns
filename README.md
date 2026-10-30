@@ -192,9 +192,10 @@ duplicate guard splits randomly at depth 8 (reference: 3) or when a child equals
 parent; distances in reservoirs are bfloat16 like the reference, but final pruning
 recomputes exact distances. No graph save/load, no MIPS, no int8/float benchmarks yet.
 
-## Distributed PiPNN (exabyte-scale design)
+## Distributed PiPNN (~10^11 vectors)
 
-DISTRIBUTED.md covers adapting PiPNN to 2–3 EB, drawing on DistributedANN, SPIRE and SPANN:
+DISTRIBUTED.md covers adapting PiPNN to about 10^11 vectors (embeddings of a 2–3 EB
+autonomous-driving data lake), drawing on DistributedANN, SPIRE and SPANN:
 scale arithmetic, a MapReduce-shaped distributed build (balanced shards, closure
 replicas, per-shard leaf k-NN, exactly mergeable HashPrune combiner, owner-side
 RobustPrune), serving, and graph vs. inverted lists. dpipnn.py simulates it in one
