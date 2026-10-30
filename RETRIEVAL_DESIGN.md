@@ -258,6 +258,101 @@ for exploration, not the system of record.
 5. Compare against Milvus or cuVS IVF-RaBitQ at 10^9 as an off-the-shelf baseline
    before building custom components.
 
+## 7. Building on Lance (ByteDance Volcano Engine's stack)
+
+Volcano Engine's LAS (Lake for AI Service) runs its autonomous-driving data lake on
+the open **Lance** format. It reports, vendor-side: up to 70% less storage, GPU
+utilization up from 60% to 96%, and 10 PB of label processing cut from 4 days to 1.
+It also reports distributed IVF-PQ training across Lance fragments cutting a 7-day
+pipeline to 1 day, and a 100K+ QPS hybrid-search deployment. LanceDB claims flat
+latency at 10B+ vectors (HNSW over centroids, RaBitQ), but publishes no recall numbers
+at that scale. The notes below come from Lance's open-source docs and code
+(`lance-format/lance`, commit `47540d0`), not from the blog posts, which this
+environment could not open.
+
+### 7.1 What Lance already provides (and how it maps onto §4)
+
+| Our design | Lance feature | Notes |
+| --- | --- | --- |
+| Posting lists of compressed codes | **IVF index** = clustering + sub-index + quantizer. `IVF_RQ` (RaBitQ, default 5 bits) is the recommended default; also `IVF_PQ`, `IVF_SQ`, `IVF_FLAT`, `IVF_HNSW_*` | Partitions are stored contiguously in `auxiliary.idx`, so one partition is one range read. 1-bit RQ is `d/8 + 20` bytes per row (116 B at 768-d, about 116 TB per embedding column at 10^12). 5-bit is `d/8 + 4d/8 + 28` (508 B, about 508 TB) |
+| Re-rank with better distances | `refine_factor` re-ranks k × factor candidates with full vectors | The full embedding column stays in the table |
+| Streaming build | IVF training on a sample (`num_partitions × 256 × d × 4` bytes), then a streaming "shuffle" pass that assigns, quantizes and writes per-partition files | Same shape as §4.2 step 3. The build trains an HNSW over the centroids to speed assignment once `#centroids × d ≥ 10^6` |
+| Distributed build | **Segments**: each worker indexes a set of fragments into `indices/<uuid>/`. The caller merges groups and commits them as one logical index. Shared model artifacts (one set of IVF centroids and codebooks for all workers) keep partition IDs meaning the same thing everywhere | Lance has no scheduler; Ray or Spark drives it (`lance-ray`, `lance-spark`) |
+| Daily ingestion | Appends stay searchable through a flat scan of unindexed rows. `optimize_indices` assigns new rows to existing partitions; `retrain=True` rebuilds. MemWAL (experimental) is an LSM layer for streaming writes | SPFresh-style split and reassign is **not** provided |
+| Filters | `prefilter=True` plus scalar indices: bitmap, B-tree, label_list, zone map, **R-tree** (GPS), bloom filter, JSON | Covers time, region, rig, tags and geography |
+| Caption search (CARIM-style) | Full-text BM25 index, combined with vector search in one scanner | Hybrid queries out of the box |
+| Several embeddings per segment | **Data evolution**: add and backfill new columns without rewriting data files | New embedding models (video, BEV, trajectory) become new columns, each with its own index |
+| Raw sensor payloads | **Blob v2** (inline, packed or dedicated files, or external URIs), `take_blobs` for partial reads | Video, LiDAR and radar stay next to their metadata, or point into the existing lake |
+| Training reads | `lance.torch` dataset, `ShardedFragmentSampler`, fast random access by row address | Manifests can be lists of row addresses |
+| Reproducible datasets | Versioning, tags and branches (zero-copy) | Pin the exact snapshot each training set came from |
+
+### 7.2 Gaps at 10^12 vectors and large k
+
+1. **Query fan-out across segments.** At query time Lance searches **each segment
+   independently**, ranking partitions with that segment's centroids, then merges by
+   distance. A 10^12 table indexed as hundreds of segments (for example one per day
+   or month) is therefore partition-and-route by write time: every unfiltered query
+   touches every segment. Fixes:
+   - train **one shared IVF model** on a global sample and give it to every worker;
+   - route each query **once** against the shared centroids;
+   - read partition p from every segment (partition p is just split by time across
+     segments).
+
+   Time filters then prune whole segments, and merging segments reduces the count.
+2. **The centroid router does not scale to ~10^8 partitions.** Training memory grows as
+   `num_partitions × 256 × d × 4` bytes (about 786 GB at 10^6 partitions, 768-d).
+   Partition lookup uses the centroid set, which at 10^8 needs a graph. Keep about
+   10^5–10^6 shared partitions (about 10^6–10^7 rows each), which is coarser than
+   §4.1, or add our hierarchical, PiPNN-graph router (§5) over finer partitions.
+3. **No boundary replication.** IVF assigns each vector to one partition, with no SPANN
+   closure or SOAR spilling. Use more probes, or write a spilled copy into a second
+   partition during the custom build.
+4. **No batch-of-queries execution.** The API is one query at a time. The posting-major
+   batch engine in §4.3 (route the job, invert to partition → queries, read each
+   partition once, score it against all its queries on GPU) has to be built on top.
+   The index files are open-spec Lance files, so it can read the
+   `(segment, partition)` ranges directly.
+5. **No SPFresh-style rebalancing.** `optimize_indices` only appends to existing
+   partitions. Monitor partition sizes and either retrain per time window or add a
+   split and reassign job.
+
+### 7.3 Recommended layout on Lance
+
+- **One `segments` table per embedding generation**, with one row per clip segment:
+  - IDs, drive, timestamp, vehicle, rig;
+  - GPS (R-tree), weather and labels (bitmap or label_list), caption (full-text);
+  - model scores (uncertainty);
+  - embedding columns (`emb_video`, `emb_bev`, `emb_traj`, fp16);
+  - blob references to raw video, LiDAR and radar.
+
+  Fragments are written in time order, so time filters prune fragments and segments.
+- **Indexes:** `IVF_RQ` on each embedding column. Use 1-bit for the first pass with
+  `refine_factor` re-ranking, or 5-bit when recall needs it. Shared centroids per
+  column, trained on a 10^8–10^9 sample on GPU. One segment per time window, built by
+  Ray workers.
+- **Custom components** (this repo's direction):
+  - **router:** a PiPNN graph over the shared centroids (§5; measured to match brute
+    force);
+  - **batch planner and scanner:** a Ray job that reads `(segment, partition)` ranges
+    and scores them on GPU, with full-scan fallback (§3 crossover);
+  - **optional spilled assignment** (SOAR or closure) during the build;
+  - **dedup and balanced sampling** over partitions.
+- **Output:** a result Lance table (job ID, query ID, row address, score, sampling
+  weight), versioned and tagged. Training reads blobs through `lance.torch` by row
+  address.
+
+### 7.4 What to verify first
+
+1. Build an `IVF_RQ` index on 10^9 real segment embeddings with shared centroids across
+   about 10 segments. Measure recall at large k against exact search, with and without
+   `refine_factor`.
+2. Measure single-query fan-out cost against segment count, and the gain from routing
+   once against the shared centroids.
+3. Prototype the batch scanner over `auxiliary.idx` partition ranges and measure reads
+   per query against batch size (compare with §3).
+4. Check whether Volcano Engine (LAS) exposes batch or offline vector-retrieval jobs.
+   If it does, the custom scanner may not be needed.
+
 ## Sources
 
 - DistributedANN: [MSR PDF](https://www.microsoft.com/en-us/research/wp-content/uploads/2025/07/DistributedANN_Adams_VecDBICML.pdf), [arXiv 2509.06046](https://arxiv.org/abs/2509.06046)
@@ -285,3 +380,5 @@ for exploration, not the system of record.
 - CoReVLA: [arXiv 2509.15968](https://arxiv.org/abs/2509.15968); OpenLongTail: [arXiv 2607.09655](https://arxiv.org/html/2607.09655); VLA for driving survey: [arXiv 2512.16760](https://arxiv.org/pdf/2512.16760)
 - Tesla training-data patent: [EP3850549B1](https://patents.google.com/patent/EP3850549B1)
 - Lance AV data lake: [Volcano Engine](https://www.lancedb.com/blog/volcano-engine-autonomous-driving-data-lake-solution), [WeRide](https://www.lancedb.com/blog/werides-data-platform-transformation-how-lancedb-fuels-model-development-velocity)
+- Volcano Engine AI stack on Lance: [LanceDB blog](https://www.lancedb.com/blog/volcano-engine-lance-agent-memory); 10B-scale vector search: [LanceDB blog](https://www.lancedb.com/blog/how-lancedb-accelerates-vector-search-at-10-billion-scale), [April 2026 newsletter](https://lancedb.com/blog/newsletter-april-2026)
+- Lance format and docs: [github.com/lance-format/lance](https://github.com/lance-format/lance) (`docs/src/format/index/vector/index.md`, `guide/distributed_indexing.md`, `guide/vector_search.md`, `guide/performance.md`, `guide/blob.md`, `guide/data_evolution.md`, `format/table/mem_wal.md`)
