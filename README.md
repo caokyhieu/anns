@@ -204,13 +204,17 @@ recommended design for training-data retrieval (large k, batched jobs, fast inde
 with a literature survey; retrieval_experiment.py measures large-k recall, build time
 and batch amortization for graph vs. posting lists. LANCE_PIPELINE.md explains how a
 Lance-based (Volcano Engine-style) pipeline prepares multimodal AV training data, and
-lance_pipeline_demo.py runs it end to end (`uv sync --locked --extra lance` first):
+lance_pipeline_demo.py runs it end to end (`uv sync --locked --extra lance` first).
+LANCE_VS_PIPNN_BUILD.md compares Lance's IVF build with a PiPNN-style hierarchical
+partition assignment (same recall and QPS, up to 33x faster assignment);
+ivf_build_experiment.py measures it against pylance:
 
 ```bash
 uv run --locked python -m unittest -v test_dpipnn
 uv run --locked python distributed_experiment.py   # writes distributed-results.json
 uv run --locked python retrieval_experiment.py     # writes retrieval-results.json
 uv run --locked --extra lance python lance_pipeline_demo.py
+uv run --locked --extra compare --extra lance python ivf_build_experiment.py --lance
 ```
 
 ## Limitations
