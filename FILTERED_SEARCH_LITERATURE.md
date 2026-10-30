@@ -298,3 +298,7 @@ In order of value for effort:
 ```bash
 uv run --locked --extra lance --extra compare python filtered_degree_check.py
 ```
+
+FILTERED_METHODS.md implements these methods (NaviX, ACORN, Milvus's fallbacks, CAPS,
+SIEVE, PathFinder, GLS ρ) on our HNSW, fastpipnn, k-NN and IVF indexes and reports
+which claims hold on this data.
