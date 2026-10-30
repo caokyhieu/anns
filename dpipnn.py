@@ -16,6 +16,7 @@ HashPrune keeps, per source, the nearest candidate per hash bucket and then the
 mergeable: hashprune(A + B) == hashprune(hashprune(A) + hashprune(B)).
 """
 from dataclasses import dataclass, field
+from time import perf_counter
 import numpy as np
 
 
@@ -311,23 +312,43 @@ def build_partitioned(x, shards=8, p=None, seed=None):
 # ---- Serving -----------------------------------------------------------------------
 
 def beam_search(x, cluster, q, seeds, beam, k):
-    """Best-first beam search; returns top-k IDs and the expansion (node read) sequence."""
+    """Best-first beam search; returns top-k IDs, the expansion (node read) sequence and
+    the number of distance evaluations. The pool is a sorted (distance, ID) array."""
     seeds = np.unique(seeds)
-    known = dict(zip(seeds.tolist(), sqdist(q[None], x[seeds])[0].tolist()))
-    pool = sorted((d, i) for i, d in known.items())[:beam]
-    done, reads = set(), []
+    seen = np.zeros(len(x), bool)
+    seen[seeds] = True
+    ds = sqdist(q[None], x[seeds])[0]
+    order = np.lexsort((seeds, ds))[:beam]
+    ids, ds = seeds[order], ds[order]
+    expanded = np.zeros(len(ids), bool)
+    reads, evals, cursor = [], len(seeds), 0
     while True:
-        nxt = next((i for _, i in pool if i not in done), None)
-        if nxt is None:
+        while cursor < len(ids) and expanded[cursor]:
+            cursor += 1
+        if cursor == len(ids):
             break
-        done.add(nxt)
-        reads.append(nxt)
-        nb = [j for j in cluster.neighbors(nxt).tolist() if j not in known]
-        if nb:
-            ds = sqdist(q[None], x[nb])[0]
-            known.update(zip(nb, ds.tolist()))
-            pool = sorted(pool + list(zip(ds.tolist(), nb)))[:beam]
-    return [i for _, i in pool[:k]], reads, len(known)
+        expanded[cursor] = True
+        p = int(ids[cursor])
+        reads.append(p)
+        nb = cluster.neighbors(p)
+        nb = nb[~seen[nb]]
+        if not len(nb):
+            continue
+        seen[nb] = True
+        evals += len(nb)
+        nd = sqdist(q[None], x[nb])[0]
+        o = np.lexsort((nb, nd))
+        nb, nd = nb[o], nd[o]
+        pos = np.searchsorted(ds, nd, side="right")
+        keep = pos < beam
+        if not keep.any():
+            continue
+        nb, nd, pos = nb[keep], nd[keep], pos[keep]
+        ids = np.insert(ids, pos, nb)[:beam]
+        ds = np.insert(ds, pos, nd)[:beam]
+        expanded = np.insert(expanded, pos, False)[:beam]
+        cursor = min(cursor, int(pos[0]))
+    return ids[:k].tolist(), reads, evals
 
 
 class Head:
@@ -367,11 +388,23 @@ def search_routed(x, cluster, head, q, beam, probes, k=10):
 # ---- SPANN-style inverted index (comparison) ---------------------------------------
 
 class Spann:
-    """Posting lists with closure assignment; centroids live in memory, postings on disk."""
-    def __init__(self, x, posting=64, eps1=0.15, max_replicas=8, rng_rule=True, seed=0):
+    """Posting lists with closure assignment; centroids live in memory, postings on disk.
+
+    router="graph" finds the nearest postings with a PiPNN graph over the centroids
+    instead of a brute-force scan: at 10^12 vectors there are ~10^9 centroids.
+    """
+    def __init__(self, x, posting=64, eps1=0.15, max_replicas=8, rng_rule=True, seed=0,
+                 router="brute", router_params=None):
         rng = np.random.default_rng(seed)
         self.x = x
         self.centers = kmeans(x, max(2, len(x) // posting), rng, iters=6)
+        self.router = None
+        if router == "graph":
+            start = perf_counter()
+            self.router = build(self.centers, 1, router_params or Params(leaf_size=128, degree=24, reservoir=48))
+            self.router_head = Head(self.centers, fraction=0.02, seed=seed)
+            self.router_seconds = perf_counter() - start
+        # Assignment uses exact centroid distances here; at scale it would use the router.
         order, dist = nearest(x, self.centers, max_replicas)
         keep = closure(order, dist, eps1, max_replicas, self.centers, rng_rule)
         rows, cols = np.nonzero(keep)
@@ -381,16 +414,38 @@ class Spann:
         self.offsets = np.r_[0, np.cumsum(np.bincount(lists, minlength=len(self.centers)))]
         self.replication = len(rows) / len(x)
 
+    def route(self, x, count):
+        """Nearest `count` centroids per row (sorted), brute force or via the router graph."""
+        count = min(count, len(self.centers))
+        if self.router is None:
+            return nearest(x, self.centers, count)
+        order = np.empty((len(x), count), np.int64)
+        for r, v in enumerate(x):
+            found, _, _ = beam_search(self.centers, self.router, v, self.router_head.entry(v),
+                                      max(2 * count, 32), count)
+            order[r] = found
+        diff = self.centers[order] - x[:, None]
+        return order, np.einsum("ijk,ijk->ij", diff, diff)
+
+    def probe(self, q, probes, eps2=0.6):
+        """Postings to scan: the nearest `probes`, pruned to within (1+eps2) of the first."""
+        order, d = self.route(q[None], probes)
+        root = np.sqrt(d[0])
+        return order[0][root <= (1 + eps2) * root[0]]
+
     def search(self, q, probes, eps2=0.6, k=10, page_vectors=32):
-        d = sqdist(q[None], self.centers)[0]
-        order = np.argsort(d, kind="stable")[:probes]
-        root = np.sqrt(d[order])
-        order = order[root <= (1 + eps2) * root[0]]
-        ids = np.concatenate([self.members[self.offsets[c]:self.offsets[c+1]] for c in order])
+        lists = self.probe(q, probes, eps2)
+        ids = np.concatenate([self.members[self.offsets[c]:self.offsets[c+1]] for c in lists])
         scanned = len(ids)
         ids = np.unique(ids)
         ds = sqdist(q[None], self.x[ids])[0]
-        found = ids[np.argsort(ds, kind="stable")[:k]].tolist()
-        sizes = np.diff(self.offsets)[order]
-        return found, dict(lists=len(order), vectors_scanned=scanned,
+        top = np.argpartition(ds, k - 1)[:k] if k < len(ids) else np.arange(len(ids))
+        found = ids[top[np.lexsort((ids[top], ds[top]))]].tolist()
+        sizes = np.diff(self.offsets)[lists]
+        return found, dict(lists=len(lists), vectors_scanned=scanned,
                            pages=int(np.ceil(sizes / page_vectors).sum()))
+
+    def batch_io(self, probe_lists):
+        """Vectors read when a batch scans each probed posting once for all its queries."""
+        union = np.unique(np.concatenate(probe_lists))
+        return int(np.diff(self.offsets)[union].sum()), len(union)

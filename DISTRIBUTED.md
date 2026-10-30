@@ -7,32 +7,64 @@ into them. The notes are based on three papers,
 read in the requested order, and on a simulated prototype (`dpipnn.py`,
 `distributed_experiment.py`, `test_dpipnn.py`) that tests the parts we can test on one machine.
 
-> **Source caveat.** arxiv.org was not reachable from the environment that wrote
-> these notes. Paper details below come from the abstracts and from secondary
-> summaries found by web search. Statements marked *(summary)* should be checked
-> against the PDFs before any decision depends on them.
+> **Sources.** DistributedANN and SPANN were read in full, from the PDFs Microsoft
+> Research hosts. SPIRE is only on arxiv.org, which this environment cannot reach, so
+> its details come from the abstract and secondary summaries; those statements are
+> marked *(summary)*. RETRIEVAL_DESIGN.md surveys related work and gives the
+> design for training-data retrieval.
 
 ## 1. What the papers say, and what each means for PiPNN
 
 ### DistributedANN: serving one graph across thousands of machines
 [Adams et al., ICML 2025 VecDB workshop, arXiv:2509.06046](https://arxiv.org/abs/2509.06046)
 
-- One 50-billion-vector DiskANN graph spread across more than 1,000 machines. Median
-  latency is 26 ms at over 100k QPS. It is deployed in Bing over hundreds of billions of vectors.
-- It is built from two well-understood components: a **distributed key-value store
-  used as a large shared disk** (it holds the graph nodes) and an **in-memory head
-  index** (built from the graph's top layers) that supplies beam-search entry points.
-- The authors report it is **about 6× more efficient than partition-and-route** (sending
-  each query to a subset of independently indexed partitions).
-- *(summary)* Compressed (PQ) neighbor vectors are duplicated into each graph node, and
-  node scoring runs on the storage hosts, so a hop returns scored candidates rather
-  than raw bytes. The global graph is built by stitching cluster-partitioned graphs.
-  The head index is reported as the CPU bottleneck.
+- One DiskANN graph over a 50-billion-vector slice of the Bing index (384-d int8),
+  spread across more than 1,000 machines. Median latency is 26 ms (p99 35 ms) at over
+  100k QPS. It replaced the partitioned production system in Bing, which serves
+  "hundreds of billions" of vectors.
+- **Layout.** A distributed key-value store holds the graph nodes and is treated as a
+  shared disk. Each node stores the full vector, up to R = 72 neighbor IDs (8 bytes
+  each), and the **OPQ codes of all its neighbors**. That is about 10× space
+  amplification, and it means each hop needs one read. A **head index** is built from
+  the top layers of the graph, collected by breadth-first traversal: 2.5B vectors in a
+  sharded in-memory index. It supplies entry points.
+- **Near-data scoring.** A node-scoring service on every key-value host reads the
+  requested nodes, computes exact distances, and scores neighbors from their OPQ codes.
+  It returns only scored candidates better than the caller's current threshold, which
+  saves about 6× network bandwidth. An orchestration service runs H = 5 rounds of beam
+  width 128 and uses hedged requests.
+- **Build: stitching, not insertion.** Vectors are partitioned into clusters with SPANN
+  closure assignment (boundary vectors go to several partitions). A DiskANN graph is
+  built per partition. The global graph is the union of each replicated vector's
+  neighbor lists across partitions, and the head comes from the union of the
+  partitions' top layers so everything stays reachable. The authors say the stitched
+  graph is lower quality than an incrementally built one, but good enough and much
+  faster to build.
+- **Results against clustered partitioning (40 of 203 partitions searched, ~200M
+  vectors each), at equal footprint for 15k QPS:**
 
-**For PiPNN:** this is the serving model to aim for. One global graph, not N
-independent shard graphs. The hard part DistributedANN had to work around, building
-one graph over data that no single machine holds, is the part PiPNN's design
-handles naturally (§3).
+  | Metric | DistributedANN | Clustered partitioning |
+  | --- | ---: | ---: |
+  | Recall@5 | 90.8% | 83.0% |
+  | Recall@200 | 71.9% | 67.4% |
+  | IOs per query | 640 | 4,800 |
+  | SSD | 780 TiB | 270 TiB |
+  | RAM | 42 TiB | 18 TiB |
+  | Throughput | >100k QPS (SSD-space bound) | ~15k QPS (IO bound) |
+
+  Hosts had 256–768 GiB RAM, 5–10 TiB SSD and 40 Gb/s networking.
+- **Lessons the authors report.** The head index becomes the CPU bottleneck. Recall
+  degrades gracefully when node reads fail (90.8% → 87.0% at 96% availability).
+  Clustered partitions create hot spots. Future work they list: several nearby vectors
+  per graph node, HDD tiering for cold data, and GPU for the head.
+- **For large k, note recall@200 = 71.9%.** Graph search at this scale is tuned for
+  small k. That matters for training-data retrieval (RETRIEVAL_DESIGN.md).
+
+**For PiPNN:** DistributedANN's build is already PiPNN-shaped: closure-replicated
+partitions, a local graph per partition, then a merge of each vector's neighbor lists.
+PiPNN does the same thing more principled. Its merge is HashPrune plus RobustPrune,
+which bounds the degree instead of taking a union and truncating to 72. And its local
+step is a GEMM over leaves, not incremental insertion (§3).
 
 ### SPIRE: distributed construction and the accuracy cost of partitioning
 [Xu et al., arXiv:2512.17264](https://arxiv.org/abs/2512.17264)
@@ -61,16 +93,31 @@ cheap to build and keep in memory (§2).
 ### SPANN: inverted lists instead of a graph
 [Chen et al., NeurIPS 2021, arXiv:2111.08566](https://arxiv.org/abs/2111.08566)
 
-- Memory–disk hybrid. Posting-list centroids are in memory (searched with an SPTAG
-  graph). Posting lists are on disk.
-- Build: hierarchical **balanced** clustering keeps posting lengths even. Then a
-  **closure assignment** adds a boundary vector to every posting whose centroid is
-  within (1+ε1) of its nearest one, capped at 8 replicas. An **RNG rule** skips
-  postings whose centroid is close to an already-chosen one.
-- Query: probe the nearest K postings, and drop any whose centroid is more than (1+ε2)
-  farther than the nearest (query-aware dynamic pruning).
-- Reaches 90% recall about 2× faster than DiskANN at equal memory. Recall@1 and
-  Recall@10 of 90% in about 1 ms with 32 GB of memory on billion-scale data.
+- Memory–disk hybrid. Posting-list centroids are in memory, searched with an SPTAG
+  index (trees plus a relative-neighborhood graph). Each centroid is replaced by the
+  real vector nearest to it, so routing work also scores real candidates. Posting
+  lists are on SSD.
+- **Hierarchical balanced clustering (HBC).** It clusters into a small number k of
+  balanced clusters recursively until each list is under its size limit. That reduces
+  clustering cost from O(N·d·#lists) to O(N·d·k·log_k #lists), and balance keeps
+  per-list reads and latency predictable. It clustered 1M points into 160K lists in
+  about 50 s on 64 threads, and built the whole index in about 2 minutes. A GPU build
+  ran more than 5× faster.
+- **About 16% of points as centroids.** Recall stops improving beyond 16%. Posting
+  lists are capped at 12 KB (byte vectors) or 48 KB (float).
+- **Closure assignment:** add x to list j if Dist(x, c_j) ≤ (1+ε1)·Dist(x, c_1), with
+  ε1 = 10 and at most 8 replicas (more than 8 brings no gain). An **RNG rule** then skips
+  list j if Dist(c_j, x) > Dist(c_{j-1}, c_j), so the replicas point in different
+  directions instead of duplicating nearby lists.
+- **Query-aware pruning:** search list j only if Dist(q, c_j) ≤ (1+ε2)·Dist(q, c_1),
+  with ε2 = 0.6 for recall@1 and 7.0 for recall@10. Query difficulty varies a lot: on
+  SIFT1M, 80% of queries need 6 lists for recall@1, but 99% need 114.
+- **Results:** 2× faster than DiskANN to 90% recall at equal memory on SIFT1B, DEEP1B
+  and SPACEV1B. 90% recall@1 and recall@10 in about 1 ms with 32 GB of memory.
+- **Distributed extension:** balanced partitions with closure assignment, plus query
+  pruning to limit how many machines each query reaches. Partitions are made smaller
+  than machines and bin-packed onto machines by historical query access, to avoid hot
+  spots. Closure adds about 20% more vectors per machine.
 
 **For PiPNN:** PiPNN's leaves *are* balanced, overlapping posting lists, so PiPNN
 can produce a SPANN index from its own partition step. The graph-versus-postings choice
