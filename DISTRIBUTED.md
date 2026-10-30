@@ -168,7 +168,7 @@ Recommended layout, following DistributedANN:
 - **Graph store:** node records keyed by vector ID, placed on the primary shard's
   machine (each record holds the vector or its code, plus adjacency). Primary ownership
   follows the build partition, so most hops stay on one machine. In the experiment
-  about 40–45% of edges cross shards at 8 shards, which is the price of one global graph.
+  about half of the final edges cross shards at 8 shards, which is the price of one global graph.
 - **Head:** an in-memory tier. A PiPNN graph over a 0.01–0.1% sample (or over the
   partition leaders, which PiPNN already computed), replicated for QPS, since
   DistributedANN reports the head as the bottleneck. At 10^15 the head is itself
@@ -189,7 +189,7 @@ Recommended layout, following DistributedANN:
 | Storage medium | NVMe (needs IOPS) | HDD or object storage OK (needs bandwidth) |
 | Memory | head tier only | centroids, which at 10^15 must be hierarchical |
 | Build | distributed PiPNN (§3) | balanced clustering + closure. PiPNN partition gives this |
-| Recall vs. cost | best reads-per-recall in our test | more bytes per query, fewer IOs |
+| Recall vs. cost | fewest reads per unit of recall in our test | more bytes per query, fewer IOs |
 | Updates | segment rebuilds | append to postings, rebalance (SPFresh) |
 
 Recommendation for 2–3 EB:
@@ -211,7 +211,61 @@ parameters: leaf 256, intra-shard fanout (4, 2), local k 4, reservoir 64, degree
 "Reads" counts expanded nodes (one graph-store read each). "Shards" counts the distinct
 shards a query touched. Raw records are in `distributed-results.json`.
 
-RESULTS_PLACEHOLDER
+**Build (S = 8 except the single-machine row):**
+
+| Index | Replication | Mean degree | Cross-shard edges | Edge shuffle | Replica vectors |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| single machine | 1.00 | 16.5 | — | — | — |
+| no replicas (partitioned) | 1.00 | 15.2 | 0% | 0 | 0 |
+| global, top-2 shards | 2.00 | 21.8 | 46% | 49.9 MB | 25.7 MB |
+| global, ε = 0.05 | 2.16 | 21.2 | 49% | 57.0 MB | 29.7 MB |
+| global, ε = 0.1 | 3.21 | 23.3 | 51% | 112.5 MB | 56.6 MB |
+| global, ε = 0.1, no combiner | 3.21 | 23.3 | 51% | 233.0 MB | 56.6 MB |
+| global, ε = 0.2 | 3.93 | 24.1 | 48% | 149.8 MB | 75.0 MB |
+
+ε rows cap replication at 4 shards. The combiner halved the edge shuffle and produced a
+bit-identical graph (`identical_to_combined: true`). The dataset is 25.6 MB of raw
+vectors, so at ε = 0.1 the build moves about 6.6× the data volume over the network.
+This network cost is the number to cut at exabyte scale.
+
+**Search (recall@10, reads per query, distinct shards touched per query):**
+
+| Index | Setting | Recall@10 | Reads | Distance evals | Shards |
+| --- | --- | ---: | ---: | ---: | ---: |
+| single machine | beam 32 | 0.958 | 33.6 | 391 | 1 |
+| single machine | beam 64 | 0.981 | 65.3 | 613 | 1 |
+| global ε = 0.05 | beam 32 | 0.972 | 33.4 | 452 | 3.8 |
+| global ε = 0.05 | beam 64 | 0.988 | 65.3 | 734 | 4.4 |
+| global ε = 0.1 | beam 32 | 0.978 | 33.4 | 464 | 3.7 |
+| global ε = 0.1 | beam 64 | 0.993 | 65.1 | 747 | 4.4 |
+| global top-2 | beam 64 | 0.984 | 65.1 | 766 | 4.3 |
+| global, no replicas | beam 128 | 0.720 | 132.8 | 1081 | 1.8 |
+| partition-and-route | 4 probes, beam 16 | 0.929 | 74.9 | 1105 | 4 |
+| partition-and-route | 8 probes, beam 16 | 0.971 | 153.0 | 2525 | 8 |
+| partition-and-route | 8 probes, beam 32 | 0.988 | 275.8 | 4182 | 8 |
+| SPANN-style | 8 probes | 0.968 | 15.4 pages (400 vectors) | 400 | — |
+| SPANN-style | 32 probes | 0.993 | 42.0 pages (1098 vectors) | 1098 | — |
+
+What this shows:
+
+1. **The global graph beats partition-and-route by about 4–5× in reads.** At about
+   0.97–0.99 recall, partition-and-route needs 153–276 reads against 33–65 for the
+   global graph (5.6× more distance evaluations at 0.99). This is the same direction
+   as DistributedANN's reported 6×.
+2. **Partitioning without boundary replication breaks the graph.** With no replicas,
+   shards become disconnected components, and recall stalls at 0.72 even at beam 128.
+   Closure replication is required, which matches SPIRE's argument.
+3. **The distributed graph matches or beats the single-machine one at equal reads.**
+   Replicas add candidates and mean degree goes from 16.5 to 23.3, so this costs about
+   20% more distance evaluations. It is not a free lunch. The modest ε = 0.05 or
+   top-2 already captures most of the gain at about 2× replication.
+4. **A query touches about 4–5 of the 8 shards, and its reads hop between shards
+   about 28 times at beam 64.** That is SPIRE's cross-node-hop problem. It argues for
+   batching reads per round and pushing scoring to the shard (DistributedANN). It also
+   argues for coarser virtual shards on a machine, so consecutive hops land locally.
+5. **SPANN-style postings reach 0.99 with about 42 sequential pages per query** but scan
+   about 1,100 vectors, compared with 65 random reads for the graph. Postings trade bytes
+   for IOs. The right choice depends on the storage medium, as discussed in §5.
 
 ## 7. What the prototype does not show
 
@@ -219,7 +273,7 @@ RESULTS_PLACEHOLDER
   reads, shards and bytes.
 - The data is 100k synthetic 32-d vectors. Real embeddings at 10^15 have different
   boundary geometry, and closure replication grows quickly with dimension (ε = 0.1
-  already gave 2–3× replication here). Tune ε and the cap on real samples.
+  already gave 3.2× replication here, capped at 4). Tune ε and the cap on real samples.
 - The head is a brute-force sample. Real heads are graphs and add their own recall loss.
 - SPANN here is simplified: flat k-means, no SPTAG, a relative ε form, and one ε2.
   Treat its row as indicative only.
