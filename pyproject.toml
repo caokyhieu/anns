@@ -9,6 +9,10 @@ dependencies = ["numpy>=1.24"]
 compare = [
     "hnswlib>=0.8.0",
 ]
+lance = [
+    "pylance>=14.0",
+    "pyarrow>=20",
+]
 
 [tool.uv]
 package = false

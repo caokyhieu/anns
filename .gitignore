@@ -5,3 +5,4 @@ data/
 native/build*/
 native/third_party/
 native/results/synthetic1m/
+lance-demo/

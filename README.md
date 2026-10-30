@@ -202,12 +202,15 @@ RobustPrune), serving, and graph vs. inverted lists. dpipnn.py simulates it in o
 process, counting reads, shards touched and shuffle bytes. RETRIEVAL_DESIGN.md is the
 recommended design for training-data retrieval (large k, batched jobs, fast indexing),
 with a literature survey; retrieval_experiment.py measures large-k recall, build time
-and batch amortization for graph vs. posting lists:
+and batch amortization for graph vs. posting lists. LANCE_PIPELINE.md explains how a
+Lance-based (Volcano Engine-style) pipeline prepares multimodal AV training data, and
+lance_pipeline_demo.py runs it end to end (`uv sync --locked --extra lance` first):
 
 ```bash
 uv run --locked python -m unittest -v test_dpipnn
 uv run --locked python distributed_experiment.py   # writes distributed-results.json
 uv run --locked python retrieval_experiment.py     # writes retrieval-results.json
+uv run --locked --extra lance python lance_pipeline_demo.py
 ```
 
 ## Limitations
