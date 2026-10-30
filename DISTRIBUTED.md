@@ -1,8 +1,8 @@
-# Distributed PiPNN for ~100 billion vectors
+# Distributed PiPNN for ~1 trillion vectors
 
 Design notes for indexing an autonomous-driving data lake: 2–3 EB of raw video, lidar,
-radar and logs, represented by about **10^11 embedding vectors**. The vectors and index
-are a few hundred TB. The exabytes stay in object storage, and the index holds pointers
+radar and logs, represented by about **10^12 embedding vectors** (1,000 billion). The
+vectors and index are about 2 PB. The exabytes stay in object storage, and the index holds pointers
 into them. The notes are based on three papers,
 read in the requested order, and on a simulated prototype (`dpipnn.py`,
 `distributed_experiment.py`, `test_dpipnn.py`) that tests the parts we can test on one machine.
@@ -77,54 +77,62 @@ can produce a SPANN index from its own partition step. The graph-versus-postings
 then comes down to storage: graphs need many small random reads, postings need a few
 large sequential ones (§5).
 
-## 2. Sizing: 10^11 vectors from 2–3 EB of sensor data
+## 2. Sizing: 10^12 vectors from 2–3 EB of sensor data
 
 The raw sensor data is not indexed. Embeddings are: per frame, per clip or scene, per
 object crop, per lidar sweep. Each vector carries an ID that points back to the
-raw-data blob, timestamp and vehicle in object storage. 10^11 vectors is about 2× the
-50B graph DistributedANN serves in production and about 12× SPIRE's largest real run,
-so it is within demonstrated territory.
+raw-data blob, timestamp and vehicle in object storage.
+
+**10^12 is beyond any published single-graph run.** It is 20× DistributedANN's 50B
+evaluation (its Bing deployment covers "hundreds of billions") and 125× SPIRE's largest
+real run (8B). SPIRE simulated up to 1,024B. Expect to validate recall at 10^10 and
+10^11 before trusting extrapolation to 10^12.
 
 Assume 768-d fp16 embeddings (1.5 KB). Replace this with your model's dimension.
 
-| Item | Per vector | Total for 10^11 | Where it lives |
+| Item | Per vector | Total for 10^12 | Where it lives |
 | --- | ---: | ---: | --- |
-| Full vectors (768-d fp16) | 1.5 KB | 154 TB | NVMe, read for re-ranking |
-| Adjacency (degree 64 × 5-byte IDs) | 320 B | 32 TB | NVMe, beside the vector |
-| PQ codes for traversal (64 B) | 64 B | 6.4 TB | RAM, spread over the serving nodes |
-| Head index (0.1% sample, fp16) | — | 154 GB | RAM, one large-memory node, replicated |
-| PQ codes duplicated per neighbor (DistributedANN style) | 4 KB | 205 TB | not needed (see below) |
+| Full vectors (768-d fp16) | 1.5 KB | 1.54 PB | NVMe, read for re-ranking (int8 halves it) |
+| Adjacency (degree 64 × 6-byte IDs) | 384 B | 384 TB | NVMe, beside the vector |
+| PQ codes for traversal (32–64 B) | 32–64 B | 32–64 TB | RAM, spread over the serving nodes |
+| Head index (0.1% = 10^9 vectors, PQ 64 B + degree-32 graph) | — | ~230 GB | RAM, one large-memory node, replicated |
+| PQ codes duplicated per neighbor (DistributedANN style) | 2–4 KB | 2–4 PB | not affordable (see below) |
 
 What follows:
 
-- **IDs fit in 5 bytes** (37 bits are needed). Alternatively use a 32-bit shard-local ID
-  plus a shard number.
-- **About 190 TB per copy fits on a small NVMe cluster.** At about 30 TB of usable NVMe
-  per node, that is roughly 7 nodes per copy, or 15–25 nodes with 2–3 copies for
-  availability and throughput. The 6.4 TB of PQ codes fit in the aggregate RAM of
-  those nodes (about 256–512 GB each). So traversal can score neighbors from RAM, the
-  way DiskANN does, and touch NVMe only for adjacency and final re-ranking. Duplicating
-  codes into every node, as DistributedANN does, would add 205 TB for little gain at
-  this size.
-- **The head index fits on one machine.** A 0.1% sample (10^8 vectors) is 154 GB.
-  Replicate it for QPS. A single-level head is enough here; the multi-level SPIRE
-  recursion is optional.
-- **Build compute is modest. Build memory is the real constraint.** Leaf GEMM work at
-  `fastpipnn` defaults (about 30 leaf memberships per point, leaf 1024, d = 768) is
-  4.7×10^18 FLOPs, roughly 11 node-days of CPU at 5 TFLOP/s or a few GPU-hours. But
-  HashPrune reservoirs (160 slots × about 8 B) need about 128 TB of RAM on top of
-  154 TB of vectors. So the build must be sharded (§3), even though serving needs only
-  tens of nodes. Shards are independent, so they can run in waves on 20–50 machines
-  rather than all at once.
-- **Build network traffic is manageable.** With 2× inter-shard replication (top-2, the
-  cheapest setting that worked in §6), about 154 TB of extra vector copies and about
-  50 TB of edge shuffle (about 500 B per vector, measured in §6) move once per full build.
+- **IDs need 40 bits.** 2^40 = 1.1×10^12 leaves no headroom, so use 6-byte IDs, or a
+  32-bit shard-local ID plus a shard number.
+- **About 1.9 PB of NVMe per copy.** With dense storage nodes (about 120 TB NVMe each)
+  that is about 16 nodes per copy, or 35–50 nodes with 2–3 copies. With 30 TB nodes it
+  is about 65 per copy. The 32–64 TB of PQ codes must fit in aggregate RAM: about
+  1 TB per node at 40–60 nodes, or 256–512 GB per node at 130–200 nodes. RAM may
+  decide the node count rather than disk. Use 32-byte codes or keep codes on NVMe
+  beside the adjacency if RAM is tight.
+- **Do not duplicate codes into graph nodes.** At degree 64 that adds 2–4 PB, more than
+  the vectors themselves.
+- **The head still fits on one machine if compressed.** A 0.1% sample (10^9 vectors) as
+  64-byte codes plus a degree-32 graph is about 230 GB. Replicate it for QPS. With full
+  fp16 vectors it would be 1.5 TB, so either compress it or use a two-level head
+  (10^8 on top, then 10^9 sharded): SPIRE's recursion, one extra level.
+- **Build compute is about 1 day on 100 CPU nodes.** Leaf GEMM work at `fastpipnn`
+  defaults (about 30 leaf memberships per point, leaf 1024, d = 768) is 4.7×10^19
+  FLOPs, roughly 110 node-days at 5 TFLOP/s or about 70 GPU-hours. Cutting
+  intra-shard fanout to 8 memberships with leaf 256 is about 15× less.
+- **Build memory is the real constraint.** HashPrune reservoirs (160 slots × about
+  8 B) need about 1.3 PB of RAM on top of 1.54 PB of vectors. So the build is sharded
+  into thousands of tasks (§3) and run in waves on 100–300 machines. A smaller reservoir
+  (64–96 slots) cuts that roughly in half. The prototype uses 64.
+- **Build network traffic is a few PB per full build.** With 2× inter-shard replication
+  (top-2, the cheapest setting that worked in §6), about 1.5 PB of extra vector copies
+  and about 0.5 PB of edge shuffle (about 500 B per vector, measured in §6) move once.
+  That is about 15 minutes at an ideal 2.5 TB/s (200 nodes × 100 Gb/s); expect hours in
+  practice. So full rebuilds should be rare, and new data goes into segments (§4).
 
 Questions that change the design more than the algorithm choice:
 
 1. **How many embedding spaces?** Camera, lidar, radar and text-aligned (CLIP-style)
-   embeddings live in different vector spaces. Each model needs its own index, so 10^11
-   is probably several indexes of 10^10. That is easier still.
+   embeddings live in different vector spaces. Each model needs its own index, so 10^12
+   is probably several indexes of 10^11. Each of those is close to demonstrated scale.
 2. **Filters.** Scenario mining almost always combines similarity with metadata, for
    example "pedestrian crossing, night, rain, city X, sensor rig v3, last 6 months".
    Partition first on coarse, frequently filtered attributes (time window, region,
@@ -189,11 +197,13 @@ the full vector over the network. So:
 
 Shard granularity follows SPIRE. Size build shards to fit one machine's RAM with
 reservoirs (about 3 KB per vector in total, so about 3×10^8 vectors per 1 TB). With
-2× replication there are about 2×10^11 memberships, so roughly 700–1,000 shards of
+2× replication there are about 2×10^12 memberships, so roughly 7,000–10,000 shards of
 2–3×10^8. Process them in waves. Use many more *virtual*
 shards than machines, mapped to machines by a consistent map, so you can rebalance or
-re-run one shard without touching the rest. Top-level k-means with a few hundred
-centroids runs on a sample, with no recursion needed at this scale.
+re-run one shard without touching the rest. Top-level balanced k-means needs about
+10^4 centroids. Run it on a sample (10^8 points), and route the full data to the centroids
+with a small in-memory index over them (PiPNN or brute force on GPUs). That is one level
+of SPIRE recursion.
 
 ## 4. Serving
 
@@ -205,9 +215,10 @@ Recommended layout, following DistributedANN:
   about half of the final edges cross shards at 8 shards, which is the price of one global graph.
 - **Head:** an in-memory tier. A PiPNN graph over a 0.01–0.1% sample (or over the
   partition leaders, which PiPNN already computed), replicated for QPS, since
-  DistributedANN reports the head as the bottleneck. At 10^11 a 0.1% head (154 GB)
-  fits on one large-memory node.
-- **Codes in RAM:** PQ codes (6.4 TB) are spread over the serving nodes' RAM, so
+  DistributedANN reports the head as the bottleneck. At 10^12 a 0.1% head (10^9
+  vectors) fits on one large-memory node only as PQ codes (about 230 GB). Otherwise
+  use two levels.
+- **Codes in RAM:** PQ codes (32–64 TB) are spread over the serving nodes' RAM, so
   neighbor scoring during traversal does not touch disk.
 - **Query:** the coordinator runs beam search. Each round expands W nodes (DiskANN
   beam width) and batches the reads by owning shard. Scoring is pushed to the shard,
@@ -215,7 +226,7 @@ Recommended layout, following DistributedANN:
 - **Updates:** immutable segments, LSM-style. New data goes into new segments built by
   the same pipeline, deletes are tombstones, and segments merge periodically. The
   in-place repair in `pipnn.py` is fine for small edits inside a shard, but it is not
-  how 10^11 vectors evolve. Time-partitioned segments also match how AV data
+  how 10^12 vectors evolve. Time-partitioned segments also match how AV data
   arrives and how it is filtered.
 
 ## 5. Graph or inverted lists?
@@ -224,24 +235,32 @@ Recommended layout, following DistributedANN:
 | --- | --- | --- |
 | Reads per query | ~beam random 4 KB reads | a few large sequential reads |
 | Storage medium | NVMe (needs IOPS) | HDD or object storage OK (needs bandwidth) |
-| Memory | head + PQ codes (~6.5 TB) | centroids (10^9 lists ≈ 1.5 TB at 100 vectors per list) |
+| Memory | head + PQ codes (~32–64 TB) | centroids (10^10 lists ≈ 15 TB at 100 vectors per list, so the centroid index is itself distributed) |
 | Build | distributed PiPNN (§3) | balanced clustering + closure. PiPNN partition gives this |
 | Recall vs. cost | fewest reads per unit of recall in our test | more bytes per query, fewer IOs |
 | Updates | segment rebuilds | append to postings, rebalance (SPFresh) |
 
-Recommendation for about 10^11 vectors:
+Recommendation for about 10^12 vectors:
 
-1. **Default:** one global graph per embedding model, built with distributed PiPNN and
-   served DistributedANN-style. The head and PQ codes sit in RAM, adjacency and full
-   vectors on NVMe, on roughly 15–25 serving nodes. Index storage (about 190 TB per
-   copy) is a small fraction of the 2–3 EB data lake's cost, so NVMe is affordable.
-2. **Partition by time window (and maybe region or sensor generation) on top.** Each
-   partition gets its own global graph. Queries with filters touch only the matching
-   partitions. Unfiltered queries fan out and merge. This is metadata routing, which
-   is exact. It is different from the vector-space partition-and-route that §6 shows
-   is 4–5× more expensive.
-3. **Use SPANN-style postings only for workloads that need them:** very large k for
-   training-data curation, or an archive tier on HDD or object storage. PiPNN's
+1. **Split first by embedding model.** Each model needs its own index anyway, since
+   models live in different vector spaces.
+2. **Then split by time window, so each graph holds 10^10–10^11 vectors.** That size
+   is demonstrated territory. Each segment is one global graph built with distributed
+   PiPNN and served DistributedANN-style: head and PQ codes in RAM, adjacency and
+   vectors on NVMe. Time segments also match ingestion (new drives become new segments)
+   and the most common filter.
+   - The cost: a query with no time filter must search every segment, which is
+     partition-and-route over P segments. §6 measured that at about 4–5× the reads of
+     one global graph at 8 partitions.
+   - So pick the segment size from the query log. If most queries filter on time,
+     region or sensor generation, segments are nearly free. If most queries scan all
+     history, use fewer, larger segments (up to one graph per model). That needs
+     validating recall at 10^11–10^12 first.
+3. **Budget roughly 2 PB of NVMe per copy, and 32–64 TB of RAM for codes.** That is
+   about 50–200 serving nodes depending on density and copies. It is a small fraction
+   of what storing the 2–3 EB lake costs.
+4. **Use SPANN-style postings where they fit better:** very large k for training-data
+   curation, or an archive tier of old segments on HDD or object storage. PiPNN's
    partition step can produce those postings from the same build.
 
 ## 6. Prototype results
@@ -268,7 +287,7 @@ shards a query touched. Raw records are in `distributed-results.json`.
 ε rows cap replication at 4 shards. The combiner halved the edge shuffle and produced a
 bit-identical graph (`identical_to_combined: true`). The dataset is 25.6 MB of raw
 vectors, so at ε = 0.1 the build moves about 6.6× the data volume over the network.
-This network cost is the main build cost to watch at 10^11.
+This network cost is the main build cost to watch at 10^12.
 
 **Search (recall@10, reads per query, distinct shards touched per query):**
 
