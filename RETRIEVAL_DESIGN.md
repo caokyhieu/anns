@@ -48,6 +48,49 @@ Three consequences follow.
 | **Automatic data curation** (Vo et al., TMLR 2024) | Hierarchical k-means, then balanced sampling across clusters, matches or beats manual curation for self-supervised pretraining | The same posting hierarchy gives concept-balanced training sets |
 | **Driving-RAG**, scenario embeddings | Scenario embeddings plus vector search for AV scenario retrieval | Confirms the use case. The embedding model matters as much as the index |
 
+## 2b. Related work on AV / VLA training data
+
+| Work | What it does | Implication |
+| --- | --- | --- |
+| **Cosmos-Embed1** (NVIDIA, 2025) | Video-text dual encoder for physical AI. 768-d (448p/336p) or 256-d (224p) clip embeddings for text-to-video and video-to-video search and semantic dedup. Text-to-video R@1 ≈ 30–35 on the OpenDV AV benchmark (NVIDIA-reported) | A ready-made camera-clip embedding. Its dimension sets index size (256-d is 3× smaller) |
+| **NeMo Curator video pipeline** (NVIDIA) | Splits video into clips, embeds them with Cosmos-Embed1 to Parquet, and runs semantic dedup as k-means followed by pairwise similarity inside each cluster, on Ray | Dedup is the same clustering as our posting lists. Do it inside each posting during the build |
+| **LidarCLIP** (WACV 2024) | Trains a LiDAR encoder into CLIP's space using paired camera and LiDAR frames, so text queries reach point clouds. LiDAR retrieval is on par with image retrieval, with complementary strengths | LiDAR can share the camera/text embedding space, so one text query searches both |
+| **BEV-TSR** (AAAI 2025) | Text-to-scene retrieval in BEV space: BEV features plus an LLM text encoder, contrastive and captioning losses. nuScenes-Retrieval benchmark, ~87.7% top-1 text-to-scene | Fused BEV features are a natural scene-level embedding for fused camera, LiDAR and radar |
+| **CARIM** (ICCV 2025) | Scene retrieval via VLM/LLM captions, turning text-to-video into text-to-text matching. "Inclusive" matching: return only scenes that satisfy every condition in the query | Pure similarity misses conjunctive constraints. Add caption text and structured attributes as filters, with hybrid text plus vector search |
+| **Multimodal scenario similarity search** (2026); **ScenarioFormer**; **Driving-RAG** (2025); LLM-informed trajectory embeddings (2025) | Trajectory embeddings (contrastive transformers, VRAE) work well for motion events (cut-ins, turns). Visual and trajectory embeddings combined beat either alone. Driving-RAG uses HNSW plus typical-scenario sampling | Index a trajectory or scenario embedding next to the visual one, and fuse rankings |
+| **Hierarchical segment indexing** and **multi-vector index compression** (2025–2026) | Long videos indexed coarse-to-fine (video, then segment), or as several vectors per item compressed to a budget. Multi-vector video can cost ~10 MB per video uncompressed | Use the segment (a few seconds) as the index unit, with a clip or drive-level summary vector above it |
+| **WOD-E2E** (Waymo, 2025) | Mines long-tail end-to-end driving segments with rules plus multimodal LLMs. Mining kept ~0.1% of data, and ~0.03% were final long-tail scenarios | Training retrieval is a funnel: cheap filters and vector recall over everything, then expensive VLM scoring on a small candidate set |
+| **Alpamayo-R1** (NVIDIA, 2025) | VLA training clips chosen for explicit driving decisions, with per-scenario balancing for diversity | Balancing and dedup belong in the retrieval output, not afterwards by hand |
+| **Mining the Long Tail** (2025) | Uncertainty-weighted curation beats uniform sampling on rare safety-critical events | Store model signals (uncertainty, disagreement) as columns, to filter and rank by |
+| **Automatic data curation** (Vo et al., TMLR 2024) | Hierarchical k-means, then balanced sampling across clusters | The posting hierarchy gives concept-balanced sampling for free |
+| **Tesla trigger classifiers** (patents, Karpathy) | On-vehicle classifiers on intermediate network outputs decide which data to upload | Filtering at the edge reduces N before indexing |
+| **Lance format** (ByteDance Volcano Engine, WeRide case studies) | Columnar lakehouse format for images, point clouds and video blobs plus vector and scalar indexes on object storage. PB-scale AV data lake (vendor-reported). WeRide reports scenario mining going from 1 week to 1 hour | A candidate storage layer for postings, metadata columns and manifests (benchmark before adopting) |
+| **CoReVLA**, **OpenLongTail** (2025–2026) | Fill long-tail gaps through simulation takeovers or generative video | Retrieval also finds gaps: when a query returns too little, it becomes a generation or collection request |
+
+**What this changes in the design:**
+
+1. **Index unit and vectors.** Index clip segments of a few seconds, with several
+   embeddings per segment, each in its own posting index under a shared segment ID:
+   - a video-text embedding (Cosmos-Embed1-style; LiDAR can be trained into the same
+     space, LidarCLIP-style);
+   - a fused BEV scene embedding;
+   - a trajectory or scenario embedding.
+
+   Put drive or scene-level summary vectors above the segments for coarse-to-fine
+   search. N in §4 then counts segments × embedding types, after deduplication.
+2. **Hybrid queries.** Combine vector similarity (one or more embeddings, fused by
+   rank), caption full-text search, and structured filters (time, geography, weather,
+   rig, labels, model uncertainty). Use CARIM-style conjunctive matching for "all of
+   these conditions" requests. In posting scans these are column masks.
+3. **A retrieval funnel.** Recall over 10^12 vectors in postings, then re-rank 10^5–10^7
+   candidates with full vectors, then VLM or LLM scoring of the top candidates (as in
+   WOD-E2E), then balanced sampling and dedup. Write the result as a manifest.
+4. **Dedup and balance during the build.** Run NeMo-Curator-style semantic dedup
+   inside each posting. Sample across the hierarchy for balance (Vo et al.,
+   Alpamayo-R1).
+5. **Storage.** Postings, metadata columns and manifests on a columnar format over
+   object storage (Lance or Parquet), with NVMe caching for the hot postings.
+
 ## 3. Measurements from the prototype
 
 100,000 vectors × 32-d (512-component Gaussian mixture), 1,000 held-out queries, exact
@@ -231,3 +274,14 @@ for exploration, not the system of record.
 - Automatic data curation: [arXiv 2405.15613](https://arxiv.org/abs/2405.15613)
 - Driving-RAG: [arXiv 2504.04419](https://arxiv.org/abs/2504.04419)
 - DSANN (distributed storage ANN): [arXiv 2510.17326](https://arxiv.org/abs/2510.17326)
+- Cosmos-Embed1: [Hugging Face](https://huggingface.co/nvidia/Cosmos-Embed1-448p), [TAO docs](https://docs.nvidia.com/tao/tao-toolkit/latest/text/embedding/cosmos_embed1.html)
+- NeMo Curator video dedup: [docs](https://docs.nvidia.com/nemo/curator/v25.09/curate-video/process-data/dedup)
+- LidarCLIP: [WACV 2024](https://openaccess.thecvf.com/content/WACV2024/papers/Hess_LidarCLIP_or_How_I_Learned_To_Talk_to_Point_Clouds_WACV_2024_paper.pdf)
+- BEV-TSR: [AAAI 2025](https://ojs.aaai.org/index.php/AAAI/article/view/32782), [arXiv 2401.01065](https://arxiv.org/abs/2401.01065)
+- CARIM: [ICCV 2025](https://openaccess.thecvf.com/content/ICCV2025/html/Ki_CARIM_Caption-Based_Autonomous_Driving_Scene_Retrieval_via_Inclusive_Text_Matching_ICCV_2025_paper.html)
+- Multimodal scenario similarity search: [arXiv 2607.09428](https://arxiv.org/abs/2607.09428); trajectory embedding retrieval: [SCITEPRESS 2025](https://www.scitepress.org/PublishedPapers/2025/132765); KEPT: [arXiv 2509.02966](https://arxiv.org/pdf/2509.02966)
+- Hierarchical segment indexing: [arXiv 2510.09553](https://arxiv.org/html/2510.09553v1); multi-vector index compression: [arXiv 2602.21202](https://arxiv.org/abs/2602.21202)
+- WOD-E2E: [arXiv 2510.26125](https://arxiv.org/html/2510.26125v1); Alpamayo-R1: [arXiv 2511.00088](https://arxiv.org/pdf/2511.00088); Mining the Long Tail: [arXiv 2508.18397](https://arxiv.org/html/2508.18397v2)
+- CoReVLA: [arXiv 2509.15968](https://arxiv.org/abs/2509.15968); OpenLongTail: [arXiv 2607.09655](https://arxiv.org/html/2607.09655); VLA for driving survey: [arXiv 2512.16760](https://arxiv.org/pdf/2512.16760)
+- Tesla training-data patent: [EP3850549B1](https://patents.google.com/patent/EP3850549B1)
+- Lance AV data lake: [Volcano Engine](https://www.lancedb.com/blog/volcano-engine-autonomous-driving-data-lake-solution), [WeRide](https://www.lancedb.com/blog/werides-data-platform-transformation-how-lancedb-fuels-model-development-velocity)
