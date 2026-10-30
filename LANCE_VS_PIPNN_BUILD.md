@@ -16,8 +16,15 @@ PiPNN graph *as the query router* does not matter: routing is already exact with
 either, and costs almost nothing. The win is in the build's assignment pass, and it
 grows with the partition count, which at our scale (10^12 vectors) is 10^7–10^8.
 
-Code: `ivf_build_experiment.py`. Raw results: `ivf-build-results.json` (1M × 128-d)
-and `ivf-build-results-768d.json` (300k × 768-d).
+Two more changes from the hierarchy help (§7). Training leaves locally inside each
+coarse cell, plus one global refinement step, keeps recall and shrinks the central
+training sample from 256·C to 256·√C vectors. Fine partitions then become cheap to
+build, and they raise QPS. Spilling vectors into boundary partitions so that fewer
+partitions could be used did not pay off.
+
+Code: `ivf_build_experiment.py`, `hier_build_experiment.py`. Raw results:
+`ivf-build-results.json` (1M × 128-d), `ivf-build-results-768d.json` (300k × 768-d),
+`hier-build-results.json` (§7).
 
 ## 1. What Lance does today (read from source)
 
@@ -186,18 +193,103 @@ I/O.
    run as a distributed GPU job (Ray or Spark) that writes partition IDs, and Lance
    then only encodes and writes. No fork of Lance is needed. Keep the coarse levels
    of the hierarchical training as the tree.
-2. **Use t = 4.** It matched flat recall in every setting we ran. Use t = 8 if real
+2. **Train leaves locally.** Train only the coarse levels centrally. Route the data
+   to its coarse cell, and train each cell's leaves where that cell's data lives.
+   Then run one global refinement step (per-leaf sums merged in one reduce) and
+   assign with the tree. This removes the 2.6 × 10^10-vector central sample that
+   Lance's trainer would need at 10^8 partitions (§7.1).
+3. **Use t = 4.** It matched flat recall in every setting we ran. Use t = 8 if real
    embeddings misassign more.
-3. **Use 3 levels at 10^8 partitions** and do the per-level GEMMs on GPU, so the
+4. **Use 3 levels at 10^8 partitions** and do the per-level GEMMs on GPU, so the
    pass is limited by I/O.
-4. **Use a PiPNN graph as the query router over 10^7–10^8 centroids** only if routing
+5. **Don't spill. Spend the build savings on finer partitions** if QPS matters, up
+   to what the storage tier's read size allows (§7.2).
+6. **Use a PiPNN graph as the query router over 10^7–10^8 centroids** only if routing
    ever becomes a cost. Its value there is a faster rebuild when partitions change,
    not faster queries.
-5. **Validate before committing.** These are 1M-scale synthetic vectors on 4 CPUs.
+7. **Validate before committing.** These are 1M-scale synthetic vectors on 4 CPUs.
    Next: (a) real embeddings, about 10^8 of them, at 10^5–10^6 partitions; (b) the
    tree pass on GPU vs Lance's HNSW path, end to end through
    `precomputed_partition_dataset`; (c) check that recall at fixed `nprobe` still matches
    flat, and tune t.
+
+## 7. Follow-ups: local leaf training and spilling
+
+Code: `hier_build_experiment.py`. Raw results: `hier-build-results.json`. Same 1M ×
+128-d data, RaBitQ encoder, exact routing and scan as above. Assignment is tree, t=4.
+
+### 7.1 Train leaves locally instead of on one central sample
+
+Lance trains all C centroids on 256 vectors per partition gathered on one node. At
+10^8 partitions that is 2.6 × 10^10 vectors (~39 TB at 768-d fp16). The alternative:
+- train only the √C coarse centroids centrally, on 256 vectors each;
+- route every vector to its coarse cell (one small GEMM);
+- train each cell's leaves on the vectors routed to it.
+
+Cells are independent, so the leaf training runs in parallel where the data lives.
+
+| Partitions | Variant | Central sample | Central train | Local train: sum / slowest cell | Assign | R@10 np=16 | np=32 | np=64 | np=128 | np=256 |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4,096 | global sample (Lance-style) | 1,000,000 | 30.0 s | — | 2.9 s | 0.752 | 0.860 | 0.938 | 0.977 | 0.986 |
+| | local, assign inside own cell only | 16,384 | 0.2 s | 15.0 s / 0.38 s | 0.5 s | 0.716 | 0.838 | 0.921 | 0.967 | 0.984 |
+| | local, then tree assignment | 16,384 | 0.2 s | 15.0 s / 0.38 s | 3.2 s | 0.748 | 0.860 | 0.931 | 0.975 | 0.988 |
+| | **local, tree, 1 global refinement step** | 16,384 | 0.2 s | 15.0 s / 0.38 s | 12.8 s* | 0.761 | 0.865 | 0.935 | 0.978 | 0.989 |
+| 16,384 | global sample (Lance-style) | 1,000,000 | 33.4 s | — | 3.8 s | 0.685 | 0.795 | 0.881 | 0.944 | 0.982 |
+| | local, assign inside own cell only | 32,768 | 0.5 s | 15.5 s / 0.18 s | 0.7 s | 0.660 | 0.770 | 0.863 | 0.934 | 0.972 |
+| | local, then tree assignment | 32,768 | 0.5 s | 15.5 s / 0.18 s | 4.4 s | 0.708 | 0.802 | 0.884 | 0.943 | 0.978 |
+| | **local, tree, 1 global refinement step** | 32,768 | 0.5 s | 15.5 s / 0.18 s | 15.5 s* | 0.713 | 0.814 | 0.892 | 0.947 | 0.979 |
+
+\* Includes the refinement step: each leaf is reset to the mean of the vectors the
+tree assigned to it, then assignment runs once more. In NumPy the mean step takes
+about 10 s (`np.add.at`). Distributed, it is per-leaf sums and counts merged in one
+reduce, plus a second assignment pass. Vectors scanned per query are the same for
+all variants at each `nprobe`.
+
+- **Local training with one refinement step gives the same recall as central
+  training.** It is up to 0.03 better at small nprobe and within 0.003 at
+  nprobe ≥ 128.
+- **Every vector must still go through the tree once.** Assigning each vector only
+  within its own cell loses about 1–2 points of recall: 27% of vectors have their
+  nearest leaf in a neighboring cell.
+- **The central step shrinks from 256·C sample vectors to 256·√C.** That is 30–60×
+  here (the 1M dataset caps Lance's sample at N) and 10,000× at 10^8 partitions.
+  The leaf training (about 15 s of work here) splits into √C independent jobs; the
+  slowest cell took 0.2–0.4 s.
+
+### 7.2 Spilling to boundary partitions, to allow fewer partitions
+
+The tree already scores each vector against its nearest leaves, so the second-nearest
+leaf is free. With SPANN's rule, a vector is also stored there when d2 ≤ (1 + eps)·d1.
+The question was whether this lets fewer partitions keep the same QPS. Cost is vectors
+scanned per query (replicas included) to reach a target recall:
+
+| Partitions | eps | Copies per vector | Scanned for R@10 = 0.90 | Scanned for R@10 = 0.95 | Encode |
+|---:|---:|---:|---:|---:|---:|
+| 2,048 | 0 | 1.00 | 15,664 | 24,150 | 18 s |
+| 2,048 | 0.10 | 1.80 | 14,230 | 22,113 | 27 s |
+| 4,096 | 0 | 1.00 | 11,258 | 18,386 | 22 s |
+| 4,096 | 0.10 | 1.76 | 9,827 | 16,920 | 27 s |
+| 8,192 | 0 | 1.00 | 7,858 | 13,704 | 18 s |
+| 8,192 | 0.05 | 1.46 | 7,514 | 13,149 | 24 s |
+| 8,192 | 0.10 | 1.70 | 6,937 | 12,487 | 24 s |
+| 16,384 | 0 | 1.00 | 5,150 | 9,145 | 20 s |
+| 16,384 | 0.05 | 1.38 | 4,619 | 8,467 | 24 s |
+| 16,384 | 0.10 | 1.62 | 4,511 | 8,287 | 26 s |
+
+(eps = 0.02 changed nothing beyond noise. All rows are in the JSON.)
+
+- **Spilling is not worth it here.** At best it saves 8–13% of vectors scanned, but
+  it costs 1.4–1.8× index size and encode time. Distances in high dimensions are
+  nearly tied, so even a small eps copies many vectors.
+- **Fewer partitions cost QPS.** Halving the partition count raises vectors scanned
+  at 0.95 recall by 31–50%. Spilling recovers only a fraction of that.
+- **So go finer, not coarser.** From 4k to 16k partitions, vectors scanned at 0.95
+  recall halve (18.4k → 9.1k), and the tree assignment pass only grows from 6.7 s to
+  11.8 s (√C). With local training, the training sample does not grow with C
+  either. The hierarchical build makes fine partitions cheap to build, and fine
+  partitions are what raise QPS. The limit is storage: more, smaller partitions
+  mean more probes and smaller reads per query. Pick the size from the storage
+  tier's read size (about 1 MB on NVMe and object storage).
 
 ## Caveats
 
@@ -219,4 +311,5 @@ uv sync --locked --extra compare --extra lance
 uv run --locked python ivf_build_experiment.py --lance                 # 1M x 128-d, 1k/4k/16k partitions
 uv run --locked python ivf_build_experiment.py --n 300000 --dim 768 --partitions 4096 \
     --queries 300 --probes 16 32 64 128 256 --lance --output ivf-build-results-768d.json
+uv run --locked python hier_build_experiment.py                      # §7: local training, spilling
 ```
