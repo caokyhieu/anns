@@ -211,7 +211,9 @@ ivf_build_experiment.py measures it against pylance, and hier_build_experiment.p
 tests local leaf training and boundary spilling. FILTERED_SEARCH.md measures hybrid
 (label filter + vector) search on Lance against filter selectivity and correlation, and
 lists the planner, layout and sub-index changes it implies (filtered_search_experiment.py);
-filtered_graph_experiment.py compares in-graph filtering (hnswlib, strict, ACORN-style):
+filtered_graph_experiment.py compares in-graph filtering (hnswlib, strict, ACORN-style).
+FILTERED_SEARCH_LITERATURE.md checks six filtered-search papers against these results
+(filtered_degree_check.py tests their graph-density claim):
 
 ```bash
 uv run --locked python -m unittest -v test_dpipnn
@@ -222,6 +224,7 @@ uv run --locked --extra compare --extra lance python ivf_build_experiment.py --l
 uv run --locked python hier_build_experiment.py    # writes hier-build-results.json
 uv run --locked --extra lance python filtered_search_experiment.py
 uv run --locked --extra lance --extra compare python filtered_graph_experiment.py
+uv run --locked --extra lance --extra compare python filtered_degree_check.py
 ```
 
 ## Limitations

@@ -204,7 +204,7 @@ Graph indexes offer filtering in three different ways, and they behave very diff
 | --- | --- | --- | --- |
 | **In-search filter** | hnswlib `filter=`, FAISS `IDSelector`, most vector DBs | Walks the normal graph through every node, keeps only passing nodes as results, stops once it holds `ef` passing nodes | Nothing at build time; any predicate |
 | **Predicate-agnostic denser graph (ACORN)** | ACORN (SIGMOD 2024); Weaviate implements it | Walks only passing nodes, plus 2-hop expansion through failing neighbors; the graph is built γ× denser so the passing subgraph stays connected down to s ≈ 1/γ | γ× more edges; any predicate |
-| **Label-aware construction (Filtered-DiskANN)** | FilteredVamana / StitchedVamana (WWW 2023); Qdrant's payload-aware extra edges are similar | Edges are kept per label during build, and each label has its own entry point | Labels known at build time; equality on one label (or an OR of labels); graph edits when a label changes |
+| **Label-aware construction (Filtered-DiskANN)** | FilteredVamana / StitchedVamana (WWW 2023); UNG (SIGMOD 2024) builds one graph per label set | Edges are kept per label during build, and each label has its own entry point | Labels known at build time; equality on one label (or an OR of labels); graph edits when a label changes |
 
 ### Measured (`filtered_graph_experiment.py`)
 
@@ -286,6 +286,12 @@ Things specific to this workload that limit graph filtering:
   on it.** There HNSW lives inside each IVF partition, so the partitions to probe are
   still chosen without looking at the filter (the §2 problem), whatever the HNSW search
   inside them does.
+
+## 7. Literature
+
+FILTERED_SEARCH_LITERATURE.md reads six recent papers (the SIGMOD 2026 experimental
+study, the GLS-metric system study, PathFinder, SIEVE, CAPS, NaviX), checks their claims
+against the measurements above, and lists what to apply.
 
 ## Run
 
