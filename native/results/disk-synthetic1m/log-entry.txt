@@ -1,0 +1,4 @@
+hnsw graph ready, build 133.767 s, mean degree 33.2039
+hnsw graph ready, build 0 s, mean degree 33.2039
+done
+fastpipnn graph ready, build 35.7208 s, mean degree 35.143
