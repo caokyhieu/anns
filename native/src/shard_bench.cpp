@@ -140,11 +140,11 @@ struct Router {
       parallel_for(threads, C - 1, 64, [&](size_t i) { hnsw->addPoint(cent + (i + 1) * d, i + 1); });
     } else if (kind == "fastpipnn") {
       fastpipnn::Params p;
-      p.degree = a.n("--router-degree", 32); p.reservoir = std::max<size_t>(p.reservoir, p.degree);
-      p.leaf_size = std::min<size_t>(1024, std::max<size_t>(64, C / 4));
-      p.top_leaders = std::max<size_t>(3, std::min<size_t>(1000, C / 64));
-      p.local_k = a.n("--router-local-k", 4); p.alpha = a.f("--router-alpha", 1.2);
-      p.fanout = {4, 2}; p.threads = threads;
+      p.degree = a.n("--router-degree", 48); p.reservoir = std::max<size_t>(p.reservoir, p.degree);
+      p.leaf_size = a.n("--router-leaf", 512);
+      p.top_leaders = a.n("--router-leaders", std::max<size_t>(3, std::min<size_t>(1000, C / 60)));
+      p.local_k = a.n("--router-local-k", 16); p.alpha = a.f("--router-alpha", 1.5);
+      p.fanout = parse_list(a.get("--router-fanout", "10,3")); p.threads = threads;
       fast.build(cent, C, d, d, p);
     } else {
       require(kind == "exact", "router must be exact, hnsw or fastpipnn");
@@ -421,7 +421,9 @@ int main(int argc, char** argv) {
     std::vector<std::vector<float>> qf(nq, std::vector<float>(d));
     for (size_t qi = 0; qi < nq; ++qi) for (size_t j = 0; j < d; ++j) qf[qi][j] = query.row(qi)[j];
     Router exact; exact.build("exact", cent.data(), C, d, threads, a);
-    for (std::string kind : {"hnsw", "fastpipnn"}) {
+    std::vector<std::string> kinds;
+    { std::istringstream in(a.get("--routers", "hnsw,fastpipnn")); for (std::string t; std::getline(in, t, ',');) kinds.push_back(t); }
+    for (const std::string& kind : kinds) {
       Router r; r.build(kind, cent.data(), C, d, threads, a);
       for (size_t probes : parse_list(a.get("--nprobes", "8,32"))) {
         for (size_t beam : parse_list(a.get("--router-beams", "16,32,64,128,256"))) {
@@ -522,6 +524,10 @@ int main(int argc, char** argv) {
             ",\"shard_seconds\":" + list_json(shard_build) + "}");
 
   const size_t router_beam = a.n("--router-beam", 64);
+  const std::string rerank_mode = a.get("--rerank", "global");
+  require(rerank_mode == "global" || rerank_mode == "segment", "--rerank must be global or segment");
+  const bool global_rerank = quant == "rabitq" && rerank_mode == "global";
+  cfg += ",\"rerank\":\"" + rerank_mode + "\"";
   for (size_t refine : parse_list(a.get("--refines", "10"))) {
    for (size_t probes : parse_list(a.get("--nprobes", "1,2,4,8,16,32,64"))) {
     if (probes > C) continue;
@@ -569,16 +575,24 @@ int main(int argc, char** argv) {
         }
         std::vector<std::pair<float, Id>> cand;
         while (!heap.empty()) { cand.push_back(heap.top()); heap.pop(); }
-        if (quant == "rabitq") {
+        if (quant == "rabitq" && !global_rerank) {
           rr += cand.size();
           for (auto& c : cand) c.first = sq_u8(base.row(c.second), q, d);
         }
         std::sort(cand.begin(), cand.end());
-        if (cand.size() > k) cand.resize(k);
+        if (cand.size() > (global_rerank ? keep : k)) cand.resize(global_rerank ? keep : k);
         merged.insert(merged.end(), cand.begin(), cand.end());
         double dt = now() - ts; slowest = std::max(slowest, dt); total += dt;
       }
       t = now();
+      if (global_rerank) {
+        // Estimates from different segments are comparable (shared centroids and rotation), so the
+        // coordinator keeps the global best k*refine estimates and reranks only those.
+        std::sort(merged.begin(), merged.end());
+        if (merged.size() > keep) merged.resize(keep);
+        rr += merged.size();
+        for (auto& c : merged) c.first = sq_u8(base.row(c.second), q, d);
+      }
       std::partial_sort(merged.begin(), merged.begin() + std::min(k, merged.size()), merged.end());
       double merge = now() - t;
       uint64_t ee = 0;
