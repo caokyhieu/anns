@@ -49,3 +49,10 @@ if(NATIVE_SANITIZERS)
     target_link_options(${target} PRIVATE -fsanitize=address,undefined)
   endforeach()
 endif()
+
+# Sharded designs (D1 graph shards, D5/D6 IVF segments, router study).
+add_executable(shard_bench src/shard_bench.cpp)
+target_include_directories(shard_bench PRIVATE third_party/eigen third_party/hnswlib)
+target_compile_definitions(shard_bench PRIVATE EIGEN_DONT_PARALLELIZE)
+target_compile_options(shard_bench PRIVATE -O3 -march=native -ffast-math)
+target_link_libraries(shard_bench PRIVATE Threads::Threads)

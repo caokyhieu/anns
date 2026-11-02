@@ -193,8 +193,15 @@ template <class T> class Index {
 
   // Best-first beam search from the medoid. Returns up to k IDs, nearest first.
   std::vector<Id> search(const T* query, size_t k, size_t beam, size_t* evaluations = nullptr) const {
-    thread_local std::vector<uint32_t> seen;
-    thread_local uint32_t epoch = 0;
+    // Visited marks per (thread, index): one thread may search several indexes in turn
+    // (one per shard), so the scratch array is keyed by index rather than reallocated.
+    struct Scratch { std::vector<uint32_t> seen; uint32_t epoch = 0; };
+    thread_local std::vector<std::pair<const Index*, Scratch>> scratch;
+    Scratch* sp = nullptr;
+    for (auto& e : scratch) if (e.first == this) { sp = &e.second; break; }
+    if (!sp) { scratch.emplace_back(this, Scratch{}); sp = &scratch.back().second; }
+    auto& seen = sp->seen;
+    auto& epoch = sp->epoch;
     if (seen.size() != n) { seen.assign(n, 0); epoch = 0; }
     if (++epoch == 0) { std::fill(seen.begin(), seen.end(), 0); epoch = 1; }
     using Pair = std::pair<float, Id>;
@@ -221,6 +228,26 @@ template <class T> class Index {
     for (size_t i = out.size(); i > 0; --i) { out[i - 1] = best.top().second; best.pop(); }
     if (evaluations) *evaluations = evals;
     return out;
+  }
+
+  // Partition only: randomized ball carving with no graph. Returns the leaves (lists of row
+  // indices); used to derive IVF-style centroids from PiPNN's partitioner. `points` must
+  // outlive the call only.
+  std::vector<Bucket> carve(const T* points, size_t count, size_t dimension, size_t row_stride, Params p) {
+    if (count < 2 || dimension == 0 || row_stride < dimension) throw std::invalid_argument("need >= 2 points");
+    if (p.leaf_size < 2 || p.top_leaders < 3 || p.max_leaders < 3 || !(p.leader_fraction > 0))
+      throw std::invalid_argument("invalid PiPNN parameters");
+    if (p.min_leaf == 0) p.min_leaf = std::max<size_t>(1, p.leaf_size / 10);
+    if (p.threads == 0) p.threads = std::max(1u, std::thread::hardware_concurrency());
+    params = p; stats = Stats{};
+    n = count; dim = dimension; stride = row_stride; data = points;
+    double start = now();
+    std::vector<Bucket> leaves = partition();
+    stats.partition_seconds = stats.total_seconds = now() - start;
+    stats.leaves = leaves.size();
+    for (auto& leaf : leaves) { stats.leaf_points += leaf.size(); stats.max_leaf = std::max(stats.max_leaf, leaf.size()); }
+    data = nullptr;
+    return leaves;
   }
 
  private:

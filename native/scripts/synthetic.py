@@ -21,11 +21,19 @@ for name,x in [("base.u8bin",base),("query.u8bin",queries)]:
     with (out/name).open("wb") as f:
         np.array(x.shape,dtype="<u4").tofile(f);x.tofile(f)
 truth=np.empty((a.queries,100),dtype="<u4")
-# Integer arithmetic gives exact distances for uint8 vectors; no GEMM cancellation.
-for i,q in enumerate(queries):
-    delta=base.astype(np.int32)-q.astype(np.int32)
-    ds=np.einsum("ij,ij->i",delta,delta)
-    truth[i]=np.argsort(ds,kind="stable")[:100]
+# A float32 GEMM shortlists 400 candidates per query; exact integer arithmetic then ranks them,
+# so GEMM rounding can only matter if a true top-100 neighbour falls outside the shortlist.
+shortlist=min(400,a.n)
+bf=base.astype(np.float32); bn=np.einsum("ij,ij->i",bf,bf)
+for s in range(0,a.queries,256):
+    qs=queries[s:s+256]
+    approx=bn[None,:]-2*(qs.astype(np.float32)@bf.T)
+    cand=np.argpartition(approx,shortlist-1,axis=1)[:,:shortlist]
+    for r,q in enumerate(qs):
+        delta=base[cand[r]].astype(np.int32)-q.astype(np.int32)
+        ds=np.einsum("ij,ij->i",delta,delta)
+        order=np.lexsort((cand[r],ds))
+        truth[s+r]=cand[r][order[:100]]
 with (out/"gt.ibin").open("wb") as f:
     np.array(truth.shape,dtype="<u4").tofile(f);truth.tofile(f)
 print(out)
