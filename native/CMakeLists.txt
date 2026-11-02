@@ -56,3 +56,10 @@ target_include_directories(shard_bench PRIVATE third_party/eigen third_party/hns
 target_compile_definitions(shard_bench PRIVATE EIGEN_DONT_PARALLELIZE)
 target_compile_options(shard_bench PRIVATE -O3 -march=native -ffast-math)
 target_link_libraries(shard_bench PRIVATE Threads::Threads)
+
+# On-disk graph index (PiPNN or HNSW level 0 in a DiskANN-style layout).
+add_executable(disk_bench src/disk_bench.cpp)
+target_include_directories(disk_bench PRIVATE third_party/eigen third_party/hnswlib)
+target_compile_definitions(disk_bench PRIVATE EIGEN_DONT_PARALLELIZE)
+target_compile_options(disk_bench PRIVATE -O3 -march=native -ffast-math)
+target_link_libraries(disk_bench PRIVATE Threads::Threads)

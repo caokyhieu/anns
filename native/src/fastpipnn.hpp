@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -228,6 +229,36 @@ template <class T> class Index {
     for (size_t i = out.size(); i > 0; --i) { out[i - 1] = best.top().second; best.pop(); }
     if (evaluations) *evaluations = evals;
     return out;
+  }
+
+  // Graph file: magic, n, dim, degree, entry (uint64 each), then n uint16 degrees, then
+  // n * degree uint32 neighbor IDs (unused slots = kNone). Vectors are not stored.
+  void save_graph(const std::string& path) const {
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) throw std::runtime_error("cannot write " + path);
+    uint64_t head[5] = {0x4e4e5069504e4e31ull, n, dim, params.degree, entry};
+    bool ok = std::fwrite(head, sizeof(head), 1, f) == 1 &&
+              std::fwrite(degrees.data(), sizeof(uint16_t), n, f) == n &&
+              std::fwrite(adjacency.data(), sizeof(Id), adjacency.size(), f) == adjacency.size();
+    ok = (std::fclose(f) == 0) && ok;
+    if (!ok) throw std::runtime_error("short write " + path);
+  }
+  // Loads a saved graph over `points` (count x dimension, row_stride elements per row), which
+  // must be the vectors the graph was built on and must outlive the index.
+  void load_graph(const std::string& path, const T* points, size_t row_stride) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) throw std::runtime_error("cannot read " + path);
+    uint64_t head[5];
+    bool ok = std::fread(head, sizeof(head), 1, f) == 1 && head[0] == 0x4e4e5069504e4e31ull;
+    if (ok) {
+      n = head[1]; dim = head[2]; params.degree = head[3]; entry = Id(head[4]);
+      stride = row_stride; data = points;
+      degrees.resize(n); adjacency.resize(n * params.degree);
+      ok = std::fread(degrees.data(), sizeof(uint16_t), n, f) == n &&
+           std::fread(adjacency.data(), sizeof(Id), adjacency.size(), f) == adjacency.size();
+    }
+    std::fclose(f);
+    if (!ok) throw std::runtime_error("bad graph file " + path);
   }
 
   // Partition only: randomized ball carving with no graph. Returns the leaves (lists of row
