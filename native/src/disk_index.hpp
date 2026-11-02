@@ -323,15 +323,16 @@ class DiskIndex {
     std::vector<Cand> cand;
     std::vector<std::pair<float, Id>> result;
     std::vector<float> tab;
-    std::vector<Id> keys; std::vector<uint32_t> tags; std::vector<uint8_t> vals; uint32_t epoch = 0; size_t mask = 0;
+    std::vector<Id> keys; std::vector<uint32_t> tags; std::vector<uint8_t> vals; uint32_t epoch = 0; size_t mask = 0, used = 0;
     std::unordered_map<size_t, uint8_t*> sectors;
     std::vector<std::vector<uint8_t>> bufs;
     void reset(size_t Lsize, size_t R) {
       cand.clear(); cand.reserve(Lsize + 1); result.clear(); sectors.clear();
       tab.resize(256 * 512);  // up to M = 512 sub-quantizers
-      size_t want = 1; while (want < 16 * Lsize * std::max<size_t>(R, 8)) want <<= 1;
-      if (keys.size() != want) { keys.assign(want, 0); tags.assign(want, 0); vals.assign(want, 0); epoch = 0; mask = want - 1; }
+      size_t want = 1; while (want < 4 * Lsize * std::max<size_t>(R, 8)) want <<= 1;
+      if (keys.size() < want) { keys.assign(want, 0); tags.assign(want, 0); vals.assign(want, 0); epoch = 0; mask = want - 1; }
       if (++epoch == 0) { std::fill(tags.begin(), tags.end(), 0); epoch = 1; }
+      used = 0;
     }
     size_t find(Id id) const {
       size_t h = (size_t(id) * 0x9E3779B97F4A7C15ull) >> 20 & mask;
@@ -339,7 +340,21 @@ class DiskIndex {
       return h;
     }
     uint8_t state(Id id) const { size_t h = find(id); return tags[h] == epoch ? vals[h] : 0; }
-    void set(Id id, uint8_t v) { size_t h = find(id); keys[h] = id; tags[h] = epoch; vals[h] = v; }
+    void set(Id id, uint8_t v) {
+      size_t h = find(id);
+      if (tags[h] != epoch) {
+        if (2 * (used + 1) > keys.size()) { grow(); h = find(id); }  // keep load <= 1/2 so probing ends
+        ++used;
+      }
+      keys[h] = id; tags[h] = epoch; vals[h] = v;
+    }
+    void grow() {
+      std::vector<Id> k2(2 * keys.size(), 0); std::vector<uint32_t> t2(k2.size(), 0); std::vector<uint8_t> v2(k2.size(), 0);
+      std::swap(keys, k2); std::swap(tags, t2); std::swap(vals, v2);
+      uint32_t old = epoch; epoch = 1; mask = keys.size() - 1;
+      for (size_t i = 0; i < k2.size(); ++i)
+        if (t2[i] == old) { size_t h = find(k2[i]); keys[h] = k2[i]; tags[h] = epoch; vals[h] = v2[i]; }
+    }
     uint8_t* buffer(size_t i) {
       while (bufs.size() <= i) bufs.emplace_back(2 * kSector);
       return align(bufs[i].data());

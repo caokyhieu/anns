@@ -9,7 +9,8 @@ B="./build/disk_bench --base $DATA/base.u8bin --query $DATA/query.u8bin --gt $DA
 BEAMS=16,32,64,128,256
 for g in fastpipnn hnsw; do
   # Layouts x page expansion, PQ 64 B, O_DIRECT reads. The first run builds and saves the graph.
-  $B --graph $g --pq-m 64 --orders none,bfs,carve --io direct --page-expand 0,1 --beams $BEAMS 2>>$LOG
+  KB=""; [[ $g == fastpipnn && -f $WORK/fastpipnn.graph ]] && KB="--known-build-seconds ${FASTPIPNN_BUILD_SECONDS:-0}"
+  $B --graph $g $KB --pq-m 64 --orders none,bfs,carve --io direct --page-expand 0,1 --beams $BEAMS 2>>$LOG
   # Same engine with the node file in RAM (no I/O): separates I/O time from search work.
   $B --graph $g --pq-m 64 --orders bfs --io ram --page-expand 0,1 --beams $BEAMS --ram-reference 0 2>>$LOG
   # Smaller PQ codes (32 B) and a 1% hot-node cache.
