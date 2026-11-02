@@ -239,8 +239,11 @@ class DiskIndex {
   }
 
   // Returns up to k (exact distance, original ID) pairs, nearest first.
+  // `start` (file position) overrides the stored entry point, e.g. one found by HNSW's upper
+  // layers kept in RAM.
   std::vector<std::pair<float, Id>> search(const uint8_t* q, size_t k, size_t Lsize, size_t W, bool page_expand,
-                                           SearchStats& st) const {
+                                           SearchStats& st, Id start = kNone) const {
+    const Id entry = start == kNone ? L.entry : start;
     Scratch& s = scratch();
     s.reset(Lsize, L.R);
     pq.table(q, s.tab.data());
@@ -270,8 +273,8 @@ class DiskIndex {
         insert(adc(v), v);
       }
     };
-    s.set(L.entry, 1);
-    insert(adc(L.entry), L.entry);
+    s.set(entry, 1);
+    insert(adc(entry), entry);
     std::vector<Id> pick;
     for (;;) {
       pick.clear();

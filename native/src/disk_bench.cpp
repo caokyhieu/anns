@@ -67,6 +67,56 @@ struct ByteSpace : hnswlib::SpaceInterface<float> {
 
 static bool exists(const std::string& p) { struct stat st; return ::stat(p.c_str(), &st) == 0; }
 
+// HNSW layers above 0, kept in RAM to pick the level-0 entry point per query (greedy descent,
+// as hnswlib does). Vectors of upper-layer nodes are counted as RAM.
+struct Upper {
+  Id ep = 0; int max_level = 0;
+  std::unordered_map<Id, std::vector<std::vector<Id>>> links;  // label -> links at levels 1..L
+  uint64_t ram_bytes(size_t d) const {
+    uint64_t b = 0;
+    for (auto& [id, lv] : links) { b += d + 8; for (auto& l : lv) b += 4 * l.size() + 4; }
+    return b;
+  }
+  Id descend(const uint8_t* q, const uint8_t* rows, size_t d, uint64_t& evals) const {
+    Id cur = ep;
+    float best = fastpipnn::sqdist(rows + size_t(cur) * d, q, d); ++evals;
+    for (int l = max_level; l >= 1; --l) {
+      for (bool moved = true; moved;) {
+        moved = false;
+        auto it = links.find(cur);
+        if (it == links.end() || int(it->second.size()) < l) break;
+        for (Id v : it->second[l - 1]) {
+          float dv = fastpipnn::sqdist(rows + size_t(v) * d, q, d); ++evals;
+          if (dv < best) { best = dv; cur = v; moved = true; }
+        }
+      }
+    }
+    return cur;
+  }
+  void save(const std::string& path) const {
+    std::ofstream o(path, std::ios::binary);
+    uint64_t h[3] = {ep, uint64_t(max_level), links.size()};
+    o.write(reinterpret_cast<const char*>(h), sizeof(h));
+    for (auto& [id, lv] : links) {
+      uint32_t head[2] = {id, uint32_t(lv.size())};
+      o.write(reinterpret_cast<const char*>(head), 8);
+      for (auto& l : lv) { uint32_t c = l.size(); o.write(reinterpret_cast<const char*>(&c), 4); o.write(reinterpret_cast<const char*>(l.data()), 4 * c); }
+    }
+  }
+  void load(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    require(bool(in), "cannot read " + path);
+    uint64_t h[3]; in.read(reinterpret_cast<char*>(h), sizeof(h));
+    ep = Id(h[0]); max_level = int(h[1]);
+    for (uint64_t i = 0; i < h[2]; ++i) {
+      uint32_t head[2]; in.read(reinterpret_cast<char*>(head), 8);
+      auto& lv = links[head[0]]; lv.resize(head[1]);
+      for (auto& l : lv) { uint32_t c; in.read(reinterpret_cast<char*>(&c), 4); l.resize(c); in.read(reinterpret_cast<char*>(l.data()), 4 * c); }
+    }
+    require(bool(in), "bad upper-layer file " + path);
+  }
+};
+
 int main(int argc, char** argv) {
  try {
   std::map<std::string, std::string> a;
@@ -95,6 +145,7 @@ int main(int argc, char** argv) {
 
   // ---- graph: load if saved, otherwise build and save
   diskgraph::Graph g;
+  Upper upper;  // HNSW only
   const std::string gpath = work + "/" + graph_kind + ".graph";
   double build_seconds = 0;
   fastpipnn::Index<uint8_t> fast;  // also used for the in-RAM reference search
@@ -124,7 +175,8 @@ int main(int argc, char** argv) {
     require(graph_kind == "hnsw", "--graph must be fastpipnn or hnsw");
     const size_t M = std::stoul(get("--m", "32"));
     g.n = n; g.R = 2 * M; g.entry = medoid;
-    if (exists(gpath)) {
+    if (exists(gpath) && exists(work + "/hnsw.upper")) {
+      upper.load(work + "/hnsw.upper");
       std::FILE* f = std::fopen(gpath.c_str(), "rb");
       g.deg.resize(n); g.adj.resize(n * g.R);
       require(std::fread(g.deg.data(), 2, n, f) == n && std::fread(g.adj.data(), 4, g.adj.size(), f) == g.adj.size(), "bad hnsw graph file");
@@ -146,7 +198,17 @@ int main(int argc, char** argv) {
         auto* nb = reinterpret_cast<hnswlib::tableint*>(ll + 1);
         g.deg[label] = uint16_t(cnt);
         for (size_t j = 0; j < cnt; ++j) g.adj[label * g.R + j] = Id(h.getExternalLabel(nb[j]));
+        for (int l = 1; l <= h.element_levels_[c]; ++l) {
+          auto* ul = h.get_linklist(hnswlib::tableint(c), l);
+          size_t uc = h.getListCount(ul);
+          auto* un = reinterpret_cast<hnswlib::tableint*>(ul + 1);
+          auto& dst = upper.links[Id(label)];
+          dst.emplace_back();
+          for (size_t j = 0; j < uc; ++j) dst.back().push_back(Id(h.getExternalLabel(un[j])));
+        }
       }
+      upper.ep = Id(h.getExternalLabel(h.enterpoint_node_)); upper.max_level = h.maxlevel_;
+      upper.save(work + "/hnsw.upper");
       std::FILE* f = std::fopen(gpath.c_str(), "wb");
       std::fwrite(g.deg.data(), 2, n, f); std::fwrite(g.adj.data(), 4, g.adj.size(), f);
       std::fclose(f);
@@ -222,6 +284,14 @@ int main(int argc, char** argv) {
       for (size_t i = 0; i < n; ++i)
         for (size_t j = 0; j < g.deg[i]; ++j) { edges += 1; same += idx.L.sector_of(inv[i]) == idx.L.sector_of(inv[g.nbrs(Id(i))[j]]); }
     }
+    std::vector<Id> inv(n);
+    for (size_t p = 0; p < n; ++p) inv[perm[p]] = Id(p);
+    const std::string entry_mode = get("--entry", "medoid");
+    require(entry_mode == "medoid" || (entry_mode == "upper" && graph_kind == "hnsw"), "--entry upper needs --graph hnsw");
+    const uint64_t upper_ram = entry_mode == "upper" ? upper.ram_bytes(d) : 0;
+    auto start_of = [&](const uint8_t* q, uint64_t& ev) {
+      return entry_mode == "upper" ? inv[upper.descend(q, base.rows, d, ev)] : diskgraph::kNone;
+    };
     for (const std::string& io : words(get("--io", "direct"))) {
       idx.open(npath, io);
       for (size_t cache : nums(get("--cache-nodes", "0"))) {
@@ -230,7 +300,8 @@ int main(int argc, char** argv) {
             ",\"write_seconds\":" + num(write_seconds) + ",\"disk_bytes\":" + std::to_string(idx.L.bytes()) +
             ",\"nodes_per_sector\":" + std::to_string(idx.L.per_sector) +
             ",\"neighbor_same_sector\":" + num(same / edges) + ",\"io\":\"" + io + "\",\"cache_nodes\":" +
-            std::to_string(cache) + ",\"ram_bytes\":" + std::to_string(idx.ram_bytes());
+            std::to_string(cache) + ",\"ram_bytes\":" + std::to_string(idx.ram_bytes() + upper_ram) +
+            ",\"entry\":\"" + entry_mode + "\",\"upper_nodes\":" + std::to_string(entry_mode == "upper" ? upper.links.size() : 0);
         for (size_t pe : nums(get("--page-expand", "0,1")))
           for (size_t W : nums(get("--widths", "4")))
             for (size_t beam : nums(get("--beams", "16,32,64,128"))) {
@@ -240,7 +311,9 @@ int main(int argc, char** argv) {
               std::vector<double> lat(nq);
               for (size_t qi = 0; qi < nq; ++qi) {
                 double t0 = now();
-                auto r = idx.search(query.row(qi), k, std::max(beam, k), W, pe, st);
+                uint64_t ev = 0;
+                Id start = start_of(query.row(qi), ev);
+                auto r = idx.search(query.row(qi), k, std::max(beam, k), W, pe, st, start);
                 lat[qi] = (now() - t0) * 1e3; ms += lat[qi];
                 rc += recall(qi, r);
               }
@@ -250,7 +323,8 @@ int main(int argc, char** argv) {
               double t1 = now();
               fastpipnn::parallel_for(qthreads, nq, 1, [&](size_t qi) {
                 diskgraph::SearchStats local;
-                idx.search(query.row(qi), k, std::max(beam, k), W, pe, local);
+                uint64_t ev = 0;
+                idx.search(query.row(qi), k, std::max(beam, k), W, pe, local, start_of(query.row(qi), ev));
               });
               double qps = double(nq) / (now() - t1);
               emit("{\"kind\":\"disk\"," + layout + ",\"page_expand\":" + std::to_string(pe) + ",\"width\":" +
