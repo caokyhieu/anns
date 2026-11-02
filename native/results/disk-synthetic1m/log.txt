@@ -1,0 +1,1 @@
+fastpipnn graph ready, build 35.7208 s, mean degree 35.143
