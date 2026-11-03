@@ -4,3 +4,37 @@ built flat + hnsw in 41.4488 s
 built flat + fastpipnn in 14.9167 s
 trained 256 centroids in 0.526752 s
 built flat + flat in 1.33e-07 s
+built flat + hnsw in 34.4412 s
+built flat + fastpipnn in 11.6802 s
+trained 1024 centroids in 4.40127 s
+built flat + flat in 1.42e-07 s
+built flat + hnsw in 21.7939 s
+built flat + fastpipnn in 6.89752 s
+built hnsw:15 + flat in 1.28e-07 s
+built hnsw:15 + hnsw in 18.8691 s
+built hnsw:15 + fastpipnn in 6.98303 s
+built fastpipnn:15 + flat in 1.4e-07 s
+built fastpipnn:15 + hnsw in 19.2965 s
+built fastpipnn:15 + fastpipnn in 7.00202 s
+built fastpipnn:32 + flat in 1.14e-07 s
+built fastpipnn:32 + hnsw in 19.2752 s
+built fastpipnn:32 + fastpipnn in 7.02293 s
+trained 4096 centroids in 46.9842 s
+built flat + flat in 1.43e-07 s
+built flat + hnsw in 21.469 s
+built flat + fastpipnn in 5.11118 s
+built hnsw:15 + flat in 1.96e-07 s
+built hnsw:15 + hnsw in 10.3734 s
+built hnsw:15 + fastpipnn in 5.00805 s
+built fastpipnn:15 + flat in 1.65e-07 s
+built fastpipnn:15 + hnsw in 10.1164 s
+built fastpipnn:15 + fastpipnn in 4.98817 s
+built fastpipnn:32 + flat in 1.89e-07 s
+built fastpipnn:32 + hnsw in 9.6889 s
+built fastpipnn:32 + fastpipnn in 5.15269 s
+trained 16384 centroids in 284.523 s
+built flat + flat in 1.61e-07 s
+built hnsw:15 + flat in 1.17e-07 s
+built fastpipnn:15 + flat in 1.5e-07 s
+built fastpipnn:32 + flat in 2.32e-07 s
+done
