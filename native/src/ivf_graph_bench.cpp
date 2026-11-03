@@ -53,9 +53,13 @@ static Partitions group(const U8& base, const std::vector<Id>& assign, size_t C)
 // many small graphs in turn does not look up per-index scratch. Same algorithm as
 // fastpipnn::Index::search: best-first from the medoid, stop when the frontier is worse than
 // the beam's worst. Returns (distance, local ID) pairs, nearest first.
+// `entries` > 0 also seeds the beam with that many rows spread over the partition (every
+// (m / entries)-th row; row order is the dataset's, unrelated to the vectors), all counted as
+// distance evaluations. It plays the role of HNSW's upper layers: a graph whose clusters are
+// not linked (see reachable_fraction) is still searched from a seed near the query.
 struct Visited { std::vector<uint32_t> mark; uint32_t epoch = 0; };
 static std::vector<std::pair<float, Id>> graph_search(const fastpipnn::Index<uint8_t>& g, const uint8_t* q, size_t k,
-                                                      size_t beam, Visited& v, uint64_t& evals) {
+                                                      size_t beam, Visited& v, uint64_t& evals, size_t entries = 0) {
   if (v.mark.size() < g.n) { v.mark.assign(g.n, 0); v.epoch = 0; }
   if (++v.epoch == 0) { std::fill(v.mark.begin(), v.mark.end(), 0); v.epoch = 1; }
   using Pair = std::pair<float, Id>;
@@ -71,6 +75,7 @@ static std::vector<std::pair<float, Id>> graph_search(const fastpipnn::Index<uin
     }
   };
   visit(g.entry);
+  for (size_t s = 0, E = std::min(entries, g.n); s < E; ++s) visit(Id(s * g.n / E));
   while (!frontier.empty()) {
     Pair item = frontier.top(); frontier.pop();
     if (best.size() == beam && item > best.top()) break;
@@ -80,6 +85,20 @@ static std::vector<std::pair<float, Id>> graph_search(const fastpipnn::Index<uin
   std::vector<Pair> out(best.size());
   for (size_t i = out.size(); i > 0; --i) { out[i - 1] = best.top(); best.pop(); }
   return out;
+}
+
+// Rows reachable from the entry by following out-edges (BFS), for a fastpipnn graph or an
+// HNSW level-0 graph given as a neighbor callback.
+template <class Neighbors> static size_t reachable(size_t n, Id entry, Neighbors&& nb) {
+  std::vector<char> seen(n, 0);
+  std::vector<Id> stack{entry};
+  seen[entry] = 1;
+  size_t count = 1;
+  while (!stack.empty()) {
+    Id p = stack.back(); stack.pop_back();
+    nb(p, [&](Id q) { if (!seen[q]) { seen[q] = 1; ++count; stack.push_back(q); } });
+  }
+  return count;
 }
 
 int main(int argc, char** argv) {
@@ -143,6 +162,7 @@ int main(int argc, char** argv) {
   { std::istringstream in(a.get("--sub", "flat,hnsw,fastpipnn")); for (std::string t; std::getline(in, t, ',');) subs.push_back(t); }
   const auto nprobes = parse_list(a.get("--nprobes", "1,2,4,8,16,32"));
   const auto efs = parse_list(a.get("--efs", "10,20,40,80,160"));
+  const auto entry_list = parse_list(a.get("--entries", "0"));  // extra seeds for fastpipnn searches
 
   for (const std::string& spec : assigns) {
     // -------------------------------------------------------- 1. assignment
@@ -210,7 +230,10 @@ int main(int argc, char** argv) {
           } else {
             fastpipnn::Params p;
             p.degree = a.n("--degree", 40); p.reservoir = std::max<size_t>(a.n("--reservoir", 160), p.degree);
-            p.leaf_size = a.n("--leaf-size", 1024); p.local_k = a.n("--local-k", 2); p.alpha = a.f("--alpha", 1.2);
+            // Leaf size follows the partition unless given: m / 8 within [64, 1024]. A leaf as large
+            // as the partition makes the graph a plain k-NN graph (IVF_GRAPH.md §3).
+            p.leaf_size = a.m.count("--leaf-size") ? a.n("--leaf-size", 1024) : std::clamp<size_t>(m / 8, 64, 1024);
+            p.local_k = a.n("--local-k", 2); p.alpha = a.f("--alpha", 1.2);
             p.fanout = parse_list(a.get("--fanout", "10,3")); p.threads = 1; p.seed = seed + j;
             p.leader_fraction = a.f("--leader-fraction", 0.005);
             // Depth-0 leaders scale with the partition: m / leaf_size, which is fastpipnn's own
@@ -224,20 +247,33 @@ int main(int argc, char** argv) {
         });
       }
       const double sub_wall = now() - t0;
-      double sub_cpu = 0, slowest = 0, edges = 0, graph_rows = 0;
+      double sub_cpu = 0, slowest = 0, edges = 0, graph_rows = 0, reached = 0;
       for (size_t j = 0; j < C; ++j) {
         sub_cpu += idx[j].seconds; slowest = std::max(slowest, idx[j].seconds);
-        if (idx[j].fast) { graph_rows += double(P.size(j)); for (size_t i = 0; i < P.size(j); ++i) edges += idx[j].fast->neighbors(Id(i)).size(); }
+        const size_t m = P.size(j);
+        if (idx[j].fast) {
+          const auto& g = *idx[j].fast;
+          graph_rows += double(m);
+          for (size_t i = 0; i < m; ++i) edges += g.neighbors(Id(i)).size();
+          reached += double(reachable(m, g.entry, [&](Id p, auto&& f) { for (Id q : g.neighbors(p)) f(q); }));
+        }
         if (idx[j].hnsw) {
-          graph_rows += double(P.size(j));
-          for (size_t i = 0; i < P.size(j); ++i) edges += *idx[j].hnsw->get_linklist0(hnswlib::tableint(i)) & 0xffff;
+          auto& h = *idx[j].hnsw;
+          graph_rows += double(m);
+          for (size_t i = 0; i < m; ++i) edges += *h.get_linklist0(hnswlib::tableint(i)) & 0xffff;
+          // Level 0 from the top entry point; HNSW's upper layers can still reach other parts.
+          reached += double(reachable(m, Id(h.enterpoint_node_), [&](Id p, auto&& f) {
+            const unsigned* l = h.get_linklist0(hnswlib::tableint(p));
+            for (unsigned s = 0, deg = *l & 0xffff; s < deg; ++s) f(Id(l[1 + s]));
+          }));
         }
       }
       const std::string cfg = acfg + ",\"sub\":\"" + sub + "\"";
       rec.write("{\"kind\":\"build\"," + cfg + ",\"graph_seconds\":" + num(graph_seconds) + ",\"assign_seconds\":" + num(assign_seconds) +
                 ",\"sub_seconds\":" + num(sub_wall) + ",\"sub_cpu_seconds\":" + num(sub_cpu) + ",\"sub_slowest_seconds\":" + num(slowest) +
                 ",\"total_seconds\":" + num(train_seconds + graph_seconds + assign_seconds + sub_wall) +
-                ",\"mean_degree\":" + num(graph_rows > 0 ? edges / graph_rows : 0) + ",\"graph_rows\":" + num(graph_rows) + "}");
+                ",\"mean_degree\":" + num(graph_rows > 0 ? edges / graph_rows : 0) + ",\"graph_rows\":" + num(graph_rows) +
+                ",\"reachable_fraction\":" + num(graph_rows > 0 ? reached / graph_rows : 0) + "}");
       std::cerr << "built " << spec << " + " << sub << " in " << sub_wall << " s\n";
 
       // ------------------------------------------------------ queries
@@ -246,6 +282,7 @@ int main(int argc, char** argv) {
       std::vector<std::pair<float, Id>> cd(C);
       for (size_t probes : nprobes) {
         if (probes > C) continue;
+        for (size_t seeds : (sub == "fastpipnn" ? entry_list : std::vector<size_t>{0}))
         for (size_t ef : (sub == "flat" ? std::vector<size_t>{0} : efs)) {
           std::vector<double> rc(nq), lat(nq), ev(nq);
           for (size_t qi = 0; qi < nq; ++qi) {
@@ -266,7 +303,7 @@ int main(int argc, char** argv) {
                 e += g_evals;
                 while (!r.empty()) { merged.push_back({r.top().first, P.ids[b + r.top().second]}); r.pop(); }
               } else if (idx[j].fast) {
-                for (auto& [dist, id] : graph_search(*idx[j].fast, q, k, std::max(ef, k), visited, e)) merged.push_back({dist, P.ids[b + id]});
+                for (auto& [dist, id] : graph_search(*idx[j].fast, q, k, std::max(ef, k), visited, e, seeds)) merged.push_back({dist, P.ids[b + id]});
               } else {
                 for (size_t i = 0; i < m; ++i) merged.push_back({sq_u8(P.row(b + i), q, d), P.ids[b + i]});
                 e += m;
@@ -277,7 +314,7 @@ int main(int argc, char** argv) {
             rc[qi] = recall(qi, merged); ev[qi] = double(e);
           }
           auto R = summarize(rc), L = summarize(lat), E = summarize(ev);
-          rec.write("{\"kind\":\"query\"," + cfg + ",\"nprobe\":" + std::to_string(probes) + ",\"ef\":" + std::to_string(ef) +
+          rec.write("{\"kind\":\"query\"," + cfg + ",\"nprobe\":" + std::to_string(probes) + ",\"ef\":" + std::to_string(ef) + ",\"entries\":" + std::to_string(seeds) +
                     ",\"recall\":" + num(R.mean) + ",\"distance_evals\":" + num(E.mean) + ",\"latency_ms_mean\":" + num(L.mean) +
                     ",\"latency_ms_p50\":" + num(L.p50) + ",\"latency_ms_p99\":" + num(L.p99) + "}");
         }

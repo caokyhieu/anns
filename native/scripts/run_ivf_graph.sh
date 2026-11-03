@@ -9,8 +9,9 @@ cd "$(dirname "$0")/.."
 DATA=${1:-results/synthetic1m}; OUT=${2:-results/ivf-graph-synthetic1m}; T=${3:-4}
 mkdir -p "$OUT"; R="$OUT/results.jsonl"; LOG="$OUT/log.txt"
 B="./build/ivf_graph_bench --base $DATA/base.u8bin --query $DATA/query.u8bin --gt $DATA/gt.ibin --dataset $(basename $DATA) --threads $T --output $R"
-# fastpipnn inside partitions: leaf 128, local_k 8, depth-0 leaders = 4 * rows / leaf (tuned in IVF_GRAPH.md §3).
-F="--leaf-size 128 --local-k 8 --leaders-per-leaf 4"
+# fastpipnn inside partitions (tuned in IVF_GRAPH.md §3): leaf = rows / 8 within [64, 1024], local_k 2,
+# depth-0 leaders = 4 * rows / leaf, degree 40; searched from the medoid alone and with 64 extra seeds.
+F="--local-k 2 --leaders-per-leaf 4 --entries 0,64"
 EFS=10,20,40,80,160
 $B $F --lists 64   --assign flat --sub flat,hnsw,fastpipnn --nprobes 1,2,4,8 --efs $EFS 2>>$LOG
 $B $F --lists 256  --assign flat --sub flat,hnsw,fastpipnn --nprobes 1,2,4,8,16 --efs $EFS 2>>$LOG
