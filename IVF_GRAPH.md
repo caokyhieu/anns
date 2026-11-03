@@ -30,7 +30,8 @@ one condition.
 
 Latency is mean single-thread time per query. k-means training is 4.4 s at 1,024 partitions
 and 47 s at 4,096, the same for both rows. The LanceDB rows use hnswlib with Lance's exact
-parameters. §5 checks them against real Lance.
+parameters. §5 checks them against real Lance: the sub-index matches, and real Lance's
+assignment graph is a little worse (0.925 max recall at 4,096 partitions).
 
 Code: `native/src/ivf_graph_bench.cpp` (shared helpers in `native/src/bench_common.hpp`),
 `native/scripts/run_ivf_graph.sh`, `native/scripts/summarize_ivf_graph.py`,
@@ -209,15 +210,52 @@ these sizes). Swapping one stage at a time:
 
 ## 5. Real LanceDB check
 
-(pending)
+`lance_ivf_graph_check.py`, pylance 14.0.2, `IVF_HNSW_FLAT` with m 20 and ef_construction 150,
+the same 1M vectors, 300 queries. Lance's centroid HNSW is forced off or on with
+`LANCE_USE_HNSW_SPEEDUP_INDEXING`. That switch also changes k-means training, which uses the
+same `SimpleIndex`, so the centroids differ between the two modes. Raw: `lance.jsonl`.
+
+| Partitions | Lance assignment | Build | Max R@10 | Recall at (nprobe, ef) | | |
+|---:|---|---:|---:|---:|---:|---:|
+| 64 | | | | np 1, ef 40 | np 1, ef 80 | np 1, ef 160 |
+| | exact (off) | 93.6 s | 0.978 | 0.771 | 0.905 | 0.967 |
+| | HNSW (on) | 91.6 s | 0.983 | 0.777 | 0.912 | 0.975 |
+| | *native: flat + hnsw* | 41.6 s | 0.974 | 0.763 | 0.903 | 0.970 |
+| 1,024 | | | | np 8, ef 40 | np 16, ef 80 | np 32, ef 160 |
+| | exact (off) | 65.5 s | 1.000 | 0.985 | 0.999 | 1.000 |
+| | HNSW (on) | 69.4 s | 0.999 | 0.861 | 0.990 | 0.999 |
+| | *native: flat + hnsw* | 27.1 s | 1.000 | 0.938 | 0.997 | 1.000 |
+| | *native: hnsw:15 + hnsw* | 25.2 s | 0.989 | 0.909 | 0.971 | 0.981 |
+| 4,096 | | | | np 32, ef 20 | np 64, ef 40 | np 128, ef 160 |
+| | exact (off) | 87.2 s | 1.000 | 0.999 | 1.000 | 1.000 |
+| | HNSW (on) | 67.4 s | **0.925** | 0.803 | 0.873 | 0.925 |
+| | *native: flat + hnsw* | 72.4 s | 1.000 | 0.979 | 0.999 | 1.000 |
+| | *native: hnsw:15 + hnsw* | 59.4 s | 0.946 | 0.877 | 0.917 | 0.946 |
+
+- **The assignment result holds on real Lance, and is slightly worse there.** With its centroid
+  HNSW on, Lance at 4,096 partitions stops at 0.925 recall for any `nprobe` (the stand-in:
+  0.946). At 1,024 partitions it needs twice the `nprobe` for 0.90–0.99. With exact assignment it
+  reaches 0.99 at np 32, ef 20.
+- **The per-partition HNSW stand-in matches Lance.** At 64 partitions, where the two k-means
+  runs give similar partitions, hnswlib and Lance's HNSW agree within 0.01 at every ef.
+- **Lance's partitions are better than this benchmark's.** At 1,024 and 4,096 partitions, Lance
+  with exact assignment beats even a full scan of the same number of native partitions
+  (0.985 at np 8 against 0.959). Lance's trainer is hierarchical and runs more iterations than
+  the 10 Lloyd iterations here. That shifts every native row by the same amount, so it does not
+  change the HNSW vs PiPNN comparison. It does mean absolute `nprobe` values are not
+  comparable with Lance's.
+- **Build time:** Lance takes 65–94 s against 25–72 s for the native HNSW pipeline. Lance also
+  trains longer and writes the index to disk. Lance's query latency (2.7–10 ms) is mostly
+  Python and query planning, so it is not compared.
 
 ## 6. Caveats
 
 - Synthetic data (128 well-separated Gaussian clusters, uint8, 128-d). It exaggerates both
   the graph connectivity problem (§3) and how well a single partition answers a query.
-- The LanceDB baseline is hnswlib with Lance's parameters, not Lance's Rust HNSW. Lance's
-  HNSW caps the number of levels at 7 and differs in small details. §5 compares recall with
-  real Lance.
+- The LanceDB baseline is hnswlib with Lance's parameters, not Lance's Rust HNSW. §5 shows it
+  matches Lance's per-partition HNSW, and is slightly kinder than Lance's own centroid HNSW.
+  The native k-means (10 Lloyd iterations) gives worse partitions than Lance's trainer for all
+  methods alike.
 - No quantization: Lance's usual `IVF_HNSW_SQ` / `IVF_HNSW_PQ` and `IVF_RQ` would change the
   absolute numbers and the scan-vs-graph crossover, but not the assignment results.
 - One build per configuration and 4 cores. Build times are wall clock on a shared VM.
