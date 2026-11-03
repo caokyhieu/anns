@@ -1,0 +1,24 @@
+trained 1024 centroids in 4.21767 s
+built flat + hnsw in 22.4983 s
+trained 1024 centroids in 4.38331 s
+built flat + fastpipnn in 16.0741 s
+trained 1024 centroids in 4.74181 s
+built flat + fastpipnn in 16.6965 s
+trained 1024 centroids in 4.46398 s
+built flat + fastpipnn in 15.3189 s
+trained 1024 centroids in 4.24963 s
+built flat + fastpipnn in 10.0014 s
+trained 1024 centroids in 4.36561 s
+built flat + fastpipnn in 16.362 s
+trained 64 centroids in 0.0865178 s
+built flat + hnsw in 43.5806 s
+trained 64 centroids in 0.083669 s
+built flat + fastpipnn in 22.0733 s
+trained 64 centroids in 0.0826701 s
+built flat + fastpipnn in 21.5555 s
+trained 64 centroids in 0.0719795 s
+built flat + fastpipnn in 20.5944 s
+trained 64 centroids in 0.0800949 s
+built flat + fastpipnn in 14.0589 s
+trained 64 centroids in 0.080079 s
+built flat + fastpipnn in 22.6288 s

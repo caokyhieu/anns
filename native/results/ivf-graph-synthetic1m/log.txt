@@ -1,0 +1,6 @@
+trained 64 centroids in 0.0787732 s
+built flat + flat in 1.2e-07 s
+built flat + hnsw in 41.4488 s
+built flat + fastpipnn in 14.9167 s
+trained 256 centroids in 0.526752 s
+built flat + flat in 1.33e-07 s
