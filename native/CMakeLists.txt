@@ -63,3 +63,10 @@ target_include_directories(disk_bench PRIVATE third_party/eigen third_party/hnsw
 target_compile_definitions(disk_bench PRIVATE EIGEN_DONT_PARALLELIZE)
 target_compile_options(disk_bench PRIVATE -O3 -march=native -ffast-math)
 target_link_libraries(disk_bench PRIVATE Threads::Threads)
+
+# IVF with graphs for assignment and inside partitions: LanceDB's HNSW vs fastpipnn (IVF_GRAPH.md).
+add_executable(ivf_graph_bench src/ivf_graph_bench.cpp)
+target_include_directories(ivf_graph_bench PRIVATE third_party/eigen third_party/hnswlib)
+target_compile_definitions(ivf_graph_bench PRIVATE EIGEN_DONT_PARALLELIZE)
+target_compile_options(ivf_graph_bench PRIVATE -O3 -march=native -ffast-math)
+target_link_libraries(ivf_graph_bench PRIVATE Threads::Threads)
