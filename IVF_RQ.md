@@ -7,7 +7,7 @@ This experiment checks that on real Lance `IVF_RQ` indexes, with the datasets an
 [lance-format/lance discussion #9122](https://github.com/lance-format/lance/discussions/9122)
 (PCA pre-transform for IVF + RQ, September 2026).
 
-**Status:** GIST1M is done (§4): on the discussion's GIST setup the baseline matches their
+**Status:** GIST1M is done (§4, tree assignment and 4,096 partitions in §4.1): on the discussion's GIST setup the baseline matches their
 numbers, and the assignment method makes no difference, as expected at 256 partitions.
 VIBE has not been run. This environment's network policy blocks `huggingface.co`, and full
 VIBE needs about 40 GB of RAM. §3 gives the commands for a larger machine.
@@ -180,7 +180,86 @@ For the customer's IVF_RQ on GIST-like data at 256 partitions, this means:
 - PCA and bit width, the topics of #9122, are the levers that matter.
 
 The assignment question only arises for indexes where C × d ≥ 10^6, such as VIBE at 1,024
-partitions or GIST from about 1,042 partitions.
+partitions or GIST from about 1,042 partitions. §4.1 tests that on GIST.
+
+### 4.1 Tree assignment, at 256 and 4,096 partitions
+
+This is the `tree_t` assignment of `LANCE_VS_PIPNN_BUILD.md` (`ivf_assign --assign tree:t`). The
+leaves must be Lance's own centroids, so the coarse level is k-means over those centroids:
+round(√C) coarse cells, each centroid under its nearest coarse centroid. Each row takes its t
+nearest coarse cells and is scored against their leaves with one GEMM per cell. The rows enter
+Lance through `precomputed_partition_dataset` like the other `fixed-*` modes.
+
+The 4,096-partition run uses the same GIST setup with nprobe scaled ×16 (32–256) and refine none
+or 5. 4,096 × 960 = 3.9 × 10^6, so Lance enables its centroid HNSW by default on CPUs without
+AMX-FP16.
+
+**Assignment of the 1M rows** (native, 4 threads, base already in memory):
+
+| Partitions | Method | Distances / row | Time | Exact nearest | Empty lists |
+|---:|---|---:|---:|---:|---:|
+| 256 | exact (GEMM) | 256 | 1.21–1.45 s | 1.0000 | 0 |
+| | hnsw, Lance's settings | 87 | 3.93 s | 0.9905 | 0 |
+| | fastpipnn, beam 32 | 146 | 5.49 s | 1.0000 | 0 |
+| | tree, t = 2 / 4 / 8 | 66 / 110 / 182 | 0.92 / 1.53 / 2.77 s | 0.8927 / 0.9886 / 0.9998 | 0 |
+| 4,096 | exact (GEMM) | 4,096 | 17.41 s | 1.0000 | 0 |
+| | hnsw, Lance's settings | 137 | 7.52 s | 0.7996 | 26 |
+| | fastpipnn, beam 32 | 501 | 29.05 s | 0.9999 | 0 |
+| | tree, t = 2 / 4 / 8 | 237 / 412 / 755 | 1.73 / 2.93 / 5.62 s | 0.8239 / 0.9491 / 0.9929 | 0 |
+
+**Recall@10 (p50 latency).** At 256 partitions:
+
+| Mode | np 8, refine 2 | np 16, refine 2 | np 20, refine 5 | np 32, refine 5 | np 64, no refine |
+|---|---:|---:|---:|---:|---:|
+| lance-exact | 0.8072 | 0.9181 (6.4 ms) | 0.9517 (7.2 ms) | 0.9833 | 0.8217 |
+| fixed-tree2 | 0.7918 | 0.9090 (6.2 ms) | 0.9449 (7.1 ms) | 0.9808 | 0.8213 |
+| fixed-tree4 | 0.8059 | 0.9176 (6.4 ms) | 0.9519 (6.8 ms) | 0.9837 | 0.8220 |
+| fixed-tree8 | 0.8066 | 0.9177 (5.9 ms) | 0.9517 (7.3 ms) | 0.9833 | 0.8205 |
+
+At 4,096 partitions (build includes Lance's k-means only for `lance-*`):
+
+| Mode | Build | np 32, refine 5 | np 64, refine 5 | np 128, refine 5 | np 256, refine 5 | np 128, no refine |
+|---|---:|---:|---:|---:|---:|---:|
+| lance-exact | 340.7 s | 0.7279 | 0.8448 | 0.9304 (7.3 ms) | 0.9771 (9.1 ms) | 0.8091 |
+| lance-hnsw (Lance's default here) | 149.8 s | 0.7262 | 0.8451 | 0.9303 (7.3 ms) | 0.9784 (8.9 ms) | 0.8062 |
+| fixed-lance-hnsw | 43.1 s | 0.7264 | 0.8441 | 0.9307 | 0.9777 | 0.8071 |
+| fixed-flat | 40.7 s | 0.7279 | 0.8447 | 0.9303 | 0.9770 | 0.8035 |
+| fixed-fastpipnn32 | 25.0 s | 0.7278 | 0.8447 | 0.9304 | 0.9771 | 0.8044 |
+| fixed-tree2 | 23.0 s | 0.7107 | 0.8303 | 0.9227 | 0.9733 | 0.7970 |
+| fixed-tree4 | 23.2 s | 0.7241 | 0.8413 | 0.9290 | 0.9771 | 0.7983 |
+| fixed-tree8 | 24.3 s | 0.7278 | 0.8445 | 0.9306 (7.4 ms) | 0.9774 (9.2 ms) | 0.7994 |
+
+Full sweeps: `summarize native/results/ivf-rq-gist1m/results.jsonl`. Raw logs: `run-tree.log`,
+`run-4096.log`.
+
+- **Tree t = 8 gives the same recall as exact assignment at both sizes.** At 4,096 partitions it
+  is 3.1× faster than the exact GEMM (5.6 s vs 17.4 s) and 5× faster than the PiPNN graph
+  (29 s). The graph is slow here because beam search at d = 960 is random access, while the tree
+  stays matrix-shaped. Against `fixed-flat` (same centroids, exact assignment) at refine 5:
+  - t = 8 is within 0.001 at every nprobe;
+  - t = 4 loses up to 0.004;
+  - t = 2 loses up to 0.017 at small nprobe.
+
+  The gaps shrink as nprobe grows. Without refine, 2-bit recall varies by up to 0.006 even
+  between `lance-exact` and `fixed-flat`, which share centroids and assignment. The no-refine
+  columns therefore cannot separate t = 4 from t = 8.
+- **At 256 partitions the tree is no faster than the GEMM.** Its 16 cells of 16 leaves make
+  GEMMs too small to pay. The tree is for large C.
+- **On GIST, Lance's own centroid HNSW does not hurt recall, even at 4,096 partitions.** It puts
+  only 80% of rows on their nearest centroid, and Lance's real build left 5 lists empty. Yet
+  `lance-hnsw` and `fixed-lance-hnsw` are within ±0.003 of `lance-exact` at every point. Rows that
+  miss land in an adjacent partition that a query probing 32+ partitions also reads. This
+  differs from the synthetic set of `IVF_GRAPH.md`, whose separated clusters made the same miss
+  rate cost 5+ points. Exact-nearest rate alone does not predict the recall loss. Only a recall
+  run on the customer's data does.
+- **Assignment is a small part of the build.** Lance's end-to-end build at 4,096 partitions
+  (340.7 s with exact assignment) is mostly k-means training. With the centroids given, the same
+  index builds in 41 s, and exact assignment is 17 s of that natively. With HNSW on, Lance's
+  training also routes through the HNSW and the build drops to 149.8 s, at no recall cost here.
+  To speed up IVF_RQ builds at this scale, the lever is training: the local leaf training of
+  `LANCE_VS_PIPNN_BUILD.md` §7.1, or Lance's HNSW mode. The assignment method is not.
+- `fixed-tree2`'s 256-partition build took 264.9 s because it read the dataset from disk after
+  the assignment tool had filled the page cache. The other tree builds took 22–24 s.
 
 ## 5. Smoke test on this machine
 
