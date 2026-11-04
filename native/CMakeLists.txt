@@ -70,3 +70,10 @@ target_include_directories(ivf_graph_bench PRIVATE third_party/eigen third_party
 target_compile_definitions(ivf_graph_bench PRIVATE EIGEN_DONT_PARALLELIZE)
 target_compile_options(ivf_graph_bench PRIVATE -O3 -march=native -ffast-math)
 target_link_libraries(ivf_graph_bench PRIVATE Threads::Threads)
+
+# Row -> partition assignment against fixed centroids, for Lance precomputed partitions (IVF_RQ.md).
+add_executable(ivf_assign src/ivf_assign.cpp)
+target_include_directories(ivf_assign PRIVATE third_party/eigen third_party/hnswlib)
+target_compile_definitions(ivf_assign PRIVATE EIGEN_DONT_PARALLELIZE)
+target_compile_options(ivf_assign PRIVATE -O3 -march=native -ffast-math)
+target_link_libraries(ivf_assign PRIVATE Threads::Threads)
