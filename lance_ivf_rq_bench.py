@@ -11,6 +11,8 @@ IVF_RQ: RaBitQ codes, query path, refine.
     fixed-flat        native exact assignment (sanity check: should match lance-exact)
     fixed-hnsw15      native hnswlib with Lance's SimpleIndex settings (stand-in check)
     fixed-fastpipnnB  a PiPNN (fastpipnn) graph over the centroids, beam B
+    fixed-treeT       the tree assignment of LANCE_VS_PIPNN_BUILD.md: sqrt(C) coarse cells built
+                      over the centroids, each row searches the leaves of its T nearest cells
   The native assignments come from native/build/ivf_assign and enter through
   precomputed_partition_dataset.
 
@@ -51,6 +53,7 @@ PRESETS = {
 }
 DEFAULT_MODES = ["lance-exact", "lance-hnsw", "fixed-lance-hnsw", "fixed-flat", "fixed-hnsw15",
                  "fixed-fastpipnn16", "fixed-fastpipnn32"]
+ALL_MODES = DEFAULT_MODES + ["fixed-tree1", "fixed-tree2", "fixed-tree4", "fixed-tree8"]
 
 
 # ----------------------------------------------------------------------------- binary files
@@ -320,7 +323,7 @@ def cmd_run(a):
         native = [m[len("fixed-"):] for m in modes if m.startswith("fixed-") and m != "fixed-lance-hnsw"]
         if native:
             prefix = data / f"assign-{C}"
-            specs = ",".join("flat" if m == "flat" else m.replace("hnsw", "hnsw:").replace("fastpipnn", "fastpipnn:") for m in native)
+            specs = ",".join("flat" if m == "flat" else m.replace("hnsw", "hnsw:").replace("fastpipnn", "fastpipnn:").replace("tree", "tree:") for m in native)
             if not all((data / f"assign-{C}.{m}.u32").exists() for m in native):
                 subprocess.run([str(ASSIGN_BIN), "--base", str(data / "base.fbin"), "--centroids", str(cent),
                                 "--assign", specs, "--out-prefix", str(prefix), "--output", str(data / "assign.jsonl"),
@@ -338,10 +341,10 @@ def cmd_summarize(a):
         print("|---|---:|---:|---:|---:|---:|")
         for r in map(json.loads, open(assign_file)):
             name = r["assign"] + (f":{r['assign_beam']}" if r["assign_beam"] else "")
-            print(f"| {name} ({r['lists']} lists) | {r['evals_per_row']:.0f} | {r['assign_seconds']:.1f} s | "
+            print(f"| {name} ({r['lists']} lists) | {r['evals_per_row']:.0f} | {r['assign_seconds']:.2f} s | "
                   f"{r['exact_fraction']:.4f} | {r['empty_lists']} | {r['list_size_max']} |")
-    for bits in sorted({r["bits"] for r in rows}):
-        rs = [r for r in rows if r["bits"] == bits]
+    for parts, bits in sorted({(r["partitions"], r["bits"]) for r in rows}):
+        rs = [r for r in rows if r["bits"] == bits and r["partitions"] == parts]
         probes = sorted({r["nprobe"] for r in rs if r["kind"] == "query"})
         refines = sorted({r["refine"] or 0 for r in rs if r["kind"] == "query"})
         k = next(r["k"] for r in rs if r["kind"] == "query")
@@ -393,7 +396,7 @@ def main():
     ch.add_argument("--save-centroids")
     ru.add_argument("--preset", choices=PRESETS, required=True)
     ru.add_argument("--bits", type=int, nargs="+")
-    ru.add_argument("--modes", nargs="+", choices=DEFAULT_MODES)
+    ru.add_argument("--modes", nargs="+", choices=ALL_MODES)
     ru.add_argument("--threads", type=int, default=0)
     sm = sub.add_parser("summarize")
     sm.add_argument("results")
