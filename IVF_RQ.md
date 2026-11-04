@@ -7,10 +7,10 @@ This experiment checks that on real Lance `IVF_RQ` indexes, with the datasets an
 [lance-format/lance discussion #9122](https://github.com/lance-format/lance/discussions/9122)
 (PCA pre-transform for IVF + RQ, September 2026).
 
-**Status:** the harness is built and checked end to end on the local synthetic set (§4). GIST1M
-and VIBE have not been run. This environment's network policy blocks `huggingface.co` and
-`ann-benchmarks.com`, and full VIBE needs about 40 GB of RAM. §3 gives the commands for a larger
-machine.
+**Status:** GIST1M is done (§4): on the discussion's GIST setup the baseline matches their
+numbers, and the assignment method makes no difference, as expected at 256 partitions.
+VIBE has not been run. This environment's network policy blocks `huggingface.co`, and full
+VIBE needs about 40 GB of RAM. §3 gives the commands for a larger machine.
 
 Code: `lance_ivf_rq_bench.py` (data prep, builds, query sweeps, tables), `native/src/ivf_assign.cpp`
 (native assignment against fixed centroids).
@@ -127,7 +127,62 @@ For a first pass, `--bits 2 --modes lance-exact lance-hnsw fixed-lance-hnsw fixe
 Results go to `data/<name>/results.jsonl` and `data/<name>/assign.jsonl`. Copy them to
 `native/results/ivf-rq-<name>/` to commit.
 
-## 4. Smoke test on this machine
+## 4. GIST1M results
+
+ann-benchmarks `gist-960-euclidean.hdf5`: 1M × 960 base, 1,000 queries, its exact top-100
+(spot-checked against an exact search: 10/10 on 5 queries). 256 partitions, 2-bit RQ, L2,
+k 10, all 1,000 queries, medians of 3 runs, 10 warm-up queries, pylance 14.0.2, 4 vCPUs.
+Raw: `native/results/ivf-rq-gist1m/`.
+
+**The baseline reproduces #9122.** `lance-exact` matches the discussion's 960D baseline:
+
+| nprobe / refine | Discussion: Recall@10, p50, p95, QPS | Here (`lance-exact`) |
+|---|---|---|
+| 16 / 2 | 0.9152, 6.25 ms, 9.92 ms, 149.7 | 0.9181, 6.44 ms, 7.94 ms, 151.8 |
+| 16 / 3 | 0.9259, 5.34 ms, 7.72 ms, 175.7 | 0.9293, 6.80 ms, 8.51 ms, 142.4 |
+| Index size | 251.39 MiB | 263.7 MB (251.4 MiB) |
+| Build | 9.31 s | 36.3 s (4 vCPUs; their hardware is not reported) |
+
+**The assignment method makes no difference here.** Recall@10 (p50 latency):
+
+| Mode | Build | np 16, refine 2 | np 20, refine 5 | np 32, refine 5 | np 64, refine 5 | np 64, no refine |
+|---|---:|---:|---:|---:|---:|---:|
+| lance-exact | 36.3 s | 0.9181 (6.4 ms) | 0.9517 (7.2 ms) | 0.9833 (7.9 ms) | 0.9978 (10.1 ms) | 0.8217 |
+| lance-hnsw | 42.3 s | 0.9161 (6.0 ms) | 0.9528 (6.8 ms) | 0.9856 (7.5 ms) | 0.9974 (10.3 ms) | 0.8244 |
+| fixed-lance-hnsw | 29.1 s | 0.9189 (6.3 ms) | 0.9513 (7.0 ms) | 0.9829 (8.2 ms) | 0.9975 (10.3 ms) | 0.8226 |
+| fixed-flat | 20.3 s | 0.9182 (5.9 ms) | 0.9515 (7.1 ms) | 0.9831 (8.0 ms) | 0.9976 (10.4 ms) | 0.8240 |
+| fixed-hnsw15 | 17.5 s | 0.9181 (6.0 ms) | 0.9504 (7.1 ms) | 0.9824 (7.8 ms) | 0.9971 (10.0 ms) | 0.8231 |
+| fixed-fastpipnn16 | 17.8 s | 0.9171 (6.0 ms) | 0.9516 (6.9 ms) | 0.9832 (7.7 ms) | 0.9977 (10.2 ms) | 0.8199 |
+| fixed-fastpipnn32 | 18.0 s | 0.9199 (6.3 ms) | 0.9517 (7.3 ms) | 0.9831 (8.1 ms) | 0.9976 (10.5 ms) | 0.8214 |
+
+| Native assignment (1M rows, 4 threads) | Distances / row | Time | Exact nearest | Largest list |
+|---|---:|---:|---:|---:|
+| flat | 256 | 1.5 s | 1.0000 | 13,104 |
+| hnsw, Lance's settings | 87 | 3.9 s | 0.9905 | 13,176 |
+| fastpipnn, beam 16 | 116 | 4.0 s | 0.9999 | 13,104 |
+| fastpipnn, beam 32 | 146 | 5.5 s | 1.0000 | 13,104 |
+
+- Across all 20 (nprobe, refine) points, the seven modes are within 0.0046 of each other. That
+  is the build-to-build spread from RaBitQ's random rotation. The full sweep is in
+  `summarize native/results/ivf-rq-gist1m/results.jsonl`.
+- With only 256 centroids, even Lance's centroid HNSW puts 99% of rows on their nearest
+  centroid, and the 1% it misses lie on partition boundaries, where refine and nprobe 16+ cover
+  them. Lance would not turn the HNSW on for this shape anyway (256 × 960 < 10^6).
+- At 256 partitions, exact assignment (1.5 s) is cheaper than either graph. The graphs only pay
+  off with many partitions.
+- **Build times of `fixed-*` rows are not a speed-up.** They skip k-means, because the centroids
+  come from `lance-exact`. `lance-hnsw` (42 s) is slower than `lance-exact` (36 s) because k-means
+  training also routes through the HNSW, which at 256 centroids is slower than the GEMM.
+
+For the customer's IVF_RQ on GIST-like data at 256 partitions, this means:
+- Lance's default assignment is exact.
+- Swapping in PiPNN changes neither recall nor latency.
+- PCA and bit width, the topics of #9122, are the levers that matter.
+
+The assignment question only arises for indexes where C × d ≥ 10^6, such as VIBE at 1,024
+partitions or GIST from about 1,042 partitions.
+
+## 5. Smoke test on this machine
 
 Synthetic 1M × 128 (the set of `IVF_GRAPH.md`), 256 partitions, 2-bit, 200 queries, one repeat.
 Raw: `native/results/ivf-rq-smoke-synthetic1m/`.
@@ -151,10 +206,9 @@ Raw: `native/results/ivf-rq-smoke-synthetic1m/`.
 
 All modes agree within the ±0.005 build-to-build noise. That is expected for this set: 256
 centroids are few enough that even Lance's centroid HNSW is 99.8% exact, and Lance would not
-enable it here on its own. The test shows that every mode builds and queries. It says nothing
-yet about GIST or VIBE.
+enable it here on its own. The test shows that every mode builds and queries.
 
-## 5. What to look for
+## 6. What to look for
 
 - **VIBE, `lance-hnsw` and `fixed-lance-hnsw` vs `lance-exact`.** How much recall the default
   assignment of a 1,024 × 1,024 index loses at each nprobe, and whether more nprobe recovers it.
@@ -163,5 +217,6 @@ yet about GIST or VIBE.
 - **`fixed-fastpipnn32` vs `lance-exact`.** Whether a PiPNN assignment matches exact
   assignment at a fraction of its cost. The native assignment also reports how many distances
   each row needs.
-- **GIST** should show no difference, since Lance assigns it exactly by default. If it does, the
-  cause is elsewhere.
+- **GIST** at 256 partitions showed no difference (§4), as expected. The next GIST check is
+  1,024–4,096 partitions (`run --preset gist --partitions 4096`), where C × d ≥ 10^6 and Lance
+  would turn its centroid HNSW on.
