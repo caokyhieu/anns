@@ -1,0 +1,177 @@
+=== rep 1 bits 1 baseline
+[baseline] building IVF1000_RQ1 on 1000000x960
+  stage train_ivf             19.06s
+  stage train_quantizer        0.00s
+  stage shuffle               43.84s
+  stage merge_partitions       0.69s
+  total build           63.60s
+  nprobes=10   recall@10=0.5401 recall@100=0.5304 avg_latency=5.76ms
+  nprobes=20   recall@10=0.6110 recall@100=0.6340 avg_latency=5.91ms
+  nprobes=50   recall@10=0.6562 recall@100=0.7142 avg_latency=7.12ms
+  nprobes=100  recall@10=0.6693 recall@100=0.7373 avg_latency=9.41ms
+=== rep 1 bits 1 blocked
+[blocked] building IVF1000_RQ1 on 1000000x960
+  stage train_ivf             13.52s
+  stage train_quantizer        0.00s
+  stage shuffle               16.70s
+  stage merge_partitions       0.56s
+  total build           30.80s
+  nprobes=10   recall@10=0.5473 recall@100=0.5324 avg_latency=5.48ms
+  nprobes=20   recall@10=0.6145 recall@100=0.6370 avg_latency=6.02ms
+  nprobes=50   recall@10=0.6590 recall@100=0.7131 avg_latency=7.21ms
+  nprobes=100  recall@10=0.6722 recall@100=0.7362 avg_latency=9.66ms
+=== rep 1 bits 5 baseline
+[baseline] building IVF1000_RQ5 on 1000000x960
+  stage train_ivf             19.58s
+  stage train_quantizer        0.00s
+  stage shuffle               70.61s
+  stage merge_partitions       1.62s
+  total build           92.05s
+  nprobes=10   recall@10=0.6625 recall@100=0.5774 avg_latency=6.44ms
+  nprobes=20   recall@10=0.7946 recall@100=0.7313 avg_latency=6.48ms
+  nprobes=50   recall@10=0.9105 recall@100=0.8900 avg_latency=8.25ms
+  nprobes=100  recall@10=0.9472 recall@100=0.9520 avg_latency=11.00ms
+=== rep 1 bits 5 blocked
+[blocked] building IVF1000_RQ5 on 1000000x960
+  stage train_ivf             13.21s
+  stage train_quantizer        0.00s
+  stage shuffle               41.13s
+  stage merge_partitions       1.49s
+  total build           56.06s
+  nprobes=10   recall@10=0.6734 recall@100=0.5780 avg_latency=6.27ms
+  nprobes=20   recall@10=0.8051 recall@100=0.7371 avg_latency=6.53ms
+  nprobes=50   recall@10=0.9153 recall@100=0.8951 avg_latency=8.14ms
+  nprobes=100  recall@10=0.9495 recall@100=0.9533 avg_latency=11.00ms
+=== rep 1 bits 5 blocked+const
+[blocked+const] building IVF1000_RQ5 on 1000000x960
+  stage train_ivf             12.85s
+  stage train_quantizer        0.00s
+  stage shuffle               19.47s
+  stage merge_partitions       1.99s
+  total build           34.34s
+  nprobes=10   recall@10=0.6491 recall@100=0.5714 avg_latency=6.39ms
+  nprobes=20   recall@10=0.7917 recall@100=0.7288 avg_latency=6.76ms
+  nprobes=50   recall@10=0.9081 recall@100=0.8890 avg_latency=8.16ms
+  nprobes=100  recall@10=0.9471 recall@100=0.9507 avg_latency=10.85ms
+=== rep 1 bits 9 baseline
+[baseline] building IVF1000_RQ9 on 1000000x960
+  stage train_ivf             18.50s
+  stage train_quantizer        0.00s
+  stage shuffle              197.33s
+  stage merge_partitions       4.11s
+  total build          220.51s
+  nprobes=10   recall@10=0.6663 recall@100=0.5791 avg_latency=7.61ms
+  nprobes=20   recall@10=0.8037 recall@100=0.7384 avg_latency=7.00ms
+  nprobes=50   recall@10=0.9200 recall@100=0.8967 avg_latency=8.89ms
+  nprobes=100  recall@10=0.9572 recall@100=0.9570 avg_latency=10.92ms
+=== rep 1 bits 9 blocked
+[blocked] building IVF1000_RQ9 on 1000000x960
+  stage train_ivf             13.36s
+  stage train_quantizer        0.00s
+  stage shuffle              168.67s
+  stage merge_partitions       3.80s
+  total build          186.27s
+  nprobes=10   recall@10=0.6658 recall@100=0.5777 avg_latency=6.85ms
+  nprobes=20   recall@10=0.7990 recall@100=0.7329 avg_latency=6.65ms
+  nprobes=50   recall@10=0.9177 recall@100=0.8969 avg_latency=7.95ms
+  nprobes=100  recall@10=0.9556 recall@100=0.9575 avg_latency=10.31ms
+=== rep 1 bits 9 blocked+const
+[blocked+const] building IVF1000_RQ9 on 1000000x960
+  stage train_ivf             12.74s
+  stage train_quantizer        0.00s
+  stage shuffle               21.47s
+  stage merge_partitions       5.06s
+  total build           39.60s
+  nprobes=10   recall@10=0.6699 recall@100=0.5773 avg_latency=6.62ms
+  nprobes=20   recall@10=0.8043 recall@100=0.7383 avg_latency=6.66ms
+  nprobes=50   recall@10=0.9183 recall@100=0.8945 avg_latency=8.17ms
+  nprobes=100  recall@10=0.9550 recall@100=0.9570 avg_latency=11.01ms
+=== rep 2 bits 1 baseline
+[baseline] building IVF1000_RQ1 on 1000000x960
+  stage train_ivf             19.02s
+  stage train_quantizer        0.00s
+  stage shuffle               44.09s
+  stage merge_partitions       0.51s
+  total build           63.63s
+  nprobes=10   recall@10=0.5381 recall@100=0.5296 avg_latency=5.32ms
+  nprobes=20   recall@10=0.6088 recall@100=0.6349 avg_latency=5.75ms
+  nprobes=50   recall@10=0.6557 recall@100=0.7145 avg_latency=7.22ms
+  nprobes=100  recall@10=0.6663 recall@100=0.7382 avg_latency=9.23ms
+=== rep 2 bits 1 blocked
+[blocked] building IVF1000_RQ1 on 1000000x960
+  stage train_ivf             12.99s
+  stage train_quantizer        0.00s
+  stage shuffle               17.24s
+  stage merge_partitions       0.54s
+  total build           30.79s
+  nprobes=10   recall@10=0.5415 recall@100=0.5309 avg_latency=5.53ms
+  nprobes=20   recall@10=0.6136 recall@100=0.6334 avg_latency=5.28ms
+  nprobes=50   recall@10=0.6604 recall@100=0.7110 avg_latency=6.72ms
+  nprobes=100  recall@10=0.6741 recall@100=0.7356 avg_latency=8.49ms
+=== rep 2 bits 5 baseline
+[baseline] building IVF1000_RQ5 on 1000000x960
+  stage train_ivf             19.01s
+  stage train_quantizer        0.00s
+  stage shuffle               69.38s
+  stage merge_partitions       3.75s
+  total build           92.35s
+  nprobes=10   recall@10=0.6686 recall@100=0.5789 avg_latency=6.03ms
+  nprobes=20   recall@10=0.8016 recall@100=0.7337 avg_latency=6.34ms
+  nprobes=50   recall@10=0.9141 recall@100=0.8909 avg_latency=8.23ms
+  nprobes=100  recall@10=0.9485 recall@100=0.9523 avg_latency=10.58ms
+=== rep 2 bits 5 blocked
+[blocked] building IVF1000_RQ5 on 1000000x960
+  stage train_ivf             12.75s
+  stage train_quantizer        0.00s
+  stage shuffle               40.99s
+  stage merge_partitions       3.81s
+  total build           57.60s
+  nprobes=10   recall@10=0.6647 recall@100=0.5784 avg_latency=6.26ms
+  nprobes=20   recall@10=0.7945 recall@100=0.7316 avg_latency=6.01ms
+  nprobes=50   recall@10=0.9079 recall@100=0.8907 avg_latency=7.96ms
+  nprobes=100  recall@10=0.9475 recall@100=0.9511 avg_latency=10.25ms
+=== rep 2 bits 5 blocked+const
+[blocked+const] building IVF1000_RQ5 on 1000000x960
+  stage train_ivf             12.52s
+  stage train_quantizer        0.00s
+  stage shuffle               19.26s
+  stage merge_partitions       3.93s
+  total build           35.74s
+  nprobes=10   recall@10=0.6586 recall@100=0.5780 avg_latency=6.60ms
+  nprobes=20   recall@10=0.7927 recall@100=0.7335 avg_latency=6.90ms
+  nprobes=50   recall@10=0.9114 recall@100=0.8900 avg_latency=9.74ms
+  nprobes=100  recall@10=0.9457 recall@100=0.9526 avg_latency=11.51ms
+=== rep 2 bits 9 baseline
+[baseline] building IVF1000_RQ9 on 1000000x960
+  stage train_ivf             19.03s
+  stage train_quantizer        0.00s
+  stage shuffle              197.31s
+  stage merge_partitions       4.61s
+  total build          221.45s
+  nprobes=10   recall@10=0.6757 recall@100=0.5814 avg_latency=7.60ms
+  nprobes=20   recall@10=0.8053 recall@100=0.7349 avg_latency=7.27ms
+  nprobes=50   recall@10=0.9195 recall@100=0.8944 avg_latency=9.09ms
+  nprobes=100  recall@10=0.9576 recall@100=0.9581 avg_latency=12.43ms
+=== rep 2 bits 9 blocked
+[blocked] building IVF1000_RQ9 on 1000000x960
+  stage train_ivf             12.85s
+  stage train_quantizer        0.00s
+  stage shuffle              176.60s
+  stage merge_partitions       4.44s
+  total build          194.36s
+  nprobes=10   recall@10=0.6721 recall@100=0.5815 avg_latency=7.57ms
+  nprobes=20   recall@10=0.7992 recall@100=0.7349 avg_latency=7.03ms
+  nprobes=50   recall@10=0.9173 recall@100=0.8941 avg_latency=8.81ms
+  nprobes=100  recall@10=0.9564 recall@100=0.9577 avg_latency=11.91ms
+=== rep 2 bits 9 blocked+const
+[blocked+const] building IVF1000_RQ9 on 1000000x960
+  stage train_ivf             11.99s
+  stage train_quantizer        0.00s
+  stage shuffle               22.38s
+  stage merge_partitions       2.52s
+  total build           37.37s
+  nprobes=10   recall@10=0.6602 recall@100=0.5759 avg_latency=7.70ms
+  nprobes=20   recall@10=0.7966 recall@100=0.7330 avg_latency=6.99ms
+  nprobes=50   recall@10=0.9207 recall@100=0.8956 avg_latency=8.78ms
+  nprobes=100  recall@10=0.9565 recall@100=0.9579 avg_latency=11.87ms
+DONE

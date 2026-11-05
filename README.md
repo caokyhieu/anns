@@ -138,3 +138,7 @@ A harder run used 1,000 vectors, 32 dimensions, 40 queries, seed 31, and beam 16
 All stage invariants passed. Recall remained above the configured 90% monitoring threshold, so these experiment runs did not trigger a rebuild; unit tests exercise both recall-triggered and periodic rebuilds. Batch mutation costs exceeded fresh-build costs at this scale. The results support prototype correctness and useful recall, not a performance advantage.
 
 Raw records: results.json and results-beam16.json. Timings are machine-specific and are not a controlled performance benchmark.
+
+## Lance IVF_RQ build optimizations
+
+See [`lance_ivf_rq/`](lance_ivf_rq/README.md) for a patch that speeds up Lance `IVF_RQ` index builds (up to 5.7x on GIST1M) and the benchmark that measured it.
