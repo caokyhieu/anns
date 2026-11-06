@@ -1,0 +1,764 @@
+diff --git a/rust/lance-core/src/utils/cpu.rs b/rust/lance-core/src/utils/cpu.rs
+index 4881212..ef29a6c 100644
+--- a/rust/lance-core/src/utils/cpu.rs
++++ b/rust/lance-core/src/utils/cpu.rs
+@@ -62,6 +62,8 @@ impl CpuFeatures {
+     pub const AVX512VPOPCNTDQ: Self = Self(1 << 23);
+     pub const AVX512VBMI: Self = Self(1 << 24);
+     pub const AVX512BF16: Self = Self(1 << 25);
++    pub const SVE: Self = Self(1 << 26);
++    pub const SVE2: Self = Self(1 << 27);
+ 
+     /// The set with no features, which every host supports.
+     pub const fn empty() -> Self {
+@@ -237,6 +239,8 @@ const FEATURE_TABLE: &[FeatureInfo] = {
+         x86(F::AVX512BF16, "avx512bf16", F::AVX512BW),
+         other(F::NEON, "neon", F::empty()),
+         other(F::FP16, "fp16", F::NEON),
++        other(F::SVE, "sve", F::NEON.union(F::FP16)),
++        other(F::SVE2, "sve2", F::SVE),
+         other(F::LSX, "lsx", F::empty()),
+         other(F::LASX, "lasx", F::LSX),
+     ]
+@@ -287,6 +291,8 @@ const BASELINE: CpuFeatures = {
+         (cfg!(target_feature = "avx512bf16"), CpuFeatures::AVX512BF16),
+         (cfg!(target_feature = "neon"), CpuFeatures::NEON),
+         (cfg!(target_feature = "fp16"), CpuFeatures::FP16),
++        (cfg!(target_feature = "sve"), CpuFeatures::SVE),
++        (cfg!(target_feature = "sve2"), CpuFeatures::SVE2),
+         (cfg!(target_feature = "lsx"), CpuFeatures::LSX),
+         (cfg!(target_feature = "lasx"), CpuFeatures::LASX),
+     ];
+@@ -366,11 +372,17 @@ fn detect_host_features() -> CpuFeatures {
+     #[cfg(not(any(target_os = "ios", target_os = "tvos")))]
+     let has_fp16 = aarch64::has_neon_f16_support();
+ 
++    let mut features = CpuFeatures::NEON;
+     if has_fp16 {
+-        CpuFeatures::NEON.union(CpuFeatures::FP16)
+-    } else {
+-        CpuFeatures::NEON
++        features = features.union(CpuFeatures::FP16);
+     }
++    if std::arch::is_aarch64_feature_detected!("sve") {
++        features = features.union(CpuFeatures::SVE);
++    }
++    if std::arch::is_aarch64_feature_detected!("sve2") {
++        features = features.union(CpuFeatures::SVE2);
++    }
++    features
+ }
+ 
+ #[cfg(target_arch = "loongarch64")]
+@@ -637,6 +649,8 @@ mod tests {
+     #[case::avx512vbmi("avx512vbmi", CpuFeatures::AVX512BW.union(CpuFeatures::AVX2))]
+     #[case::avx512bf16("avx512bf16", CpuFeatures::AVX512BW.union(CpuFeatures::FMA))]
+     #[case::fp16("fp16", CpuFeatures::NEON)]
++    #[case::sve("sve", CpuFeatures::NEON.union(CpuFeatures::FP16))]
++    #[case::sve2("sve2", CpuFeatures::SVE.union(CpuFeatures::NEON).union(CpuFeatures::FP16))]
+     #[case::lasx("lasx", CpuFeatures::LSX)]
+     fn target_feature_mask_includes_implied_features(
+         #[case] name: &str,
+diff --git a/rust/lance-linalg/Cargo.toml b/rust/lance-linalg/Cargo.toml
+index 016030d..3e9f030 100644
+--- a/rust/lance-linalg/Cargo.toml
++++ b/rust/lance-linalg/Cargo.toml
+@@ -65,5 +65,9 @@ harness = false
+ name = "batch_distance"
+ harness = false
+ 
++[[bench]]
++name = "arm_kernels"
++harness = false
++
+ [lints]
+ workspace = true
+diff --git a/rust/lance-linalg/benches/arm_kernels.rs b/rust/lance-linalg/benches/arm_kernels.rs
+new file mode 100644
+index 0000000..de3b98a
+--- /dev/null
++++ b/rust/lance-linalg/benches/arm_kernels.rs
+@@ -0,0 +1,88 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright The Lance Authors
++
++//! Run the same benchmark with and without LANCE_DISABLE_SVE_BUILD. This
++//! isolates kernel selection while retaining algorithms, inputs and profiles.
++
++use std::hint::black_box;
++
++use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
++use lance_linalg::distance::{Dot, L2, dot::dot_f32, dot_u8::dot_u8, l2::l2_f32, l2_u8::l2_u8};
++use lance_linalg::simd::dist_table::{sum_4bit_dist_table_f32_rows, sum_4bit_hacc_dist_table};
++
++fn distances(c: &mut Criterion) {
++    let mut group = c.benchmark_group("arm_distances");
++    for dim in [8, 16, 32, 128, 768, 960, 1536, 4097] {
++        let x: Vec<f32> = (0..dim).map(|i| (i % 101) as f32 / 101.0).collect();
++        let y: Vec<f32> = (0..dim).map(|i| (i % 79) as f32 / 79.0).collect();
++        let a: Vec<u8> = (0..dim).map(|i| (i * 17 % 256) as u8).collect();
++        let b: Vec<u8> = (0..dim).map(|i| (i * 31 % 256) as u8).collect();
++        group.throughput(Throughput::Elements(dim as u64));
++        group.bench_function(BenchmarkId::new("dot_f32", dim), |b| {
++            b.iter(|| black_box(dot_f32(black_box(&x), black_box(&y))))
++        });
++        group.bench_function(BenchmarkId::new("l2_f32", dim), |b| {
++            b.iter(|| black_box(l2_f32(black_box(&x), black_box(&y))))
++        });
++        group.bench_function(BenchmarkId::new("dot_u8", dim), |bencher| {
++            bencher.iter(|| black_box(dot_u8(black_box(&a), black_box(&b))))
++        });
++        group.bench_function(BenchmarkId::new("l2_u8", dim), |bencher| {
++            bencher.iter(|| black_box(l2_u8(black_box(&a), black_box(&b))))
++        });
++        let batch = y.repeat(64);
++        let mut out = vec![0.0; 64];
++        group.throughput(Throughput::Elements((64 * dim) as u64));
++        group.bench_function(BenchmarkId::new("dot_f32_batch", dim), |b| {
++            b.iter(|| {
++                f32::dot_batch_into(black_box(&x), black_box(&batch), dim, &mut out);
++                black_box(&out);
++            })
++        });
++        group.bench_function(BenchmarkId::new("l2_f32_batch", dim), |b| {
++            b.iter(|| {
++                f32::l2_batch_into(black_box(&x), black_box(&batch), dim, &mut out);
++                black_box(&out);
++            })
++        });
++    }
++    group.finish();
++}
++
++fn lookup(c: &mut Criterion) {
++    let mut group = c.benchmark_group("arm_lookup");
++    for (n, cols, selected) in [(32, 16, 7), (1024, 96, 129), (16384, 192, 1024)] {
++        let codes: Vec<u8> = (0..n * cols).map(|i| (i * 73 % 256) as u8).collect();
++        let tables: Vec<f32> = (0..32 * cols).map(|i| (i % 251) as f32 / 251.0).collect();
++        let hacc: Vec<u8> = (0..64 * cols).map(|i| (i * 41 % 256) as u8).collect();
++        let rows: Vec<u32> = (0..selected).map(|i| ((i * 257) % n) as u32).collect();
++        let mut out = vec![0.0; selected];
++        let mut hout = vec![0; n];
++        let label = format!("n{n}_cols{cols}_selected{selected}");
++        group.throughput(Throughput::Elements(selected as u64));
++        group.bench_function(BenchmarkId::new("f32_rows", &label), |b| {
++            b.iter(|| {
++                sum_4bit_dist_table_f32_rows(
++                    n,
++                    cols,
++                    black_box(&codes),
++                    black_box(&tables),
++                    &rows,
++                    &mut out,
++                );
++                black_box(&out);
++            })
++        });
++        group.throughput(Throughput::Elements(n as u64));
++        group.bench_function(BenchmarkId::new("hacc", &label), |b| {
++            b.iter(|| {
++                sum_4bit_hacc_dist_table(n, cols, black_box(&codes), black_box(&hacc), &mut hout);
++                black_box(&hout);
++            })
++        });
++    }
++    group.finish();
++}
++
++criterion_group!(benches, distances, lookup);
++criterion_main!(benches);
+diff --git a/rust/lance-linalg/build.rs b/rust/lance-linalg/build.rs
+index ce1eda7..1b7bf73 100644
+--- a/rust/lance-linalg/build.rs
++++ b/rust/lance-linalg/build.rs
+@@ -20,6 +20,10 @@ fn main() -> Result<(), String> {
+         "cargo::rustc-check-cfg=cfg(kernel_support, values(\"avx512_f16\", \"avx512_bf16\", \"avx512_dist_table\", \"amx_fp16\"))"
+     );
+     println!("cargo::rustc-check-cfg=cfg(simd_fallback)");
++    println!("cargo::rustc-check-cfg=cfg(kernel_support, values(\"sve\", \"sve2\"))");
++    println!("cargo:rerun-if-env-changed=LANCE_DISABLE_SVE_BUILD");
++    println!("cargo:rerun-if-changed=src/simd/sve.c");
++    println!("cargo:rerun-if-changed=src/simd/sve2.c");
+ 
+     println!("cargo:rerun-if-changed=src/simd/f16.c");
+     println!("cargo:rerun-if-changed=src/simd/bf16.c");
+@@ -33,6 +37,29 @@ fn main() -> Result<(), String> {
+     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+ 
++    // Optional objects keep the baseline portable, including on older toolchains.
++    // The Rust candidates independently check the OS-visible CPU capabilities.
++    if target_arch == "aarch64"
++        && target_os == "linux"
++        && env::var_os("LANCE_DISABLE_SVE_BUILD").is_none()
++    {
++        for isa in ["sve", "sve2"] {
++            let result = cc::Build::new()
++                .std("c11")
++                .file(format!("src/simd/{isa}.c"))
++                .flag(format!("-march=armv8-a+{isa}"))
++                .flag("-msve-vector-bits=scalable")
++                .flag("-fno-fast-math")
++                .flag("-ffp-contract=off")
++                .opt_level(3)
++                .try_compile(&format!("lance_{isa}"));
++            match result {
++                Ok(()) => println!("cargo:rustc-cfg=kernel_support=\"{isa}\""),
++                Err(err) => println!("cargo:warning=Skipping {isa} kernels: {err}"),
++            }
++        }
++    }
++
+     // Architectures without SIMD kernels back the vector types with plain arrays.
+     if !matches!(target_arch.as_str(), "x86_64" | "aarch64" | "loongarch64") {
+         println!("cargo:rustc-cfg=simd_fallback");
+diff --git a/rust/lance-linalg/src/distance/dot.rs b/rust/lance-linalg/src/distance/dot.rs
+index 90cd533..11ea368 100644
+--- a/rust/lance-linalg/src/distance/dot.rs
++++ b/rust/lance-linalg/src/distance/dot.rs
+@@ -364,7 +364,11 @@ lance_core::dispatch! {
+                 DOT_F32_SCALAR,
+             ]
+         }
+-        #[cfg(not(target_arch = "x86_64"))]
++        #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++        {
++            &[DOT_F32_SVE, DOT_F32_SCALAR]
++        }
++        #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", kernel_support = "sve"))))]
+         {
+             &[DOT_F32_SCALAR]
+         }
+@@ -382,13 +386,40 @@ lance_core::dispatch! {
+                 DOT_F32_BATCH_SCALAR,
+             ]
+         }
+-        #[cfg(not(target_arch = "x86_64"))]
++        #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++        {
++            &[DOT_F32_BATCH_SVE, DOT_F32_BATCH_SCALAR]
++        }
++        #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", kernel_support = "sve"))))]
+         {
+             &[DOT_F32_BATCH_SCALAR]
+         }
+     };
+ }
+ 
++#[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++lance_core::target_kernel! {
++    #[target_features("sve")]
++    #[candidate(DOT_F32_SVE: PairKernel)]
++    fn dot_f32_sve(x: &[f32], y: &[f32]) -> f32 {
++        // SAFETY: the candidate checks SVE; the common prefix bounds both loads.
++        unsafe { crate::simd::arm::lance_dot_f32_sve(x.as_ptr(), y.as_ptr(), x.len().min(y.len())) }
++    }
++}
++
++#[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++lance_core::target_kernel! {
++    #[target_features("sve")]
++    #[candidate(DOT_F32_BATCH_SVE: BatchKernel)]
++    fn dot_batch_f32_sve(x: &[f32], batch: &[f32], dimension: usize, output: &mut [f32]) {
++        assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
++        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
++            // SAFETY: validated slices have dimension elements; dispatch checks SVE.
++            *distance = unsafe { crate::simd::arm::lance_dot_f32_sve(x.as_ptr(), y.as_ptr(), dimension) };
++        }
++    }
++}
++
+ lance_core::target_kernel! {
+     #[target_features()]
+     #[candidate(DOT_F32_SCALAR: PairKernel)]
+@@ -811,6 +842,17 @@ pub fn dot_distance_arrow_batch(
+ 
+ #[cfg(test)]
+ mod tests {
++    #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++    #[test]
++    fn sve_candidate_is_selected_when_supported() {
++        if lance_core::utils::cpu::CpuFeatures::host().contains(
++            lance_core::utils::cpu::CpuFeatures::from_target_features(&["sve"]),
++        ) {
++            assert_eq!(DOT_F32.selected().name(), DOT_F32_SVE.name());
++            assert_eq!(DOT_F32_BATCH.selected().name(), DOT_F32_BATCH_SVE.name());
++        }
++    }
++
+     use super::*;
+     use crate::test_utils::{
+         arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
+diff --git a/rust/lance-linalg/src/distance/dot_u8.rs b/rust/lance-linalg/src/distance/dot_u8.rs
+index 8a57b48..071d8f9 100644
+--- a/rust/lance-linalg/src/distance/dot_u8.rs
++++ b/rust/lance-linalg/src/distance/dot_u8.rs
+@@ -40,13 +40,27 @@ lance_core::dispatch! {
+         {
+             &[x86::DOT_U8_AVX512_VNNI, x86::DOT_U8_AVX2, DOT_U8_SCALAR]
+         }
+-        #[cfg(not(target_arch = "x86_64"))]
++        #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++        {
++            &[DOT_U8_SVE, DOT_U8_SCALAR]
++        }
++        #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", kernel_support = "sve"))))]
+         {
+             &[DOT_U8_SCALAR]
+         }
+     };
+ }
+ 
++#[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++lance_core::target_kernel! {
++    #[target_features("sve")]
++    #[candidate(DOT_U8_SVE: DotU8Kernel)]
++    fn dot_u8_sve(x: &[u8], y: &[u8]) -> u32 {
++        // SAFETY: the candidate checks SVE; the common prefix bounds both loads.
++        unsafe { crate::simd::arm::lance_dot_u8_sve(x.as_ptr(), y.as_ptr(), x.len().min(y.len())) }
++    }
++}
++
+ lance_core::target_kernel! {
+     #[target_features()]
+     #[candidate(DOT_U8_SCALAR: DotU8Kernel)]
+@@ -209,6 +223,16 @@ pub fn dot_u8_u64(a: &[u8], b: &[u8]) -> u64 {
+ 
+ #[cfg(test)]
+ mod tests {
++    #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++    #[test]
++    fn sve_candidate_is_selected_when_supported() {
++        if lance_core::utils::cpu::CpuFeatures::host().contains(
++            lance_core::utils::cpu::CpuFeatures::from_target_features(&["sve"]),
++        ) {
++            assert_eq!(DOT_U8.selected().name(), DOT_U8_SVE.name());
++        }
++    }
++
+     use super::*;
+     use crate::test_utils::u8_inputs::{LENGTHS, Pattern, random};
+ 
+diff --git a/rust/lance-linalg/src/distance/l2.rs b/rust/lance-linalg/src/distance/l2.rs
+index 750524e..5f4d460 100644
+--- a/rust/lance-linalg/src/distance/l2.rs
++++ b/rust/lance-linalg/src/distance/l2.rs
+@@ -373,7 +373,11 @@ lance_core::dispatch! {
+                 L2_F32_SCALAR,
+             ]
+         }
+-        #[cfg(not(target_arch = "x86_64"))]
++        #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++        {
++            &[L2_F32_SVE, L2_F32_SCALAR]
++        }
++        #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", kernel_support = "sve"))))]
+         {
+             &[L2_F32_SCALAR]
+         }
+@@ -394,13 +398,40 @@ lance_core::dispatch! {
+                 L2_F32_BATCH_SCALAR,
+             ]
+         }
+-        #[cfg(not(target_arch = "x86_64"))]
++        #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++        {
++            &[L2_F32_BATCH_SVE, L2_F32_BATCH_SCALAR]
++        }
++        #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", kernel_support = "sve"))))]
+         {
+             &[L2_F32_BATCH_SCALAR]
+         }
+     };
+ }
+ 
++#[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++lance_core::target_kernel! {
++    #[target_features("sve")]
++    #[candidate(L2_F32_SVE: PairKernel)]
++    fn l2_f32_sve(x: &[f32], y: &[f32]) -> f32 {
++        // SAFETY: the candidate checks SVE; the common prefix bounds both loads.
++        unsafe { crate::simd::arm::lance_l2_f32_sve(x.as_ptr(), y.as_ptr(), x.len().min(y.len())) }
++    }
++}
++
++#[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++lance_core::target_kernel! {
++    #[target_features("sve")]
++    #[candidate(L2_F32_BATCH_SVE: BatchKernel)]
++    fn l2_batch_f32_sve(x: &[f32], batch: &[f32], dimension: usize, output: &mut [f32]) {
++        assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
++        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
++            // SAFETY: validated slices have dimension elements; dispatch checks SVE.
++            *distance = unsafe { crate::simd::arm::lance_l2_f32_sve(x.as_ptr(), y.as_ptr(), dimension) };
++        }
++    }
++}
++
+ lance_core::target_kernel! {
+     #[target_features()]
+     #[candidate(L2_F32_SCALAR: PairKernel)]
+@@ -1091,6 +1122,17 @@ pub fn l2_distance_arrow_batch(
+ 
+ #[cfg(test)]
+ mod tests {
++    #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++    #[test]
++    fn sve_candidate_is_selected_when_supported() {
++        if lance_core::utils::cpu::CpuFeatures::host().contains(
++            lance_core::utils::cpu::CpuFeatures::from_target_features(&["sve"]),
++        ) {
++            assert_eq!(L2_F32.selected().name(), L2_F32_SVE.name());
++            assert_eq!(L2_F32_BATCH.selected().name(), L2_F32_BATCH_SVE.name());
++        }
++    }
++
+     use super::*;
+     use arrow_array::{cast::AsArray, types::Float32Type};
+ 
+diff --git a/rust/lance-linalg/src/distance/l2_u8.rs b/rust/lance-linalg/src/distance/l2_u8.rs
+index 46f1a50..b50b713 100644
+--- a/rust/lance-linalg/src/distance/l2_u8.rs
++++ b/rust/lance-linalg/src/distance/l2_u8.rs
+@@ -33,13 +33,27 @@ lance_core::dispatch! {
+         {
+             &[x86::L2_U8_AVX512_VNNI, x86::L2_U8_AVX2, L2_U8_SCALAR]
+         }
+-        #[cfg(not(target_arch = "x86_64"))]
++        #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++        {
++            &[L2_U8_SVE, L2_U8_SCALAR]
++        }
++        #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", kernel_support = "sve"))))]
+         {
+             &[L2_U8_SCALAR]
+         }
+     };
+ }
+ 
++#[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++lance_core::target_kernel! {
++    #[target_features("sve")]
++    #[candidate(L2_U8_SVE: L2U8Kernel)]
++    fn l2_u8_sve(x: &[u8], y: &[u8]) -> u32 {
++        // SAFETY: the candidate checks SVE; the common prefix bounds both loads.
++        unsafe { crate::simd::arm::lance_l2_u8_sve(x.as_ptr(), y.as_ptr(), x.len().min(y.len())) }
++    }
++}
++
+ lance_core::target_kernel! {
+     #[target_features()]
+     #[candidate(L2_U8_SCALAR: L2U8Kernel)]
+@@ -216,6 +230,16 @@ pub fn l2_u8_u64(a: &[u8], b: &[u8]) -> u64 {
+ 
+ #[cfg(test)]
+ mod tests {
++    #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++    #[test]
++    fn sve_candidate_is_selected_when_supported() {
++        if lance_core::utils::cpu::CpuFeatures::host().contains(
++            lance_core::utils::cpu::CpuFeatures::from_target_features(&["sve"]),
++        ) {
++            assert_eq!(L2_U8.selected().name(), L2_U8_SVE.name());
++        }
++    }
++
+     use super::*;
+     use crate::test_utils::u8_inputs::{LENGTHS, Pattern, random};
+ 
+diff --git a/rust/lance-linalg/src/simd.rs b/rust/lance-linalg/src/simd.rs
+index cc3418c..15963e4 100644
+--- a/rust/lance-linalg/src/simd.rs
++++ b/rust/lance-linalg/src/simd.rs
+@@ -15,6 +15,11 @@
+ use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
+ 
+ pub mod amx_fp16;
++#[cfg(all(
++    target_arch = "aarch64",
++    any(kernel_support = "sve", kernel_support = "sve2")
++))]
++pub(crate) mod arm;
+ pub mod dist_table;
+ pub mod f32;
+ pub mod f64;
+diff --git a/rust/lance-linalg/src/simd/arm.rs b/rust/lance-linalg/src/simd/arm.rs
+new file mode 100644
+index 0000000..b5bac41
+--- /dev/null
++++ b/rust/lance-linalg/src/simd/arm.rs
+@@ -0,0 +1,33 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright The Lance Authors
++
++//! Internal C ABI. Call only through feature-checked candidates with validated
++//! buffers; the C objects use the calling thread's current SVE vector length.
++
++#[cfg(kernel_support = "sve")]
++unsafe extern "C" {
++    pub(crate) fn lance_dot_f32_sve(x: *const f32, y: *const f32, n: usize) -> f32;
++    pub(crate) fn lance_l2_f32_sve(x: *const f32, y: *const f32, n: usize) -> f32;
++    pub(crate) fn lance_dot_u8_sve(x: *const u8, y: *const u8, n: usize) -> u32;
++    pub(crate) fn lance_l2_u8_sve(x: *const u8, y: *const u8, n: usize) -> u32;
++    pub(crate) fn lance_sum_f32_rows_sve(
++        codes: *const u8,
++        tables: *const f32,
++        n: usize,
++        code_len: usize,
++        rows: *const u32,
++        count: usize,
++        out: *mut f32,
++    );
++}
++
++#[cfg(kernel_support = "sve2")]
++unsafe extern "C" {
++    pub(crate) fn lance_sum_hacc_sve2(
++        codes: *const u8,
++        tables: *const u8,
++        code_len: usize,
++        n: usize,
++        out: *mut u32,
++    );
++}
+diff --git a/rust/lance-linalg/src/simd/dist_table.rs b/rust/lance-linalg/src/simd/dist_table.rs
+index fe52ff0..e8d4d35 100644
+--- a/rust/lance-linalg/src/simd/dist_table.rs
++++ b/rust/lance-linalg/src/simd/dist_table.rs
+@@ -51,7 +51,11 @@ lance_core::dispatch! {
+         {
+             &[SUM_HACC_AVX2, SUM_HACC_SCALAR]
+         }
+-        #[cfg(not(target_arch = "x86_64"))]
++        #[cfg(all(target_arch = "aarch64", kernel_support = "sve2"))]
++        {
++            &[SUM_HACC_SVE2, SUM_HACC_SCALAR]
++        }
++        #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", kernel_support = "sve2"))))]
+         {
+             &[SUM_HACC_SCALAR]
+         }
+@@ -1855,7 +1859,11 @@ lance_core::dispatch! {
+         {
+             &[SUM_F32_ROWS_AVX512, SUM_F32_ROWS_AVX2, SUM_F32_ROWS_SCALAR]
+         }
+-        #[cfg(not(target_arch = "x86_64"))]
++        #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++        {
++            &[SUM_F32_ROWS_SVE, SUM_F32_ROWS_SCALAR]
++        }
++        #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", kernel_support = "sve"))))]
+         {
+             &[SUM_F32_ROWS_SCALAR]
+         }
+@@ -2535,8 +2543,56 @@ unsafe extern "C" {
+     );
+ }
+ 
++#[cfg(all(target_arch = "aarch64", kernel_support = "sve2"))]
++lance_core::target_kernel! {
++    #[target_features("sve2")]
++    #[candidate(SUM_HACC_SVE2: SumHaccFn)]
++    fn sum_hacc_sve2(codes: &[u8], tables: &[u8], code_len: usize, dists: &mut [MaybeUninit<u32>]) {
++        assert_row_major_bounds(dists.len(), code_len, codes, tables, 64);
++        // SAFETY: validated packed batches and tables; writes all output slots.
++        // The candidate requires SVE2, independently of whether this object built.
++        unsafe { crate::simd::arm::lance_sum_hacc_sve2(
++            codes.as_ptr(), tables.as_ptr(), code_len, dists.len(), dists.as_mut_ptr().cast(),
++        ) };
++    }
++}
++
++#[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++lance_core::target_kernel! {
++    #[target_features("sve")]
++    #[candidate(SUM_F32_ROWS_SVE: SumF32RowsFn)]
++    fn sum_f32_rows_sve(codes: &[u8], tables: &[f32], n: usize, rows: &[u32], dists: &mut [f32]) {
++        let (code_len, dists) = f32_rows_bounds(codes, tables, n, rows, dists);
++        // SAFETY: bounds cover every gathered row/table entry and output store.
++        // Addition order is identical to the portable kernel (no fast-math).
++        unsafe { crate::simd::arm::lance_sum_f32_rows_sve(
++            codes.as_ptr(), tables.as_ptr(), n, code_len, rows.as_ptr(), rows.len(), dists.as_mut_ptr(),
++        ) };
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
++    #[cfg(all(target_arch = "aarch64", kernel_support = "sve2"))]
++    #[test]
++    fn sve2_candidate_is_selected_when_supported() {
++        if lance_core::utils::cpu::CpuFeatures::host().contains(
++            lance_core::utils::cpu::CpuFeatures::from_target_features(&["sve2"]),
++        ) {
++            assert_eq!(SUM_HACC.selected().name(), SUM_HACC_SVE2.name());
++        }
++    }
++
++    #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++    #[test]
++    fn sve_candidate_is_selected_when_supported() {
++        if lance_core::utils::cpu::CpuFeatures::host().contains(
++            lance_core::utils::cpu::CpuFeatures::from_target_features(&["sve"]),
++        ) {
++            assert_eq!(SUM_F32_ROWS.selected().name(), SUM_F32_ROWS_SVE.name());
++        }
++    }
++
+     use super::*;
+ 
+     #[test]
+diff --git a/rust/lance-linalg/src/simd/sve.c b/rust/lance-linalg/src/simd/sve.c
+new file mode 100644
+index 0000000..eb3319d
+--- /dev/null
++++ b/rust/lance-linalg/src/simd/sve.c
+@@ -0,0 +1,87 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright The Lance Authors
++
++#include <arm_sve.h>
++#include <stddef.h>
++#include <stdint.h>
++
++// No fixed vector length: Linux can use a different VL on each calling thread.
++// Do not compile with fast-math: PQ sums must retain their addition order.
++float lance_dot_f32_sve(const float *x, const float *y, size_t n) {
++  svfloat32_t a = svdup_f32(0), b = svdup_f32(0);
++  size_t i = 0, lanes = svcntw();
++  for (; n - i >= 2 * lanes; i += 2 * lanes) {
++    a = svmla_f32_m(svptrue_b32(), a, svld1_f32(svptrue_b32(), x + i),
++                    svld1_f32(svptrue_b32(), y + i));
++    b = svmla_f32_m(svptrue_b32(), b, svld1_f32(svptrue_b32(), x + i + lanes),
++                    svld1_f32(svptrue_b32(), y + i + lanes));
++  }
++  for (; i < n; i += lanes) {
++    svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)n);
++    a = svmla_f32_m(pg, a, svld1_f32(pg, x + i), svld1_f32(pg, y + i));
++  }
++  return svaddv_f32(svptrue_b32(), svadd_f32_x(svptrue_b32(), a, b));
++}
++
++float lance_l2_f32_sve(const float *x, const float *y, size_t n) {
++  svfloat32_t a = svdup_f32(0), b = svdup_f32(0);
++  size_t i = 0, lanes = svcntw();
++  for (; n - i >= 2 * lanes; i += 2 * lanes) {
++    svfloat32_t d0 = svsub_f32_x(svptrue_b32(), svld1_f32(svptrue_b32(), x + i),
++                                svld1_f32(svptrue_b32(), y + i));
++    svfloat32_t d1 = svsub_f32_x(svptrue_b32(), svld1_f32(svptrue_b32(), x + i + lanes),
++                                svld1_f32(svptrue_b32(), y + i + lanes));
++    a = svmla_f32_m(svptrue_b32(), a, d0, d0);
++    b = svmla_f32_m(svptrue_b32(), b, d1, d1);
++  }
++  for (; i < n; i += lanes) {
++    svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)n);
++    svfloat32_t d = svsub_f32_x(pg, svld1_f32(pg, x + i), svld1_f32(pg, y + i));
++    a = svmla_f32_m(pg, a, d, d);
++  }
++  return svaddv_f32(svptrue_b32(), svadd_f32_x(svptrue_b32(), a, b));
++}
++
++// The ABI receives validated, column-major packed codes. Each byte holds
++// low/high nibble indices into two consecutive 16-entry tables.
++void lance_sum_f32_rows_sve(const uint8_t *codes, const float *tables,
++                          size_t n, size_t code_len, const uint32_t *rows,
++                          size_t count, float *out) {
++  for (size_t i = 0; i < count; i += svcntw()) {
++    svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)count);
++    svuint32_t ids = svld1_u32(pg, rows + i);
++    svfloat32_t sum = svdup_f32(-0.0f);
++    for (size_t col = 0; col < code_len; ++col) {
++      svuint32_t code = svld1ub_gather_u32offset_u32(pg, codes + col * n, ids);
++      svuint32_t low = svand_n_u32_x(pg, code, 15);
++      svuint32_t high = svlsr_n_u32_x(pg, code, 4);
++      svfloat32_t l = svld1_gather_u32index_f32(pg, tables + 32 * col, low);
++      svfloat32_t h = svld1_gather_u32index_f32(pg, tables + 32 * col + 16, high);
++      // Match the reference's sum += (low + high), including signed zero.
++      sum = svadd_f32_m(pg, sum, svadd_f32_x(pg, l, h));
++    }
++    svst1_f32(pg, out + i, sum);
++  }
++}
++
++// The public u32 kernels return the low 32 bits. The existing Rust u64
++// wrappers chunk inputs to obtain an exact wide result, including overflow.
++uint32_t lance_dot_u8_sve(const uint8_t *x, const uint8_t *y, size_t n) {
++  svuint32_t sum = svdup_u32(0);
++  for (size_t i = 0; i < n; i += svcntb()) {
++    svbool_t pg = svwhilelt_b8((uint64_t)i, (uint64_t)n);
++    // Predicated loads zero inactive bytes, so the unpredicated dot is safe.
++    sum = svdot_u32(sum, svld1_u8(pg, x + i), svld1_u8(pg, y + i));
++  }
++  return svaddv_u32(svptrue_b32(), sum);
++}
++
++uint32_t lance_l2_u8_sve(const uint8_t *x, const uint8_t *y, size_t n) {
++  svuint32_t sum = svdup_u32(0);
++  for (size_t i = 0; i < n; i += svcntb()) {
++    svbool_t pg = svwhilelt_b8((uint64_t)i, (uint64_t)n);
++    svuint8_t d = svabd_u8_z(pg, svld1_u8(pg, x + i), svld1_u8(pg, y + i));
++    sum = svdot_u32(sum, d, d);
++  }
++  return svaddv_u32(svptrue_b32(), sum);
++}
+diff --git a/rust/lance-linalg/src/simd/sve2.c b/rust/lance-linalg/src/simd/sve2.c
+new file mode 100644
+index 0000000..f6e47dc
+--- /dev/null
++++ b/rust/lance-linalg/src/simd/sve2.c
+@@ -0,0 +1,55 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright The Lance Authors
++
++#include <arm_sve.h>
++#include <stddef.h>
++#include <stdint.h>
++
++// Byte table lookups operate on the low byte of each u16 index. Mask off
++// the irrelevant high byte before reconstructing a full u16 table entry.
++static inline svuint16_t lookup16(svuint8_t low, svuint8_t high,
++                                 svuint16_t index) {
++  svuint8_t bytes = svreinterpret_u8_u16(index);
++  svuint16_t l = svand_n_u16_x(svptrue_b16(),
++      svreinterpret_u16_u8(svtbl_u8(low, bytes)), 255);
++  svuint16_t h = svlsl_n_u16_x(svptrue_b16(),
++      svreinterpret_u16_u8(svtbl_u8(high, bytes)), 8);
++  return svorr_u16_x(svptrue_b16(), l, h);
++}
++
++// SVE2 widening addition separates even/odd PERM0 lanes directly into
++// contiguous output rows. It also preserves carries between table bytes.
++void lance_sum_hacc_sve2(const uint8_t *codes, const uint8_t *tables,
++                       size_t code_len, size_t n, uint32_t *out) {
++  svbool_t table_pg = svwhilelt_b8((uint64_t)0, (uint64_t)16);
++  for (size_t batch = 0; batch < n; batch += 32) {
++    for (size_t j = 0; j < 16; j += svcnth()) {
++      svbool_t pg = svwhilelt_b16((uint64_t)j, (uint64_t)16);
++      svuint32_t le = svdup_u32(0), lo = svdup_u32(0);
++      svuint32_t he = svdup_u32(0), ho = svdup_u32(0);
++      for (size_t col = 0; col < code_len; ++col) {
++        const uint8_t *block = codes + batch * code_len + col * 32;
++        const uint8_t *table = tables + col * 64;
++        svuint16_t c0 = svld1ub_u16(pg, block + j);
++        svuint16_t c1 = svld1ub_u16(pg, block + 16 + j);
++        svuint8_t t0 = svld1_u8(table_pg, table);
++        svuint8_t t1 = svld1_u8(table_pg, table + 16);
++        svuint8_t t2 = svld1_u8(table_pg, table + 32);
++        svuint8_t t3 = svld1_u8(table_pg, table + 48);
++        svuint16_t l0 = lookup16(t0, t2, svand_n_u16_x(pg, c0, 15));
++        svuint16_t l1 = lookup16(t1, t3, svand_n_u16_x(pg, c1, 15));
++        svuint16_t h0 = lookup16(t0, t2, svlsr_n_u16_x(pg, c0, 4));
++        svuint16_t h1 = lookup16(t1, t3, svlsr_n_u16_x(pg, c1, 4));
++        le = svadd_u32_x(svptrue_b32(), le, svaddlb_u32(l0, l1));
++        lo = svadd_u32_x(svptrue_b32(), lo, svaddlt_u32(l0, l1));
++        he = svadd_u32_x(svptrue_b32(), he, svaddlb_u32(h0, h1));
++        ho = svadd_u32_x(svptrue_b32(), ho, svaddlt_u32(h0, h1));
++      }
++      svbool_t store_pg = svwhilelt_b32((uint64_t)(j / 2), (uint64_t)8);
++      svst1_u32(store_pg, out + batch + j / 2, le);
++      svst1_u32(store_pg, out + batch + 8 + j / 2, lo);
++      svst1_u32(store_pg, out + batch + 16 + j / 2, he);
++      svst1_u32(store_pg, out + batch + 24 + j / 2, ho);
++    }
++  }
++}
