@@ -142,3 +142,7 @@ Raw records: results.json and results-beam16.json. Timings are machine-specific 
 ## Lance IVF_RQ build optimizations
 
 See [`lance_ivf_rq/`](lance_ivf_rq/README.md) for a patch that speeds up Lance `IVF_RQ` index builds (up to 5.7x on GIST1M) and the benchmark that measured it.
+
+## Lance ARM kernels
+
+See [`lance_arm_sve/`](lance_arm_sve/README.md) for SVE/SVE2 implementations of existing Lance distance and lookup kernels, automatic runtime dispatch, correctness tests, and a native benchmark script. Kunpeng performance has not yet been measured.
