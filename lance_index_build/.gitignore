@@ -1,0 +1,4 @@
+# Local Lance worktree (tracked in its own repository), datasets and raw run outputs.
+worktrees/
+datasets/
+results/

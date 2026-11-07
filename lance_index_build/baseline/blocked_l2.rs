@@ -1,0 +1,379 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! Register- and cache-blocked exact nearest-centroid search for f32 L2.
+//!
+//! The per-vector path scores one vector against every centroid, so for a
+//! centroid table larger than L2 (1000 x 960 f32 is 3.8 MB) each vector
+//! re-streams the whole table from L3 or DRAM and the kernel is bandwidth
+//! bound. This path scores a block of rows against an L2-resident tile of
+//! centroids with a 4x4 register tile, so every loaded centroid lane feeds
+//! four FMAs and every loaded row lane feeds four.
+//!
+//! Distances use `|x|^2 + |c|^2 - 2 x.c` to pick the winner. The returned
+//! distance is then recomputed exactly against the winning centroid, because
+//! callers use it as `|x - c|^2` (RaBitQ's L2 add factor, cluster radius and
+//! loss), and the expansion loses precision when `|x|` is large relative to
+//! the residual.
+//!
+//! Selection matches `argmin_value_float_with_bias`: the first centroid with
+//! the strictly smallest `dist + bias` wins, and a row whose distances are all
+//! NaN gets `None`. Near-ties can resolve differently from the per-vector
+//! kernel because the dot products are summed in a different order.
+
+use std::sync::LazyLock;
+
+use lance_linalg::distance::L2;
+use rayon::prelude::*;
+
+const MR: usize = 4;
+const NR: usize = 4;
+const ROW_BLOCK: usize = 64;
+/// Target bytes for one centroid tile; sized to stay resident in L2 next to a
+/// row block of similar size.
+const TILE_BYTES: usize = 256 * 1024;
+/// Below these sizes the per-vector kernel is already cache resident.
+pub(crate) const MIN_DIMENSION: usize = 32;
+pub(crate) const MIN_CENTROIDS: usize = 8;
+
+#[derive(Clone, Copy)]
+enum Kernel {
+    #[cfg(target_arch = "x86_64")]
+    Avx512,
+    #[cfg(target_arch = "x86_64")]
+    Avx2,
+}
+
+static KERNEL: LazyLock<Option<Kernel>> = LazyLock::new(|| {
+    if std::env::var_os("LANCE_DISABLE_BLOCKED_L2").is_some() {
+        return None;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx512f") {
+            return Some(Kernel::Avx512);
+        }
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            return Some(Kernel::Avx2);
+        }
+    }
+    None
+});
+
+/// Whether the blocked path will be used for this shape.
+pub(crate) fn applies(num_centroids: usize, dimension: usize) -> bool {
+    KERNEL.is_some() && dimension >= MIN_DIMENSION && num_centroids >= MIN_CENTROIDS
+}
+
+/// Exact nearest centroid (with optional additive per-centroid bias) for each
+/// row of `data`. Returns `None` when no SIMD kernel is available.
+pub(crate) fn l2_argmin(
+    centroids: &[f32],
+    data: &[f32],
+    dimension: usize,
+    biases: Option<&[f32]>,
+) -> Option<Vec<Option<(u32, f32)>>> {
+    let kernel = (*KERNEL)?;
+    let k = centroids.len() / dimension;
+    debug_assert_eq!(centroids.len(), k * dimension);
+    debug_assert_eq!(data.len() % dimension, 0);
+
+    // Pad the centroid table to a multiple of NR; padding columns are never
+    // read back as candidates.
+    let k_pad = k.div_ceil(NR) * NR;
+    let mut padded = centroids.to_vec();
+    padded.resize(k_pad * dimension, 0.0);
+    let c_norms: Vec<f32> = centroids
+        .chunks_exact(dimension)
+        .map(|c| c.iter().map(|v| v * v).sum())
+        .collect();
+    let tile = ((TILE_BYTES / (dimension * 4)) / NR * NR).max(NR);
+
+    let results = data
+        .par_chunks(ROW_BLOCK * dimension)
+        .map_init(
+            || vec![0.0f32; ROW_BLOCK.div_ceil(MR) * MR * dimension],
+            |xbuf, rows| {
+                let n = rows.len() / dimension;
+                let n_pad = n.div_ceil(MR) * MR;
+                xbuf[..rows.len()].copy_from_slice(rows);
+                xbuf[rows.len()..n_pad * dimension].fill(0.0);
+                let x_norms: Vec<f32> = rows
+                    .chunks_exact(dimension)
+                    .map(|x| x.iter().map(|v| v * v).sum())
+                    .collect();
+                let mut best_score = vec![f32::INFINITY; n];
+                let mut best_idx: Vec<Option<u32>> = vec![None; n];
+                let mut out = [0.0f32; MR * NR];
+                for tile_start in (0..k_pad).step_by(tile) {
+                    let tile_end = (tile_start + tile).min(k_pad);
+                    for r in (0..n_pad).step_by(MR) {
+                        for j in (tile_start..tile_end).step_by(NR) {
+                            // SAFETY: rows r..r+MR and centroids j..j+NR are in
+                            // bounds of the padded buffers, and the kernel was
+                            // chosen by runtime feature detection.
+                            unsafe {
+                                let x = xbuf.as_ptr().add(r * dimension);
+                                let c = padded.as_ptr().add(j * dimension);
+                                match kernel {
+                                    #[cfg(target_arch = "x86_64")]
+                                    Kernel::Avx512 => x86::tile_avx512(x, c, dimension, &mut out),
+                                    #[cfg(target_arch = "x86_64")]
+                                    Kernel::Avx2 => x86::tile_avx2(x, c, dimension, &mut out),
+                                }
+                            }
+                            for a in 0..MR {
+                                let row = r + a;
+                                if row >= n {
+                                    break;
+                                }
+                                for b in 0..NR {
+                                    let cj = j + b;
+                                    if cj >= k {
+                                        break;
+                                    }
+                                    let mut dist = x_norms[row] + c_norms[cj] - 2.0 * out[a * NR + b];
+                                    // Keep NaN (f32::max would drop it).
+                                    if dist < 0.0 {
+                                        dist = 0.0;
+                                    }
+                                    let score = match biases {
+                                        Some(bias) => dist + bias[cj],
+                                        None => dist,
+                                    };
+                                    if score < best_score[row] {
+                                        best_score[row] = score;
+                                        best_idx[row] = Some(cj as u32);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                best_idx
+                    .into_iter()
+                    .zip(rows.chunks_exact(dimension))
+                    .map(|(idx, x)| {
+                        idx.map(|idx| {
+                            let c = &centroids[idx as usize * dimension..][..dimension];
+                            (idx, f32::l2(x, c))
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            },
+        )
+        .flatten_iter()
+        .collect();
+    Some(results)
+}
+
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use std::arch::x86_64::*;
+
+    use super::{MR, NR};
+
+    /// `out[a * NR + b] = dot(x[a], c[b])` for a 4x4 tile.
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn tile_avx512(
+        x: *const f32,
+        c: *const f32,
+        dim: usize,
+        out: &mut [f32; MR * NR],
+    ) {
+        unsafe {
+            let (x0, x1, x2, x3) = (x, x.add(dim), x.add(2 * dim), x.add(3 * dim));
+            let (c0, c1, c2, c3) = (c, c.add(dim), c.add(2 * dim), c.add(3 * dim));
+            let mut a00 = _mm512_setzero_ps();
+            let mut a01 = _mm512_setzero_ps();
+            let mut a02 = _mm512_setzero_ps();
+            let mut a03 = _mm512_setzero_ps();
+            let mut a10 = _mm512_setzero_ps();
+            let mut a11 = _mm512_setzero_ps();
+            let mut a12 = _mm512_setzero_ps();
+            let mut a13 = _mm512_setzero_ps();
+            let mut a20 = _mm512_setzero_ps();
+            let mut a21 = _mm512_setzero_ps();
+            let mut a22 = _mm512_setzero_ps();
+            let mut a23 = _mm512_setzero_ps();
+            let mut a30 = _mm512_setzero_ps();
+            let mut a31 = _mm512_setzero_ps();
+            let mut a32 = _mm512_setzero_ps();
+            let mut a33 = _mm512_setzero_ps();
+            let full = dim / 16 * 16;
+            let mut d = 0;
+            while d < full {
+                let v0 = _mm512_loadu_ps(x0.add(d));
+                let v1 = _mm512_loadu_ps(x1.add(d));
+                let v2 = _mm512_loadu_ps(x2.add(d));
+                let v3 = _mm512_loadu_ps(x3.add(d));
+                let w = _mm512_loadu_ps(c0.add(d));
+                a00 = _mm512_fmadd_ps(v0, w, a00);
+                a10 = _mm512_fmadd_ps(v1, w, a10);
+                a20 = _mm512_fmadd_ps(v2, w, a20);
+                a30 = _mm512_fmadd_ps(v3, w, a30);
+                let w = _mm512_loadu_ps(c1.add(d));
+                a01 = _mm512_fmadd_ps(v0, w, a01);
+                a11 = _mm512_fmadd_ps(v1, w, a11);
+                a21 = _mm512_fmadd_ps(v2, w, a21);
+                a31 = _mm512_fmadd_ps(v3, w, a31);
+                let w = _mm512_loadu_ps(c2.add(d));
+                a02 = _mm512_fmadd_ps(v0, w, a02);
+                a12 = _mm512_fmadd_ps(v1, w, a12);
+                a22 = _mm512_fmadd_ps(v2, w, a22);
+                a32 = _mm512_fmadd_ps(v3, w, a32);
+                let w = _mm512_loadu_ps(c3.add(d));
+                a03 = _mm512_fmadd_ps(v0, w, a03);
+                a13 = _mm512_fmadd_ps(v1, w, a13);
+                a23 = _mm512_fmadd_ps(v2, w, a23);
+                a33 = _mm512_fmadd_ps(v3, w, a33);
+                d += 16;
+            }
+            let acc = [
+                a00, a01, a02, a03, a10, a11, a12, a13, a20, a21, a22, a23, a30, a31, a32, a33,
+            ];
+            for (o, a) in out.iter_mut().zip(acc) {
+                *o = _mm512_reduce_add_ps(a);
+            }
+            tail(x, c, dim, full, out);
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn hsum256(v: __m256) -> f32 {
+        let lo = _mm256_castps256_ps128(v);
+        let hi = _mm256_extractf128_ps(v, 1);
+        let s = _mm_add_ps(lo, hi);
+        let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+        let s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 0x55));
+        _mm_cvtss_f32(s)
+    }
+
+    /// Same contract as [`tile_avx512`]; computed as two 2x4 halves so the
+    /// accumulators fit in the 16 ymm registers.
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn tile_avx2(
+        x: *const f32,
+        c: *const f32,
+        dim: usize,
+        out: &mut [f32; MR * NR],
+    ) {
+        unsafe {
+            let (c0, c1, c2, c3) = (c, c.add(dim), c.add(2 * dim), c.add(3 * dim));
+            let full = dim / 8 * 8;
+            for half in 0..2 {
+                let x0 = x.add(2 * half * dim);
+                let x1 = x0.add(dim);
+                let mut a00 = _mm256_setzero_ps();
+                let mut a01 = _mm256_setzero_ps();
+                let mut a02 = _mm256_setzero_ps();
+                let mut a03 = _mm256_setzero_ps();
+                let mut a10 = _mm256_setzero_ps();
+                let mut a11 = _mm256_setzero_ps();
+                let mut a12 = _mm256_setzero_ps();
+                let mut a13 = _mm256_setzero_ps();
+                let mut d = 0;
+                while d < full {
+                    let v0 = _mm256_loadu_ps(x0.add(d));
+                    let v1 = _mm256_loadu_ps(x1.add(d));
+                    let w = _mm256_loadu_ps(c0.add(d));
+                    a00 = _mm256_fmadd_ps(v0, w, a00);
+                    a10 = _mm256_fmadd_ps(v1, w, a10);
+                    let w = _mm256_loadu_ps(c1.add(d));
+                    a01 = _mm256_fmadd_ps(v0, w, a01);
+                    a11 = _mm256_fmadd_ps(v1, w, a11);
+                    let w = _mm256_loadu_ps(c2.add(d));
+                    a02 = _mm256_fmadd_ps(v0, w, a02);
+                    a12 = _mm256_fmadd_ps(v1, w, a12);
+                    let w = _mm256_loadu_ps(c3.add(d));
+                    a03 = _mm256_fmadd_ps(v0, w, a03);
+                    a13 = _mm256_fmadd_ps(v1, w, a13);
+                    d += 8;
+                }
+                let base = 2 * half * NR;
+                let acc = [a00, a01, a02, a03, a10, a11, a12, a13];
+                for (i, a) in acc.into_iter().enumerate() {
+                    out[base + i] = hsum256(a);
+                }
+            }
+            tail(x, c, dim, full, out);
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn tail(x: *const f32, c: *const f32, dim: usize, from: usize, out: &mut [f32; MR * NR]) {
+        unsafe {
+            for d in from..dim {
+                for a in 0..MR {
+                    let xv = *x.add(a * dim + d);
+                    for b in 0..NR {
+                        out[a * NR + b] += xv * *c.add(b * dim + d);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::{Rng, SeedableRng, rngs::SmallRng};
+
+    fn reference(c: &[f32], x: &[f32], dim: usize, bias: Option<&[f32]>) -> Vec<Option<u32>> {
+        x.chunks_exact(dim)
+            .map(|x| {
+                let mut best = (f32::INFINITY, None);
+                for (j, c) in c.chunks_exact(dim).enumerate() {
+                    let s = f32::l2(x, c) + bias.map_or(0.0, |b| b[j]);
+                    if s < best.0 {
+                        best = (s, Some(j as u32));
+                    }
+                }
+                best.1
+            })
+            .collect()
+    }
+
+    #[test]
+    fn matches_per_vector_assignment() {
+        let mut rng = SmallRng::seed_from_u64(7);
+        for &(n, k, dim) in &[(1, 8, 32), (67, 13, 33), (300, 64, 128), (130, 101, 960)] {
+            let x: Vec<f32> = (0..n * dim).map(|_| rng.random::<f32>()).collect();
+            let c: Vec<f32> = (0..k * dim).map(|_| rng.random::<f32>()).collect();
+            let bias: Vec<f32> = (0..k).map(|_| rng.random::<f32>() * 0.01).collect();
+            for b in [None, Some(bias.as_slice())] {
+                let Some(got) = l2_argmin(&c, &x, dim, b) else {
+                    return;
+                };
+                let want = reference(&c, &x, dim, b);
+                let agree = got
+                    .iter()
+                    .zip(&want)
+                    .filter(|(g, w)| g.map(|g| g.0) == **w)
+                    .count();
+                // Random uniform data has no near-ties at this scale.
+                assert_eq!(agree, n, "n={n} k={k} dim={dim}");
+                for (g, xv) in got.iter().zip(x.chunks_exact(dim)) {
+                    let (idx, dist) = g.unwrap();
+                    let exact = f32::l2(xv, &c[idx as usize * dim..][..dim]);
+                    assert_eq!(dist, exact);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nan_row_is_unassigned() {
+        let dim = 32;
+        let mut x = vec![0.5f32; 2 * dim];
+        x[3] = f32::NAN;
+        let c = vec![0.1f32; 8 * dim];
+        if let Some(got) = l2_argmin(&c, &x, dim, None) {
+            assert!(got[0].is_none());
+            assert!(got[1].is_some());
+        }
+    }
+}

@@ -1,0 +1,159 @@
+diff --git a/rust/lance-index/src/vector.rs b/rust/lance-index/src/vector.rs
+index 8b5f74c62..c076eece0 100644
+--- a/rust/lance-index/src/vector.rs
++++ b/rust/lance-index/src/vector.rs
+@@ -27,6 +27,7 @@ use std::sync::LazyLock;
+ use v3::subindex::SubIndexType;
+ 
+ pub mod bq;
++pub(crate) mod blocked_l2;
+ pub mod distributed;
+ pub(crate) mod exact_buffers;
+ pub mod flat;
+diff --git a/rust/lance-index/src/vector/bq/builder.rs b/rust/lance-index/src/vector/bq/builder.rs
+index 2a29be7af..37e7349aa 100644
+--- a/rust/lance-index/src/vector/bq/builder.rs
++++ b/rust/lance-index/src/vector/bq/builder.rs
+@@ -1,7 +1,10 @@
+ // SPDX-License-Identifier: Apache-2.0
+ // SPDX-FileCopyrightText: Copyright The Lance Authors
+ 
+-use std::sync::Arc;
++use std::collections::HashMap;
++use std::sync::{Arc, LazyLock, Mutex};
++
++use rand::{Rng, SeedableRng};
+ 
+ use arrow::array::AsArray;
+ use arrow::datatypes::{Float16Type, Float32Type, Float64Type};
+@@ -299,6 +302,46 @@ fn best_ex_rescale_factor_with_scratch(scratch: &mut ExQuantizationScratch, ex_b
+     best_t
+ }
+ 
++/// Opt-in (`LANCE_RQ_CONST_EX_SCALE=1`): use one ex-code rescale factor per
++/// `(dim, ex_bits)` instead of searching the optimal factor for every row.
++///
++/// After the random rotation a residual's normalized magnitudes follow nearly
++/// the same distribution for every row, so the per-row optimum varies little
++/// around its mean (the observation behind RaBitQ-Library's constant scaling
++/// factor). The stored ex factors are computed from the codes actually
++/// emitted, so estimates stay consistent; only the quantization error can grow.
++static USE_CONST_EX_SCALE: LazyLock<bool> = LazyLock::new(|| {
++    std::env::var("LANCE_RQ_CONST_EX_SCALE").is_ok_and(|v| v == "1" || v == "true")
++});
++
++static CONST_EX_SCALES: LazyLock<Mutex<HashMap<(usize, u8), f32>>> =
++    LazyLock::new(|| Mutex::new(HashMap::new()));
++
++const CONST_EX_SCALE_SAMPLES: usize = 100;
++
++/// Mean optimal rescale factor over Gaussian rows of dimension `dim`.
++fn const_ex_rescale_factor(dim: usize, ex_bits: u8) -> f32 {
++    if let Some(t) = CONST_EX_SCALES.lock().unwrap().get(&(dim, ex_bits)) {
++        return *t;
++    }
++    let mut rng = rand::rngs::SmallRng::seed_from_u64(0x5ca1e ^ dim as u64 ^ ((ex_bits as u64) << 32));
++    let normal = rand_distr::StandardNormal;
++    let mut scratch = ExQuantizationScratch::new(dim, ex_bits);
++    let mut sum = 0.0f64;
++    for _ in 0..CONST_EX_SCALE_SAMPLES {
++        let row: Vec<f32> = (0..dim).map(|_| rng.sample::<f32, _>(normal)).collect();
++        let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt();
++        scratch.abs_normalized.clear();
++        scratch
++            .abs_normalized
++            .extend(row.iter().map(|v| v.abs() / norm));
++        sum += best_ex_rescale_factor_with_scratch(&mut scratch, ex_bits) as f64;
++    }
++    let t = (sum / CONST_EX_SCALE_SAMPLES as f64) as f32;
++    CONST_EX_SCALES.lock().unwrap().insert((dim, ex_bits), t);
++    t
++}
++
+ /// `|v_d| / ||v||` for every dimension, or `None` for a zero / non-finite
+ /// vector (which encodes as all-zero ex codes).
+ #[doc(hidden)]
+@@ -338,7 +381,11 @@ where
+     scratch
+         .abs_normalized
+         .extend(rotated.iter().map(|value| value.abs() / norm));
+-    let t = best_ex_rescale_factor_with_scratch(scratch, ex_bits);
++    let t = if *USE_CONST_EX_SCALE {
++        const_ex_rescale_factor(rotated.len(), ex_bits)
++    } else {
++        best_ex_rescale_factor_with_scratch(scratch, ex_bits)
++    };
+     quantize_ex_code_with_scale_and_visit(
+         rotated,
+         &scratch.abs_normalized,
+diff --git a/rust/lance-index/src/vector/kmeans.rs b/rust/lance-index/src/vector/kmeans.rs
+index 63da799f6..c9e4d5e2c 100644
+--- a/rust/lance-index/src/vector/kmeans.rs
++++ b/rust/lance-index/src/vector/kmeans.rs
+@@ -689,16 +689,41 @@ where
+                             )
+                             .collect::<Vec<_>>()
+                     }
+-                    None => data
+-                        .par_chunks(dimension)
+-                        .map_init(
+-                            || vec![0.0; centroids.len() / dimension],
+-                            |distances, vec| {
+-                                l2_distance_batch_into(vec, centroids, dimension, distances);
+-                                argmin_value_float_with_bias(distances.iter().copied(), biases())
+-                            },
+-                        )
+-                        .collect::<Vec<_>>(),
++                    None => T::as_f32_slice(centroids)
++                        .zip(T::as_f32_slice(data))
++                        .filter(|_| {
++                            crate::vector::blocked_l2::applies(
++                                centroids.len() / dimension,
++                                dimension,
++                            )
++                        })
++                        .and_then(|(centroids, data)| {
++                            let biases: Option<Vec<f32>> = cluster_sizes.map(|sizes| {
++                                sizes.iter().map(|s| balance_factor * *s as f32).collect()
++                            });
++                            crate::vector::blocked_l2::l2_argmin(
++                                centroids,
++                                data,
++                                dimension,
++                                biases.as_deref(),
++                            )
++                        })
++                        .unwrap_or_else(|| {
++                            data.par_chunks(dimension)
++                                .map_init(
++                                    || vec![0.0; centroids.len() / dimension],
++                                    |distances, vec| {
++                                        l2_distance_batch_into(
++                                            vec, centroids, dimension, distances,
++                                        );
++                                        argmin_value_float_with_bias(
++                                            distances.iter().copied(),
++                                            biases(),
++                                        )
++                                    },
++                                )
++                                .collect::<Vec<_>>()
++                        }),
+                 },
+                 DistanceType::Dot => T::as_f16_slice(centroids)
+                     .zip(T::as_f16_slice(data))
+diff --git a/rust/lance/Cargo.toml b/rust/lance/Cargo.toml
+index 0e9de6eae..6a9b6988d 100644
+--- a/rust/lance/Cargo.toml
++++ b/rust/lance/Cargo.toml
+@@ -233,6 +233,10 @@ harness = false
+ name = "vector_index"
+ harness = false
+ 
++[[bench]]
++name = "ivf_rq_gist"
++harness = false
++
+ [[bench]]
+ name = "ivf_pq"
+ harness = false
