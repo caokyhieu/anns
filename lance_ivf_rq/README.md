@@ -1,5 +1,9 @@
 # Faster Lance IVF_RQ index builds: GIST1M benchmark
 
+> **Superseded.** These changes are part of the Lance patch series in
+> [`lance_index_build/patches/`](../lance_index_build/patches/); run experiments with
+> [`lance_index_build/bench.sh`](../lance_index_build/bench.sh). Kept for history.
+
 Two build-time optimizations for Lance's `IVF_RQ` index (IVF + RaBitQ), with a
 benchmark against unmodified Lance on GIST1M.
 

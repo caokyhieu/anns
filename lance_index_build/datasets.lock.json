@@ -1,0 +1,23 @@
+{
+  "bigann10m": {
+    "dir": "bigann10m",
+    "source": "https://big-ann-benchmarks.com/neurips21.html (first 10M base vectors; native/scripts/prepare_bigann.py)",
+    "files": {
+      "base.10M.u8bin": {"bytes": 1280000008, "sha256": "3f92342f582ebe3aa50751be105791e11894c4caac5b9d3321999457c56b054d"},
+      "query.u8bin":    {"bytes": 1280008,    "sha256": "eca755831fc9a8004e14886df48b81109a8ed3bfc6b632509c93c0460a30d552"},
+      "gt.10M.ibin":    {"bytes": 8000008,    "sha256": "80a4e35d5dc918e00e55f81e133e333e3b65f4de1426728c8a3ca93ac5ce74df"}
+    }
+  },
+  "gist1m": {
+    "dir": ".",
+    "source": "http://ann-benchmarks.com/gist-960-euclidean.hdf5 (lance_ivf_rq/scripts/convert_gist.py)",
+    "url": "http://ann-benchmarks.com/gist-960-euclidean.hdf5",
+    "files": {
+      "gist-960-euclidean.hdf5": {"bytes": 3844648288, "sha256": "8e95831936bfdbfa0a56086942e2cf98cd703517c67f985914183eb4cdbf026a"},
+      "base.f32":  {"bytes": 3840000000, "sha256": "1d9dfa933a86b1b78ef3de82eb286f85899866c428d373e42613783a13811038"},
+      "query.f32": {"bytes": 3840000,    "sha256": "5779751c3b63bee0a0c52a0017232ca2340af0527eb0f79270ae09c010423eea"},
+      "gt.i32":    {"bytes": 400000,     "sha256": "6e7fbeff9f4ce6d1f1207746e0dbc6a361a59ddc6c3302feb5e102d578d9b94a"},
+      "meta.txt":  {"bytes": 21,         "sha256": "62488a6f7e1839ad0bb989884c4416ae28c7afe9bcc299a9ce74f2cd07ec0bdc"}
+    }
+  }
+}

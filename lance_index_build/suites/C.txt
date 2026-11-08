@@ -1,0 +1,5 @@
+# Suite C: IVF_HNSW_FLAT vs IVF_PIPNN_FLAT partition graphs. The 1M memory pilot gates the 10M runs.
+configs/suiteC-memory-pilot-1m.env  C-mem1m-hnsw          INDEX=ivf_hnsw_flat
+configs/suiteC-memory-pilot-1m.env  C-mem1m-pipnn         INDEX=ivf_pipnn_flat
+configs/suiteC-bigann10m-k5.env     C-bigann10m-k5-hnsw   INDEX=ivf_hnsw_flat
+configs/suiteC-bigann10m-k5.env     C-bigann10m-k5-pipnn  INDEX=ivf_pipnn_flat

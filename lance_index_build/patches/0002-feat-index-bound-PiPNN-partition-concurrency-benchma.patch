@@ -1,0 +1,277 @@
+From bc7b5030882816903b3fa0e7a6ed78f033e6df00 Mon Sep 17 00:00:00 2001
+From: caokyhieu <caokyhieu253@gmail.com>
+Date: Sat, 7 Nov 2026 16:26:24 +0000
+Subject: [PATCH 2/4] feat(index): bound PiPNN partition concurrency; benchmark
+ instrumentation
+
+- Add IvfSubIndex::max_concurrent_builds (default None = CPU concurrency);
+  PiPNN uses PipnnBuildParams::concurrent_partitions (default 1) so its
+  native workers are not oversubscribed and peak memory stays bounded.
+- Register IVF_PIPNN_FLAT in the index loader (no-feature builds reject
+  it with NotSupported).
+- Add assignment_stats counters (thread-seconds, rows, batches) around
+  IVF partition assignment.
+- PiPNN centroid assignment: graph stats (degree, entry reachability).
+- Runner: INGEST_ONLY, per-build RSS before/delta, actual partition
+  count from index statistics, centroid-graph stats in assignment rows.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ rust/lance-index-bench/src/main.rs           | 23 +++++++++-
+ rust/lance-index/src/vector/ivf.rs           |  1 +
+ rust/lance-index/src/vector/ivf/transform.rs | 46 ++++++++++++++++++++
+ rust/lance-index/src/vector/pipnn.rs         | 12 +++++
+ rust/lance-index/src/vector/v3/subindex.rs   | 12 +++++
+ rust/lance/src/index/vector/builder.rs       |  9 +++-
+ 6 files changed, 100 insertions(+), 3 deletions(-)
+
+diff --git a/rust/lance-index-bench/src/main.rs b/rust/lance-index-bench/src/main.rs
+index 2b7fc5164..03df774f1 100644
+--- a/rust/lance-index-bench/src/main.rs
++++ b/rust/lance-index-bench/src/main.rs
+@@ -346,6 +346,7 @@ fn pipnn_params() -> lance_index::vector::pipnn::PipnnBuildParams {
+         ),
+         seed: env_or("PIPNN_SEED", d.seed),
+         alpha: env_or("PIPNN_ALPHA", d.alpha),
++        concurrent_partitions: env_or("PIPNN_CONCURRENT_PARTITIONS", d.concurrent_partitions),
+     }
+ }
+ 
+@@ -435,6 +436,13 @@ fn peak_rss_bytes() -> Option<u64> {
+     Some(kb * 1024)
+ }
+ 
++fn current_rss_bytes() -> Option<u64> {
++    let status = std::fs::read_to_string("/proc/self/status").ok()?;
++    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
++    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
++    Some(kb * 1024)
++}
++
+ fn cpu_seconds() -> f64 {
+     // SAFETY: getrusage writes into a zeroed, properly sized struct.
+     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+@@ -857,6 +865,10 @@ async fn main() {
+         write_dataset(&data.base, &uri).await;
+         println!("ingested dataset in {:.1}s (untimed)", t.elapsed().as_secs_f64());
+     }
++    if std::env::var("INGEST_ONLY").is_ok() {
++        println!("INGEST_ONLY set: dataset ready at {uri}");
++        return;
++    }
+     let mut dataset = Dataset::open(&uri).await.unwrap();
+     assert_eq!(
+         dataset.count_rows(None).await.unwrap(),
+@@ -935,7 +947,9 @@ async fn main() {
+             let build_id = format!("{index_kind}-{mode}-{spec}-r{repeat}");
+             println!("[{build_id}] building on {}x{}", data.base.rows, data.base.dim);
+             let timer = Arc::new(StageTimer::default());
++            let rss_before = current_rss_bytes();
+             peak_rss_reset();
++            lance_index::vector::ivf::assignment_stats::reset();
+             let cpu0 = cpu_seconds();
+             let t = Instant::now();
+             let result = dataset
+@@ -947,6 +961,8 @@ async fn main() {
+             let wall = t.elapsed().as_secs_f64();
+             let cpu = cpu_seconds() - cpu0;
+             let rss = peak_rss_bytes();
++            let (assign_thread_secs, assign_rows, assign_batches) =
++                lance_index::vector::ivf::assignment_stats::snapshot();
+             let stages: serde_json::Map<String, Value> = timer
+                 .done
+                 .lock()
+@@ -960,6 +976,10 @@ async fn main() {
+                 "num_partitions": env_or("NUM_PARTITIONS", 1000usize),
+                 "rows": data.base.rows, "dim": data.base.dim,
+                 "build_secs": wall, "cpu_secs": cpu, "peak_rss_bytes": rss,
++                "rss_before_bytes": rss_before,
++                "peak_rss_delta_bytes": rss.zip(rss_before).map(|(p, b)| p.saturating_sub(b)),
++                "assign_thread_secs": assign_thread_secs,
++                "assign_rows": assign_rows, "assign_batches": assign_batches,
+                 "vectors_per_sec": data.base.rows as f64 / wall,
+                 "stages": stages,
+                 "fixed_train_secs": fixed.as_ref().map(|f| f.2),
+@@ -993,7 +1013,8 @@ async fn main() {
+                 );
+             }
+             println!(
+-                "  build {wall:.2}s cpu {cpu:.1}s rss {:.2} GB index {:.1} MB",
++                "  build {wall:.2}s cpu {cpu:.1}s assign {assign_thread_secs:.2} thread-s ({assign_rows} rows) rss +{:.2} GB (peak {:.2}) index {:.1} MB",
++                row["peak_rss_delta_bytes"].as_u64().unwrap_or(0) as f64 / 1e9,
+                 rss.unwrap_or(0) as f64 / 1e9,
+                 bytes as f64 / 1e6
+             );
+diff --git a/rust/lance-index/src/vector/ivf.rs b/rust/lance-index/src/vector/ivf.rs
+index 470fedee0..987858247 100644
+--- a/rust/lance-index/src/vector/ivf.rs
++++ b/rust/lance-index/src/vector/ivf.rs
+@@ -35,6 +35,7 @@ pub mod builder;
+ pub mod shuffler;
+ pub mod storage;
+ mod transform;
++pub use transform::assignment_stats;
+ 
+ /// Create an IVF from the flatten centroids.
+ ///
+diff --git a/rust/lance-index/src/vector/ivf/transform.rs b/rust/lance-index/src/vector/ivf/transform.rs
+index 84974a87d..a7e090d6a 100644
+--- a/rust/lance-index/src/vector/ivf/transform.rs
++++ b/rust/lance-index/src/vector/ivf/transform.rs
+@@ -50,6 +50,51 @@ pub struct PartitionTransformer {
+     tree: Option<(Arc<crate::vector::assignment_tree::AssignmentTree>, usize)>,
+ }
+ 
++/// Process-wide counters for centroid assignment inside IVF builds.
++///
++/// Times are summed over concurrently transformed batches (thread-seconds, not
++/// wall time). Benchmarks reset them before a build and read them afterwards.
++pub mod assignment_stats {
++    use std::sync::atomic::{AtomicU64, Ordering};
++    use std::time::Instant;
++
++    static NANOS: AtomicU64 = AtomicU64::new(0);
++    static ROWS: AtomicU64 = AtomicU64::new(0);
++    static BATCHES: AtomicU64 = AtomicU64::new(0);
++
++    pub(crate) struct Timer(Instant, usize);
++
++    impl Timer {
++        pub(crate) fn start(rows: usize) -> Self {
++            Self(Instant::now(), rows)
++        }
++    }
++
++    impl Drop for Timer {
++        fn drop(&mut self) {
++            NANOS.fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
++            ROWS.fetch_add(self.1 as u64, Ordering::Relaxed);
++            BATCHES.fetch_add(1, Ordering::Relaxed);
++        }
++    }
++
++    /// Reset all counters to zero.
++    pub fn reset() {
++        NANOS.store(0, Ordering::Relaxed);
++        ROWS.store(0, Ordering::Relaxed);
++        BATCHES.store(0, Ordering::Relaxed);
++    }
++
++    /// `(thread_seconds, rows, batches)` since the last reset.
++    pub fn snapshot() -> (f64, u64, u64) {
++        (
++            NANOS.load(Ordering::Relaxed) as f64 * 1e-9,
++            ROWS.load(Ordering::Relaxed),
++            BATCHES.load(Ordering::Relaxed),
++        )
++    }
++}
++
+ impl PartitionTransformer {
+     pub fn new(
+         centroids: FixedSizeListArray,
+@@ -251,6 +296,7 @@ impl PartitionTransformer {
+ impl Transformer for PartitionTransformer {
+     #[instrument(name = "PartitionTransformer::transform", level = "debug", skip_all)]
+     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
++        let _timer = assignment_stats::Timer::start(batch.num_rows());
+         let has_part_ids = batch.column_by_name(&self.output_column).is_some();
+         let needs_dists =
+             self.with_distance && batch.column_by_name(CENTROID_DIST_COLUMN).is_none();
+diff --git a/rust/lance-index/src/vector/pipnn.rs b/rust/lance-index/src/vector/pipnn.rs
+index 1602b645a..efac30e35 100644
+--- a/rust/lance-index/src/vector/pipnn.rs
++++ b/rust/lance-index/src/vector/pipnn.rs
+@@ -44,6 +44,14 @@ pub struct PipnnBuildParams {
+     pub threads: usize,
+     pub seed: u64,
+     pub alpha: f64,
++    /// Partitions built concurrently inside an IVF build. Each uses `threads`
++    /// native workers, so peak memory and threads scale with this value.
++    #[serde(default = "one")]
++    pub concurrent_partitions: usize,
++}
++
++fn one() -> usize {
++    1
+ }
+ 
+ impl Default for PipnnBuildParams {
+@@ -56,6 +64,7 @@ impl Default for PipnnBuildParams {
+             threads: 1,
+             seed: 555,
+             alpha: 1.2,
++            concurrent_partitions: 1,
+         }
+     }
+ }
+@@ -205,6 +214,9 @@ impl IvfSubIndex for PiPNN {
+     fn metadata_key() -> &'static str {
+         METADATA_KEY
+     }
++    fn max_concurrent_builds(params: &Self::BuildParams) -> Option<usize> {
++        Some(params.concurrent_partitions.max(1))
++    }
+     fn schema() -> SchemaRef {
+         Arc::new(Schema::new(vec![Field::new(
+             NEIGHBORS,
+diff --git a/rust/lance-index/src/vector/v3/subindex.rs b/rust/lance-index/src/vector/v3/subindex.rs
+index 4127b95cb..bc8857c01 100644
+--- a/rust/lance-index/src/vector/v3/subindex.rs
++++ b/rust/lance-index/src/vector/v3/subindex.rs
+@@ -165,6 +165,18 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
+     where
+         Self: Sized;
+ 
++    /// Upper bound on partitions whose sub-index may be built at the same time.
++    ///
++    /// `None` (the default) lets the IVF builder use its CPU concurrency. Builders
++    /// that run their own worker threads use this to avoid oversubscription and to
++    /// bound peak memory, which scales with the number of concurrent partitions.
++    fn max_concurrent_builds(_params: &Self::BuildParams) -> Option<usize>
++    where
++        Self: Sized,
++    {
++        None
++    }
++
+     fn remap(&self, mapping: &RowAddrRemap, store: &impl VectorStore) -> Result<Self>
+     where
+         Self: Sized;
+diff --git a/rust/lance/src/index/vector/builder.rs b/rust/lance/src/index/vector/builder.rs
+index 458d7fcbf..7cbdbed69 100644
+--- a/rust/lance/src/index/vector/builder.rs
++++ b/rust/lance/src/index/vector/builder.rs
+@@ -1241,6 +1241,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q>
+             );
+         }
+         let partition_adjustment = Arc::new(partition_adjustment);
++        let cpus = get_num_compute_intensive_cpus().max(1);
++        let build_concurrency = S::max_concurrent_builds(&sub_index_params)
++            .map_or(cpus, |limit| limit.clamp(1, cpus));
+         let build_iter = (0..num_partitions).map(move |partition| {
+             let output_partition_id = partition;
+             let reader = reader.clone();
+@@ -1347,7 +1350,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q>
+             }
+         });
+         Ok(stream::iter(build_iter)
+-            .buffered(get_num_compute_intensive_cpus())
++            .buffered(build_concurrency)
+             .boxed())
+     }
+ 
+@@ -1362,7 +1365,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q>
+         frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
+         limits: FreshPartitionBuildLimits,
+     ) -> Result<BuildStream<S, Q>> {
+-        let concurrency = get_num_compute_intensive_cpus().max(1);
++        let cpus = get_num_compute_intensive_cpus().max(1);
++        let concurrency = S::max_concurrent_builds(&sub_index_params)
++            .map_or(cpus, |limit| limit.clamp(1, cpus));
+         let max_entries = concurrency.saturating_mul(PARTITION_BUILD_ENTRIES_PER_WORKER);
+         let cpu_permits = Arc::new(Semaphore::new(concurrency));
+         let jobs = stream::try_unfold(0usize, move |next_partition_id| {
+-- 
+2.25.1
+

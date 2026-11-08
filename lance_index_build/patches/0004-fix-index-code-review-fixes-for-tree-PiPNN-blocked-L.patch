@@ -1,0 +1,686 @@
+From ea469f0da24ac31aafb983f40dd350ebec67aa15 Mon Sep 17 00:00:00 2001
+From: caokyhieu <caokyhieu253@gmail.com>
+Date: Sun, 8 Nov 2026 22:12:16 +0000
+Subject: [PATCH 4/4] fix(index): code-review fixes for tree/PiPNN/blocked-L2
+ build paths
+
+- blocked_l2: shortlist the 4 best expansion scores per row and re-score
+  near-ties exactly, so large-magnitude data cannot pick a wrong centroid
+  from |x|^2 + |c|^2 - 2x.c cancellation; read full centroid groups in place
+  instead of copying the table on every call.
+- PiPNN search: exact scan of allowed rows below 10 % filter selectivity
+  (HNSW's threshold), tested against brute force.
+- lance-pipnn: build a stub without Eigen so workspace-wide cargo commands
+  work; the stub builder fails at run time with a clear error.
+- HNSW centroid assignment rejects m / ef_construction / ef of zero.
+- Assignment stats exclude batches that already carry partition ids; tree
+  assignment checks nulls once per batch; PiPNN assignment reuses the shared
+  column/loss tail.
+- RaBitQ constant-scale lookup caches per thread instead of taking a global
+  mutex per row.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ rust/lance-index/src/vector/blocked_l2.rs    | 114 +++++++++++++----
+ rust/lance-index/src/vector/bq/builder.rs    |  19 +++
+ rust/lance-index/src/vector/ivf/transform.rs |  92 +++++++-------
+ rust/lance-index/src/vector/pipnn.rs         | 121 +++++++++++++++++--
+ rust/lance-index/src/vector/utils.rs         |  11 +-
+ rust/lance-pipnn/build.rs                    |  12 +-
+ rust/lance-pipnn/src/lib.rs                  |  71 +++++++++++
+ 7 files changed, 356 insertions(+), 84 deletions(-)
+
+diff --git a/rust/lance-index/src/vector/blocked_l2.rs b/rust/lance-index/src/vector/blocked_l2.rs
+index a0c557e55..6bd01192a 100644
+--- a/rust/lance-index/src/vector/blocked_l2.rs
++++ b/rust/lance-index/src/vector/blocked_l2.rs
+@@ -16,10 +16,15 @@
+ //! loss), and the expansion loses precision when `|x|` is large relative to
+ //! the residual.
+ //!
+-//! Selection matches `argmin_value_float_with_bias`: the first centroid with
+-//! the strictly smallest `dist + bias` wins, and a row whose distances are all
+-//! NaN gets `None`. Near-ties can resolve differently from the per-vector
+-//! kernel because the dot products are summed in a different order.
++//! The expansion cancels when `|x|^2` is large relative to the gaps between
++//! centroid distances (unnormalized embeddings), so it only shortlists: each
++//! row keeps its [`SHORTLIST`] best expansion scores, and every shortlisted
++//! centroid within the expansion's rounding-error bound of the best is
++//! re-scored with the pairwise kernel. Selection then matches
++//! `argmin_value_float_with_bias` on exact distances: the lowest-index
++//! centroid with the smallest `dist + bias` wins, and a row whose distances are
++//! all NaN gets `None`. Only more than [`SHORTLIST`] centroids tied within the
++//! error bound can still resolve differently from the per-vector kernel.
+ //!
+ //! The 4x4 tile kernel is [`lance_linalg::distance::tile::dot_tile`]
+ //! (AVX-512 / AVX2+FMA on x86_64, SVE / NEON on aarch64). Hosts where only the
+@@ -35,6 +40,8 @@ use lance_linalg::distance::tile::{
+ use rayon::prelude::*;
+ 
+ const ROW_BLOCK: usize = 64;
++/// Expansion-score candidates kept per row for exact re-scoring.
++const SHORTLIST: usize = 4;
+ /// Target bytes for one centroid tile; sized to stay resident in L2 next to a
+ /// row block of similar size.
+ const TILE_BYTES: usize = 256 * 1024;
+@@ -73,16 +80,22 @@ pub fn l2_argmin(
+     debug_assert_eq!(centroids.len(), k * dimension);
+     debug_assert_eq!(data.len() % dimension, 0);
+ 
+-    // Pad the centroid table to a multiple of NR; padding columns are never
+-    // read back as candidates.
++    // Only the last, partial group of NR centroids needs zero padding; its padding
++    // columns are never read back as candidates. Full groups are read in place
++    // instead of copying the whole table (tens of MB at 16K x 960) on every call.
+     let k_pad = k.div_ceil(NR) * NR;
+-    let mut padded = centroids.to_vec();
+-    padded.resize(k_pad * dimension, 0.0);
++    let full = k / NR * NR;
++    let mut tail = vec![0.0f32; NR * dimension];
++    tail[..(k - full) * dimension].copy_from_slice(&centroids[full * dimension..]);
+     let c_norms: Vec<f32> = centroids
+         .chunks_exact(dimension)
+         .map(|c| c.iter().map(|v| v * v).sum())
+         .collect();
+     let tile = ((TILE_BYTES / (dimension * 4)) / NR * NR).max(NR);
++    let max_c_norm = c_norms.iter().copied().fold(0.0f32, f32::max);
++    // Generous bound on the f32 error of |x|^2 + |c|^2 - 2 x.c: a lane-split
++    // reduction of `dimension` products grows like sqrt(dimension) ulps of the norms.
++    let relative_error = 8.0 * f32::EPSILON * (dimension as f32).sqrt();
+ 
+     let results = data
+         .par_chunks(ROW_BLOCK * dimension)
+@@ -97,16 +110,23 @@ pub fn l2_argmin(
+                     .chunks_exact(dimension)
+                     .map(|x| x.iter().map(|v| v * v).sum())
+                     .collect();
+-                let mut best_score = vec![f32::INFINITY; n];
+-                let mut best_idx: Vec<Option<u32>> = vec![None; n];
++                // Per row, the SHORTLIST smallest scores in ascending order; ties keep
++                // the earlier (lower) centroid first.
++                let mut short_score = vec![[f32::INFINITY; SHORTLIST]; n];
++                let mut short_idx = vec![[u32::MAX; SHORTLIST]; n];
+                 let mut out: DotTile = [0.0; MR * NR];
+                 for tile_start in (0..k_pad).step_by(tile) {
+                     let tile_end = (tile_start + tile).min(k_pad);
+                     for r in (0..n_pad).step_by(MR) {
+                         for j in (tile_start..tile_end).step_by(NR) {
++                            let group = if j < full {
++                                &centroids[j * dimension..(j + NR) * dimension]
++                            } else {
++                                tail.as_slice()
++                            };
+                             dot_tile(
+                                 &xbuf[r * dimension..(r + MR) * dimension],
+-                                &padded[j * dimension..(j + NR) * dimension],
++                                group,
+                                 dimension,
+                                 &mut out,
+                             );
+@@ -130,23 +150,46 @@ pub fn l2_argmin(
+                                         Some(bias) => dist + bias[cj],
+                                         None => dist,
+                                     };
+-                                    if score < best_score[row] {
+-                                        best_score[row] = score;
+-                                        best_idx[row] = Some(cj as u32);
++                                    let scores = &mut short_score[row];
++                                    if score < scores[SHORTLIST - 1] {
++                                        let ids = &mut short_idx[row];
++                                        let mut at = SHORTLIST - 1;
++                                        while at > 0 && score < scores[at - 1] {
++                                            scores[at] = scores[at - 1];
++                                            ids[at] = ids[at - 1];
++                                            at -= 1;
++                                        }
++                                        scores[at] = score;
++                                        ids[at] = cj as u32;
+                                     }
+                                 }
+                             }
+                         }
+                     }
+                 }
+-                best_idx
+-                    .into_iter()
+-                    .zip(rows.chunks_exact(dimension))
+-                    .map(|(idx, x)| {
+-                        idx.map(|idx| {
+-                            let c = &centroids[idx as usize * dimension..][..dimension];
+-                            (idx, f32::l2(x, c))
+-                        })
++                (0..n)
++                    .map(|row| {
++                        let x = &rows[row * dimension..(row + 1) * dimension];
++                        let (scores, ids) = (&short_score[row], &short_idx[row]);
++                        if ids[0] == u32::MAX {
++                            return None;
++                        }
++                        let margin = relative_error * (x_norms[row] + max_c_norm);
++                        let mut best: Option<(u32, f32, f32)> = None; // (id, dist, score)
++                        for (&score, &id) in scores.iter().zip(ids) {
++                            if id == u32::MAX || score > scores[0] + margin {
++                                break;
++                            }
++                            let c = &centroids[id as usize * dimension..][..dimension];
++                            let dist = f32::l2(x, c);
++                            let exact = dist + biases.map_or(0.0, |b| b[id as usize]);
++                            if best.is_none_or(|(best_id, _, best_score)| {
++                                exact < best_score || (exact == best_score && id < best_id)
++                            }) {
++                                best = Some((id, dist, exact));
++                            }
++                        }
++                        best.map(|(id, dist, _)| (id, dist))
+                     })
+                     .collect::<Vec<_>>()
+             },
+@@ -204,6 +247,33 @@ mod tests {
+         }
+     }
+ 
++    /// Large-magnitude rows whose two nearest centroids differ by far less than
++    /// the expansion's rounding error: the exact re-score must pick the true one.
++    #[test]
++    fn near_ties_at_large_magnitude_match_per_vector() {
++        let dim = 128;
++        let mut rng = SmallRng::seed_from_u64(11);
++        let (n, k) = (200, 8);
++        let x: Vec<f32> = (0..n * dim).map(|_| 1000.0 + rng.random::<f32>()).collect();
++        let mut c = Vec::with_capacity(k * dim);
++        // Two centroids next to the data mean, six far away.
++        for j in 0..k {
++            let offset = if j < 2 {
++                0.5 + 0.01 * j as f32
++            } else {
++                50.0 * j as f32
++            };
++            c.extend((0..dim).map(|_| 1000.0 + offset + 0.01 * rng.random::<f32>()));
++        }
++        let Some(got) = l2_argmin(&c, &x, dim, None) else {
++            return;
++        };
++        let want = reference(&c, &x, dim, None);
++        for (row, (g, w)) in got.iter().zip(&want).enumerate() {
++            assert_eq!(g.map(|g| g.0), *w, "row {row}");
++        }
++    }
++
+     #[test]
+     fn nan_row_is_unassigned() {
+         let dim = 32;
+diff --git a/rust/lance-index/src/vector/bq/builder.rs b/rust/lance-index/src/vector/bq/builder.rs
+index f33c372d0..0578654ff 100644
+--- a/rust/lance-index/src/vector/bq/builder.rs
++++ b/rust/lance-index/src/vector/bq/builder.rs
+@@ -319,8 +319,27 @@ static CONST_EX_SCALES: LazyLock<Mutex<HashMap<(usize, u8), f32>>> =
+ 
+ const CONST_EX_SCALE_SAMPLES: usize = 100;
+ 
++thread_local! {
++    /// Last `(dim, ex_bits)` factor seen by this thread. Every row of a build shares
++    /// one key, so the per-row lookup stays off the process-wide mutex.
++    static LAST_CONST_EX_SCALE: std::cell::Cell<Option<((usize, u8), f32)>> =
++        const { std::cell::Cell::new(None) };
++}
++
+ /// Mean optimal rescale factor over Gaussian rows of dimension `dim`.
+ fn const_ex_rescale_factor(dim: usize, ex_bits: u8) -> f32 {
++    let key = (dim, ex_bits);
++    if let Some((cached, t)) = LAST_CONST_EX_SCALE.get()
++        && cached == key
++    {
++        return t;
++    }
++    let t = shared_const_ex_rescale_factor(dim, ex_bits);
++    LAST_CONST_EX_SCALE.set(Some((key, t)));
++    t
++}
++
++fn shared_const_ex_rescale_factor(dim: usize, ex_bits: u8) -> f32 {
+     if let Some(t) = CONST_EX_SCALES.lock().unwrap().get(&(dim, ex_bits)) {
+         return *t;
+     }
+diff --git a/rust/lance-index/src/vector/ivf/transform.rs b/rust/lance-index/src/vector/ivf/transform.rs
+index a7e090d6a..f59383c2e 100644
+--- a/rust/lance-index/src/vector/ivf/transform.rs
++++ b/rust/lance-index/src/vector/ivf/transform.rs
+@@ -23,6 +23,11 @@ use crate::vector::utils::SimpleIndex;
+ use crate::vector::{CENTROID_DIST_COLUMN, CENTROID_DIST_FIELD, LOSS_METADATA_KEY, PART_ID_FIELD};
+ 
+ use super::PART_ID_COLUMN;
++#[cfg(feature = "pipnn")]
++use rayon::prelude::*;
++
++/// Per-row partition ids and squared distances; `None` marks unassigned rows.
++type PartitionAssignment = (Vec<Option<u32>>, Vec<Option<f32>>);
+ 
+ /// PartitionTransformer
+ ///
+@@ -277,6 +282,36 @@ impl PartitionTransformer {
+         Ok(batch.add_metadata(LOSS_METADATA_KEY.to_owned(), loss.to_string())?)
+     }
+ 
++    /// Nearest centroid of every row through the PiPNN centroid graph, or `None`
++    /// when this transformer uses another backend.
++    #[cfg(feature = "pipnn")]
++    fn pipnn_assign(&self, fsl: &FixedSizeListArray) -> Result<Option<PartitionAssignment>> {
++        let Some((graph, store, beam)) = &self.pipnn else {
++            return Ok(None);
++        };
++        let num_centroids = self.centroids.len();
++        let assigned = (0..fsl.len())
++            .into_par_iter()
++            .map_init(
++                || crate::vector::graph::VisitedGenerator::new(num_centroids),
++                |scratch, row| {
++                    if fsl.is_null(row) {
++                        return Ok((None, None));
++                    }
++                    graph
++                        .search_centroid_with_scratch(fsl.value(row), *beam, store, scratch)
++                        .map(|(id, distance)| (Some(id), Some(distance)))
++                },
++            )
++            .collect::<Result<Vec<_>>>()?;
++        Ok(Some(assigned.into_iter().unzip()))
++    }
++
++    #[cfg(not(feature = "pipnn"))]
++    fn pipnn_assign(&self, _fsl: &FixedSizeListArray) -> Result<Option<PartitionAssignment>> {
++        Ok(None)
++    }
++
+     fn input_vectors<'a>(&self, batch: &'a RecordBatch) -> Result<&'a FixedSizeListArray> {
+         let arr = batch.column_by_name(&self.input_column).ok_or_else(|| {
+             lance_core::Error::index(format!(
+@@ -296,7 +331,6 @@ impl PartitionTransformer {
+ impl Transformer for PartitionTransformer {
+     #[instrument(name = "PartitionTransformer::transform", level = "debug", skip_all)]
+     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+-        let _timer = assignment_stats::Timer::start(batch.num_rows());
+         let has_part_ids = batch.column_by_name(&self.output_column).is_some();
+         let needs_dists =
+             self.with_distance && batch.column_by_name(CENTROID_DIST_COLUMN).is_none();
+@@ -310,6 +344,9 @@ impl Transformer for PartitionTransformer {
+             // rather than reassign the row to its nearest one.
+             return self.with_distances_to_chosen_partitions(batch);
+         }
++        // Started after the early returns: rows that keep caller-chosen partitions
++        // are not assigned and must not count toward the assignment statistics.
++        let _timer = assignment_stats::Timer::start(batch.num_rows());
+ 
+         // clear the columns if any of them is present
+         let batch = batch
+@@ -324,57 +361,26 @@ impl Transformer for PartitionTransformer {
+                 .ok_or_else(|| {
+                     lance_core::Error::invalid_input("tree assignment requires float32 vectors")
+                 })?;
++            let dimension = fsl.value_length() as usize;
++            // Only a values buffer that holds nulls needs the per-row child check.
++            let has_null_values = values.null_count() > 0;
+             // Array nulls keep their positions, even though routing operates on the values buffer.
+             tree.assign(values.values(), *beam)?
+                 .into_iter()
+                 .enumerate()
+                 .map(|(row, assigned)| {
+-                    if fsl.is_null(row)
+-                        || values
+-                            .slice(
+-                                row * fsl.value_length() as usize,
+-                                fsl.value_length() as usize,
+-                            )
+-                            .null_count()
+-                            > 0
+-                    {
+-                        (None, None)
+-                    } else {
+-                        assigned.map_or((None, None), |(id, distance)| (Some(id), Some(distance)))
++                    let is_null_row = fsl.is_null(row)
++                        || (has_null_values
++                            && values.slice(row * dimension, dimension).null_count() > 0);
++                    match assigned {
++                        Some((id, distance)) if !is_null_row => (Some(id), Some(distance)),
++                        _ => (None, None),
+                     }
+                 })
+                 .unzip()
++        } else if let Some(assigned) = self.pipnn_assign(fsl)? {
++            assigned
+         } else {
+-            #[cfg(feature = "pipnn")]
+-            if let Some((graph, store, beam)) = &self.pipnn {
+-                use rayon::prelude::*;
+-                let num_centroids = self.centroids.len();
+-                let results: Result<Vec<_>> = (0..fsl.len())
+-                    .into_par_iter()
+-                    .map_init(
+-                        || crate::vector::graph::VisitedGenerator::new(num_centroids),
+-                        |scratch, row| {
+-                            if fsl.is_null(row) {
+-                                return Ok((None, None));
+-                            }
+-                            graph
+-                                .search_centroid_with_scratch(fsl.value(row), *beam, store, scratch)
+-                                .map(|(id, distance)| (Some(id), Some(distance)))
+-                        },
+-                    )
+-                    .collect();
+-                let (ids, distances): (Vec<_>, Vec<_>) = results?.into_iter().unzip();
+-                let loss: f64 = distances.iter().flatten().map(|d| *d as f64).sum();
+-                let mut batch = batch
+-                    .try_with_column(PART_ID_FIELD.clone(), Arc::new(UInt32Array::from(ids)))?;
+-                if self.with_distance {
+-                    batch = batch.try_with_column(
+-                        CENTROID_DIST_FIELD.clone(),
+-                        Arc::new(Float32Array::from(distances)),
+-                    )?;
+-                }
+-                return Ok(batch.add_metadata(LOSS_METADATA_KEY.to_owned(), loss.to_string())?);
+-            }
+             match &self.index {
+                 Some(index) => fsl
+                     .iter()
+diff --git a/rust/lance-index/src/vector/pipnn.rs b/rust/lance-index/src/vector/pipnn.rs
+index e2a46ea58..76356496e 100644
+--- a/rust/lance-index/src/vector/pipnn.rs
++++ b/rust/lance-index/src/vector/pipnn.rs
+@@ -387,20 +387,43 @@ impl IvfSubIndex for PiPNN {
+             Some(&mask)
+         };
+         let distances = storage.dist_calculator(query, params.dist_q_c);
+-        let entry = OrderedNode {
+-            id: self.metadata.entry,
+-            dist: OrderedFloat(distances.distance(self.metadata.entry)),
++        let mut results = match mask {
++            // Few rows pass the filter: a single-layer walk from the entry rarely
++            // reaches enough of them, so score them exactly, below the same
++            // threshold at which HNSW switches to a flat search.
++            Some(mask) if mask.count_ones() < self.len() * 10 / 100 => {
++                let lower = params.lower_bound.unwrap_or(f32::MIN);
++                let upper = params.upper_bound.unwrap_or(f32::MAX);
++                metrics.record_comparisons(mask.count_ones());
++                let mut scored: Vec<OrderedNode> = mask
++                    .iter_ones()
++                    .map(|id| OrderedNode {
++                        id: id as u32,
++                        dist: OrderedFloat(distances.distance(id as u32)),
++                    })
++                    .filter(|node| node.dist.0 >= lower && node.dist.0 < upper)
++                    .collect();
++                scored.sort_unstable_by(|a, b| a.dist.cmp(&b.dist).then(a.id.cmp(&b.id)));
++                scored
++            }
++            mask => {
++                let entry = OrderedNode {
++                    id: self.metadata.entry,
++                    dist: OrderedFloat(distances.distance(self.metadata.entry)),
++                };
++                let (results, comparisons) = beam_search_borrowed(
++                    self,
++                    &entry,
++                    &params,
++                    &distances,
++                    mask,
++                    Some(2),
++                    &mut visited.generate(self.len()),
++                );
++                metrics.record_comparisons(comparisons + 1);
++                results
++            }
+         };
+-        let (mut results, comparisons) = beam_search_borrowed(
+-            self,
+-            &entry,
+-            &params,
+-            &distances,
+-            mask,
+-            Some(2),
+-            &mut visited.generate(self.len()),
+-        );
+-        metrics.record_comparisons(comparisons + 1);
+         results.truncate(k);
+         let (ids, distances): (Vec<_>, Vec<_>) = results
+             .into_iter()
+@@ -530,6 +553,78 @@ mod tests {
+         assert!(recall >= 0.9, "recall@10 {recall} below 0.9");
+     }
+ 
++    /// Allows rows whose id is a multiple of `step`.
++    struct EveryNth {
++        step: u64,
++    }
++
++    #[async_trait::async_trait]
++    impl PreFilter for EveryNth {
++        async fn wait_for_ready(&self) -> Result<()> {
++            Ok(())
++        }
++
++        fn is_empty(&self) -> bool {
++            false
++        }
++
++        fn mask(&self) -> Arc<lance_select::RowAddrMask> {
++            Arc::new(lance_select::RowAddrMask::all_rows())
++        }
++
++        fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
++            row_ids
++                .enumerate()
++                .filter(|(_, id)| **id % self.step == 0)
++                .map(|(i, _)| i as u64)
++                .collect()
++        }
++    }
++
++    /// Below 10 % selectivity the graph walk is replaced by an exact scan of the
++    /// allowed rows, so results must equal brute force over those rows.
++    #[test]
++    fn selective_filter_is_exact() {
++        let store = storage(2000, 13);
++        let points = flat_values(&store);
++        let graph = PiPNN::index_vectors(&store, params()).unwrap();
++        let k = 5;
++        let queries = generate_random_array_with_seed::<Float32Type>(10 * DIM, [5; 32]);
++        for q in queries.values().chunks(DIM) {
++            let query: ArrayRef = Arc::new(Float32Array::from(q.to_vec()));
++            let params = HnswQueryParams {
++                ef: 32,
++                lower_bound: None,
++                upper_bound: None,
++                dist_q_c: 0.0,
++                use_acorn: false,
++            };
++            let batch = graph
++                .search(
++                    query,
++                    k,
++                    params,
++                    &store,
++                    Arc::new(EveryNth { step: 50 }),
++                    &NoOpMetricsCollector,
++                )
++                .unwrap();
++            let ids = batch[lance_core::ROW_ID]
++                .as_primitive::<arrow_array::types::UInt64Type>()
++                .values()
++                .to_vec();
++            let mut exact: Vec<(f32, u64)> = points
++                .chunks(DIM)
++                .enumerate()
++                .filter(|(i, _)| i % 50 == 0)
++                .map(|(i, p)| (l2(q, p), i as u64))
++                .collect();
++            exact.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
++            let truth: Vec<u64> = exact[..k].iter().map(|(_, i)| *i).collect();
++            assert_eq!(ids, truth);
++        }
++    }
++
+     /// Regression for the branch defaults on small inputs: when every point fits in
+     /// one leaf, only the leaf k-NN edges remain and the graph fragments.
+     #[test]
+diff --git a/rust/lance-index/src/vector/utils.rs b/rust/lance-index/src/vector/utils.rs
+index 9e79493d6..0353aea97 100644
+--- a/rust/lance-index/src/vector/utils.rs
++++ b/rust/lance-index/src/vector/utils.rs
+@@ -128,10 +128,13 @@ impl SimpleIndex {
+         ef_construction: usize,
+         ef: usize,
+     ) -> Result<Self> {
+-        if centroids.is_empty() || ef == 0 {
+-            return Err(Error::invalid_input(
+-                "HNSW centroid assignment requires centroids and positive ef",
+-            ));
++        // m = 0 builds an edgeless graph whose search returns only the entry point,
++        // silently sending every vector to one partition.
++        if centroids.is_empty() || m == 0 || ef_construction == 0 || ef == 0 {
++            return Err(Error::invalid_input(format!(
++                "HNSW centroid assignment requires centroids and positive m, ef_construction \
++                 and ef; got m={m}, ef_construction={ef_construction}, ef={ef}"
++            )));
+         }
+         let store = FlatFloatStorage::new(centroids, distance_type);
+         let index = HNSW::index_vectors(
+diff --git a/rust/lance-pipnn/build.rs b/rust/lance-pipnn/build.rs
+index 0feff363e..fba3ef852 100644
+--- a/rust/lance-pipnn/build.rs
++++ b/rust/lance-pipnn/build.rs
+@@ -5,13 +5,21 @@ fn main() {
+     println!("cargo:rerun-if-env-changed=LANCE_PIPNN_NATIVE");
+     println!("cargo:rerun-if-env-changed=LANCE_DISABLE_SVE_BUILD");
+     println!("cargo:rerun-if-changed=cpp");
++    println!("cargo::rustc-check-cfg=cfg(pipnn_stub)");
+     let eigen = std::env::var_os("EIGEN_INCLUDE_DIR")
+         .map(PathBuf::from)
+         .unwrap_or_else(|| PathBuf::from("/usr/include/eigen3"));
+     if !eigen.join("Eigen/Dense").is_file() {
+-        panic!(
+-            "PiPNN requires Eigen headers: set EIGEN_INCLUDE_DIR to a directory containing Eigen/Dense"
++        // This crate is a workspace member, so `cargo build/clippy/doc --workspace`
++        // compiles it even when no consumer enables `pipnn`. Without Eigen, link a
++        // stub whose builder reports the missing dependency at run time instead of
++        // failing every workspace build.
++        println!(
++            "cargo:warning=Eigen headers not found (set EIGEN_INCLUDE_DIR to a directory containing Eigen/Dense); building the PiPNN stub, whose builder always fails"
+         );
++        println!("cargo:rustc-cfg=pipnn_stub");
++        println!("cargo:rustc-env=LANCE_PIPNN_BUILD_FLAGS=unavailable (built without Eigen)");
++        return;
+     }
+     // Optional SVE object, selected at runtime from HWCAP; the baseline stays portable.
+     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+diff --git a/rust/lance-pipnn/src/lib.rs b/rust/lance-pipnn/src/lib.rs
+index 0fffdfd68..1fab16f4d 100644
+--- a/rust/lance-pipnn/src/lib.rs
++++ b/rust/lance-pipnn/src/lib.rs
+@@ -45,6 +45,7 @@ pub struct Graph {
+     pub stage_seconds: [f64; 5],
+ }
+ 
++#[cfg(not(pipnn_stub))]
+ unsafe extern "C" {
+     fn lance_pipnn_build(
+         points: *const f32,
+@@ -71,6 +72,73 @@ unsafe extern "C" {
+     ) -> i32;
+ }
+ 
++/// Stand-ins for the native bridge when the build script found no Eigen headers.
++/// The builder and leaf scan always fail with a message naming the missing headers.
++#[cfg(pipnn_stub)]
++#[allow(clippy::too_many_arguments)]
++mod stub {
++    use std::ffi::c_char;
++
++    use super::BuildParams;
++
++    const MISSING: &[u8] =
++        b"lance-pipnn was built without Eigen headers; set EIGEN_INCLUDE_DIR and rebuild\0";
++
++    pub unsafe fn lance_pipnn_build(
++        _points: *const f32,
++        _n: usize,
++        _dim: usize,
++        _params: *const BuildParams,
++        _adjacency: *mut u32,
++        _degrees: *mut u16,
++        _entry: *mut u32,
++        _times: *mut f64,
++        error: *mut c_char,
++        error_capacity: usize,
++    ) -> i32 {
++        let len = MISSING.len().min(error_capacity);
++        if len > 0 {
++            // SAFETY: the caller passes a writable buffer of `error_capacity` bytes;
++            // the last copied byte is forced to NUL.
++            unsafe {
++                std::ptr::copy_nonoverlapping(MISSING.as_ptr().cast::<c_char>(), error, len);
++                *error.add(len - 1) = 0;
++            }
++        }
++        3
++    }
++
++    pub unsafe fn lance_pipnn_kernel_name() -> *const c_char {
++        c"unavailable".as_ptr()
++    }
++
++    pub unsafe fn lance_pipnn_sqdist(a: *const f32, b: *const f32, d: usize) -> f32 {
++        // SAFETY: the caller guarantees both pointers address `d` floats.
++        let (a, b) = unsafe {
++            (
++                std::slice::from_raw_parts(a, d),
++                std::slice::from_raw_parts(b, d),
++            )
++        };
++        a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
++    }
++
++    pub unsafe fn lance_pipnn_leaf_knn(
++        _points: *const f32,
++        _m: usize,
++        _dim: usize,
++        _k: usize,
++        _simd: i32,
++        _ids: *mut u32,
++        _dists: *mut f32,
++    ) -> i32 {
++        3
++    }
++}
++
++#[cfg(pipnn_stub)]
++use stub::{lance_pipnn_build, lance_pipnn_kernel_name, lance_pipnn_leaf_knn, lance_pipnn_sqdist};
++
+ /// Distance kernel the native builder selected for this process (`"neon"`,
+ /// `"sve+neon"`, `"sse2"`, `"scalar"`, ...). `LANCE_PIPNN_SCALAR=1` set before
+ /// process start forces `"scalar"`, for kernel ablations.
+@@ -224,6 +292,7 @@ mod tests {
+     use super::*;
+ 
+     #[test]
++    #[cfg_attr(pipnn_stub, ignore = "built without Eigen")]
+     fn build_owns_edges_and_handles_small_inputs() {
+         let params = BuildParams {
+             leaf_size: 16,
+@@ -255,6 +324,7 @@ mod tests {
+     }
+ 
+     #[test]
++    #[cfg_attr(pipnn_stub, ignore = "built without Eigen")]
+     fn sqdist_matches_double_reference_at_every_tail() {
+         assert!(!kernel_name().is_empty());
+         for d in [0, 1, 3, 4, 7, 8, 9, 15, 16, 17, 31, 64, 100, 128, 129, 960] {
+@@ -275,6 +345,7 @@ mod tests {
+     }
+ 
+     #[test]
++    #[cfg_attr(pipnn_stub, ignore = "built without Eigen")]
+     fn vector_leaf_scan_matches_scalar_and_brute_force() {
+         // Random floats have no distance ties, so the lists are unique.
+         for (m, dim) in [(2, 3), (5, 8), (37, 16), (130, 128), (257, 33)] {
+-- 
+2.25.1
+

@@ -1,28 +1,93 @@
 # Lance index build experiments
 
-Implementation and benchmark workspace for [`LANCE_INDEX_BUILD_PLAN.md`](../LANCE_INDEX_BUILD_PLAN.md).
+Implementation and benchmark workspace for [`LANCE_INDEX_BUILD_PLAN.md`](../LANCE_INDEX_BUILD_PLAN.md):
+tree centroid assignment, PiPNN (centroid assigner and `IVF_PIPNN_FLAT` partition graphs) and
+the x86/ARM kernels they use, all inside Lance's IVF build pipeline.
 
-- `worktrees/lance/` — isolated Lance checkout (branch `index-build-tree-pipnn`, latest commit
-  `fcd378707`; base
-  `04e61996311dc9907b8b588cad2503a2b8213a08`) carrying all changes below.
-- `baseline/` — the user's pre-existing optimized IVF_RQ patch (`lance-existing.patch`,
-  SHA-256 `ffeb70a6…37e2`) and the original files it touches.
-- `configs/` — versioned experiment definitions (`KEY=value` env files).
-- `scripts/run.sh` — builds the runner and executes one config with provenance.
-- `results/<run-id>/` — `manifest.json`, `builds.jsonl`, `queries.csv`,
-  `assignments.jsonl`, `config.env`, `logs/`.
+## Reproduce on a new machine (x86_64 or aarch64)
+
+```bash
+git clone <this repo> anns && cd anns          # or: git pull
+./lance_index_build/bench.sh doctor            # CPU features (NEON/SVE/SVE2), toolchain, data
+./lance_index_build/bench.sh setup             # Lance = upstream base + patches/, Eigen & C++ deps
+./lance_index_build/bench.sh data              # BIGANN10M + GIST1M, verified by SHA-256
+./lance_index_build/bench.sh test              # kernel / tree / PiPNN / k-means correctness
+./lance_index_build/bench.sh kernels           # criterion microbenchmarks (+ no-SVE build on ARM)
+./lance_index_build/bench.sh suite smoke       # minutes: every backend end to end on 100k
+./lance_index_build/bench.sh suite A B C ablation
+./lance_index_build/bench.sh report            # summary.md + SVG plots per run
+# or everything in order:
+./lance_index_build/bench.sh all
+```
+
+Requirements: git, a C/C++ compiler (Clang ≥ 14 or GCC ≥ 11 for SVE intrinsics), cmake,
+python3, uv, curl and rustup (Lance pins Rust 1.98.1 in `rust-toolchain.toml`; `setup`
+installs it). Disk: ~13 GB raw data plus ingested Lance datasets and shuffle spill;
+Suite C at 10M needs tens of GB of RAM (run the 1M memory pilot first, as `suites/C.txt` does).
+
+What the pieces are:
+
+| Path | Content |
+|---|---|
+| `bench.sh` | single entry point (subcommands above) |
+| `patches/` | the Lance changes as a `git am` series on upstream `LANCE_BASE`; `SERIES.env` pins the base and the resulting tree hash, which `setup` verifies |
+| `worktrees/lance/` | generated checkout (git-ignored) |
+| `suites/*.txt` | one run per line: `<config> <run-name> [KEY=VALUE ...]` |
+| `configs/*.env` | versioned experiment definitions; paths come from `ANNS_DATA` / `DATASETS_DIR` |
+| `datasets.lock.json` | dataset sources, sizes and SHA-256 |
+| `scripts/run.sh` | builds the runner and executes one config with provenance |
+| `scripts/report.py` | summary tables and recall/latency/build-time plots |
+| `results/<arch>-<host>/<run>-<stamp>/` | `manifest.json` (git tree, patch hash, CPU features, **selected kernels**), `builds.jsonl`, `queries.csv`, `assignments.jsonl`, `logs/` (git-ignored) |
+| `baseline/` | the pre-existing optimized IVF_RQ patch and the files it touches |
+
+Every manifest records `kernels.{dot_tile, blocked_l2, pipnn}`, so an x86 and an ARM run
+are self-describing. Cross-machine timings are context, not speedup ratios (plan §5.5).
+
+### Kernel ablations
+
+| Switch | Effect | Kind |
+|---|---|---|
+| `LANCE_DISABLE_BLOCKED_L2=1` | exact assignment / k-means use per-vector distances instead of 4x4 tiles | runtime |
+| `LANCE_DISABLE_SVE_BUILD=1` | build without SVE objects (NEON on aarch64); `run.sh` uses `target-nosve/` | build |
+| `LANCE_PIPNN_SCALAR=1` | scalar PiPNN distance kernel and leaf top-k scan | runtime |
+| `LANCE_PIPNN_NATIVE=1` | compile the PiPNN builder with `-march=native` (label such runs) | build |
+
+`suites/ablation.txt` runs the default and each switched-off variant on identical configs.
+
+## ARM / x86 kernels
+
+All kernels sit behind Lance's CPU dispatcher (`lance_core::dispatch!`), select once per
+process, and keep a portable fallback; nothing is compiled with a global `-march`.
+
+| Kernel | Candidates | Used by |
+|---|---|---|
+| `lance_linalg::distance::tile::dot_tile` — 4x4 f32 dot-product tile | AVX-512, AVX2+FMA, **SVE**, **NEON**, scalar | `blocked_l2`: k-means training, hierarchical node k-means, exact IVF assignment |
+| f32 L2 batch, one query vs N rows | AVX(+FMA), **SVE 4-row** (bit-identical to the pair kernel), scalar | tree beam expansion (contiguous child blocks), per-vector k-means |
+| f32 / u8 pairwise L2 and dot, 4-bit LUT sums | existing AVX*, SVE/SVE2 (from `lance_arm_sve/`) | everything |
+| PiPNN `sqdist` | SSE2, **NEON**, **SVE** (HWCAP-detected), scalar | RobustPrune, medoid |
+| PiPNN leaf top-k scan | AVX-512 (`-march=native`), **NEON**, scalar | leaf k-NN |
+
+Blocked assignment ranks with `|x|^2 + |c|^2 - 2x.c` and re-scores near-ties exactly, so it
+returns the same centroid as the per-vector path except for > 4 candidates tied within f32
+rounding. The tree's children are stored contiguously (breadth-first numbering), so each
+expansion is one batch-kernel call.
+
+Correctness of the ARM paths was checked here by cross-compiling the Lance test binaries for
+`aarch64-unknown-linux-gnu` and running them under QEMU at SVE widths 128/256/512/2048 bits
+and with SVE disabled. QEMU proves correctness only; ARM performance needs `bench.sh
+kernels` and the suites on real hardware.
 
 ## Implementation status
 
 | Plan phase | State | Where |
 |---|---|---|
 | 0 Baseline | Done: worktree, patch hash, data hashes / GT layout validated | `baseline/`, plan §5.1 |
-| 1 Benchmark foundation | Runner done (GIST + BIGANN, seeds, stage spans, per-query timing, raw outputs, assignment-quality sampling); plots/report scripts pending | `rust/lance-index-bench` |
+| 1 Benchmark foundation | Done: runner (GIST + BIGANN, seeds, stage spans, per-query timing, raw outputs, assignment-quality sampling), `report.py`, `bench.sh` | `rust/lance-index-bench`, `bench.sh` |
 | 2 Retained hierarchy | Done; greedy/beam/exhaustive; parity tests | `lance-index/src/vector/assignment_tree.rs`, `kmeans.rs` |
 | 3 Tree training integration | Done for full-dataset assignment; refinement stays exact and refreshes routing centers | `lance/src/index/vector/ivf.rs`, `IvfBuildParams` |
 | 4 PiPNN centroid backend | Done (optional `pipnn` feature, C++ bridge, Rust beam search) | `rust/lance-pipnn`, `lance-index/src/vector/pipnn.rs` |
 | 5 PiPNN partition graphs | `IVF_PIPNN_FLAT` builds, persists, reopens and searches (float32 L2); remap / incremental / fresh-segment return `NotSupported`; Python bindings pending | `SubIndexType::Pipnn`, `StageParams::Pipnn`, `VectorIndexParams::ivf_pipnn` |
-| 6 ARM kernels | Existing SVE/SVE2 pairwise kernels ported with runtime dispatch; new P0 tiled routing / leaf kernels not started; no native ARM run yet | `lance-linalg/src/simd/{sve,sve2}.c` |
+| 6 ARM kernels | Done for P0/P1: dot tiles (NEON/SVE), SVE L2 batch, tree block routing, PiPNN NEON/SVE distance + NEON leaf scan; QEMU-verified; native ARM measurements pending | `lance-linalg/src/distance/tile.rs`, `simd/sve.c`, `lance-pipnn/cpp/kernels.h` |
 | 7 Full evaluation | Not started | `configs/suite*.env` |
 
 ### API added
@@ -42,30 +107,19 @@ lance_index::vector::ivf::PreparedAssignment::{prepare, assign}  // measurement 
 Explicit backends never silently fall back; `Auto` preserves Lance's existing behaviour
 (including its environment switches).
 
-## Build prerequisites
-
-- Rust 1.98.1 (pinned by Lance).
-- Eigen headers for the `pipnn` feature: `EIGEN_INCLUDE_DIR=…/anns/native/third_party/eigen`
-  (`scripts/run.sh` sets this).
-- The PiPNN C++ builder compiles with portable flags. `LANCE_PIPNN_NATIVE=1` adds
-  `-march=native` (enables the reference AVX-512 paths); every manifest records the
-  flags actually linked (`pipnn_native_flags`). Label such runs separately.
-- `protoc` is **not** installed. Lance's own dev-dependencies need it, so `cargo test -p lance`
-  and `cargo bench -p lance` fail. The runner is therefore a separate workspace crate
-  that depends only on library crates. `cargo test -p lance-index --features pipnn` works.
-
-## Running
+## Running single configs
 
 ```bash
 cd lance_index_build
-scripts/run.sh configs/smoke-bigann100k-assign.env           # fixed-model assignment smoke
-INDEX=ivf_hnsw_flat scripts/run.sh configs/smoke-bigann100k-graphs.env
-INDEX=ivf_pipnn_flat scripts/run.sh configs/smoke-bigann100k-graphs.env
+scripts/run.sh configs/smoke-bigann100k-assign.env                     # RUN_ID defaults to <config>-<stamp>
+scripts/run.sh configs/smoke-bigann100k-graphs.env my-run INDEX=ivf_pipnn_flat PIPNN_DEGREE=48
 ```
 
-Configs are `source`d after the shell environment, so a value set in the config wins;
-edit a copy for sweeps. Branch-default PiPNN `leaf_size=1024` must not be used for
-centroid graphs with K ≤ ~1024 (see Smoke results).
+`KEY=VALUE` arguments after the run id override the config and are saved in
+`overrides.env`; values in the config override the calling shell environment.
+Branch-default PiPNN `leaf_size=1024` must not be used for centroid graphs with
+K ≤ ~1024 (see Smoke results). `protoc` is not needed: the runner is a separate
+workspace crate depending only on library crates (`cargo test -p lance` does need it).
 
 Runner semantics (see the header of `rust/lance-index-bench/src/main.rs`):
 
@@ -119,13 +173,19 @@ commit → reopen → search path.
 
 ## Known gaps / next steps
 
-1. Run smoke configs, then Suite A/B pilots on x86 (plan §8 phases 3–4 exit conditions).
-2. 1M-scale memory pilot for `IVF_PIPNN_FLAT` before 10M Suite C (plan §6).
-3. Filtered search on PiPNN uses the prefilter mask during beam search; deletion/filter
-   recall tests in a full Lance dataset are still pending.
+1. Native ARM runs: `bench.sh all` on the Kunpeng host (kernels, smoke, A/B/C, ablation).
+   Nothing here is an ARM performance measurement yet.
+2. Full A/B/C evaluation with repeats on x86 (pilots exist under `results/`).
+3. PiPNN filtered search: below 10 % selectivity it scans allowed rows exactly; above, it
+   walks the graph under the mask. Deletion/filter recall tests on a full Lance dataset pending.
 4. Python bindings and index-inspection naming for `IVF_PIPNN_FLAT` (reported as generic
    `IndexType::Vector` today).
-5. New ARM kernels (P0 tiled L2 + fused argmin/top-k; leaf Gram tiles) and native ARM runs.
+5. `SubIndexType::Pipnn` is gated on `lance-index/pipnn` while `lance` matches it under its
+   own `pipnn` feature; enabling only the former in a downstream build breaks exhaustive
+   matches (enable both, as `lance-index-bench` does).
 6. Approximate assignment during global refinement (plan §3.2 step 3) is not implemented —
    refinement is exact; a tree-routed refinement must reject nonzero balance bias.
-7. Report/plot scripts over `builds.jsonl` / `queries.csv`.
+7. Not yet ARM-specialized: PiPNN leader-routing top-f selection (scalar), uint8 Gram tiles
+   for byte input (Lance uses float32), and the leaf/routing GEMMs (Eigen's own NEON
+   kernels). HashPrune hashing/lookup already has NEON. SME is out of scope until
+   hardware support is confirmed.

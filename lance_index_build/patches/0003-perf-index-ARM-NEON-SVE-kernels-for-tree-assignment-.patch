@@ -1,0 +1,2296 @@
+From c8eb0906e628521b36afae66cf66234452e958f4 Mon Sep 17 00:00:00 2001
+From: caokyhieu <caokyhieu253@gmail.com>
+Date: Sun, 8 Nov 2026 21:43:41 +0000
+Subject: [PATCH 3/4] perf(index): ARM NEON/SVE kernels for tree assignment,
+ blocked L2 and PiPNN
+
+- lance-linalg: new `distance::tile::dot_tile` 4x4 f32 dot-product tile behind
+  the CPU dispatcher (AVX-512, AVX2+FMA, SVE, NEON, scalar). The x86 tiles move
+  here from lance-index so every architecture shares one kernel boundary.
+- blocked_l2 (k-means training, hierarchical node k-means, exact assignment)
+  now uses the dispatched tile, so aarch64 no longer falls back to per-vector
+  distances. `LANCE_DISABLE_BLOCKED_L2` remains the ablation switch.
+- SVE L2 batch kernel scores four rows per pass sharing each query load; it is
+  bit-identical to the SVE pair kernel (tested).
+- AssignmentTree numbers nodes breadth-first so siblings are contiguous; each
+  expansion is one L2 batch call and leaf distances are not recomputed. The
+  reported distance is still the exact pairwise distance to the chosen leaf.
+- PiPNN builder: SIMD squared L2 (SSE2 / NEON / runtime-detected SVE) for
+  RobustPrune and the medoid, and a NEON port of the AVX-512 leaf top-k scan.
+  `lance_pipnn::kernel_name()` reports the selection; `LANCE_PIPNN_SCALAR=1`
+  forces scalar kernels. `leaf_knn` exposes the leaf k-NN for parity tests.
+- Benchmark manifests record the selected kernels; criterion `index_tiles`
+  microbenchmarks cover dims 100/128/131/960 and center blocks 4..64.
+- Lint cleanups in code from the previous commits (crate metadata, test
+  println, redundant visibility, runner clippy findings).
+
+Verified: x86 lance-index/linalg/pipnn suites; aarch64 cross-build under QEMU
+at SVE 128/256/512/2048 bits and with SVE disabled.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ rust/lance-index-bench/Cargo.toml             |   4 +
+ rust/lance-index-bench/README.md              |   5 +
+ rust/lance-index-bench/src/main.rs            | 125 ++++--
+ rust/lance-index/src/vector.rs                |   2 +
+ .../lance-index/src/vector/assignment_tree.rs | 114 ++++--
+ rust/lance-index/src/vector/blocked_l2.rs     | 234 ++---------
+ rust/lance-index/src/vector/pipnn.rs          |  50 ++-
+ rust/lance-linalg/benches/arm_kernels.rs      |  43 ++-
+ rust/lance-linalg/src/distance.rs             |   1 +
+ rust/lance-linalg/src/distance/l2.rs          |  40 +-
+ rust/lance-linalg/src/distance/tile.rs        | 365 ++++++++++++++++++
+ rust/lance-linalg/src/simd/arm.rs             |  13 +
+ rust/lance-linalg/src/simd/sve.c              |  98 +++++
+ rust/lance-pipnn/Cargo.toml                   |   4 +
+ rust/lance-pipnn/README.md                    |  10 +
+ rust/lance-pipnn/build.rs                     |  40 +-
+ rust/lance-pipnn/cpp/bridge.cpp               |  34 ++
+ rust/lance-pipnn/cpp/fastpipnn.hpp            | 143 +++++--
+ rust/lance-pipnn/cpp/kernels.h                | 114 ++++++
+ rust/lance-pipnn/cpp/kernels_sve.c            |  26 ++
+ rust/lance-pipnn/src/lib.rs                   | 132 +++++++
+ rust/lance/src/index/loading.rs               |  26 +-
+ rust/lance/src/index/vector/builder.rs        |  12 +-
+ 23 files changed, 1283 insertions(+), 352 deletions(-)
+ create mode 100644 rust/lance-index-bench/README.md
+ create mode 100644 rust/lance-linalg/src/distance/tile.rs
+ create mode 100644 rust/lance-pipnn/README.md
+ create mode 100644 rust/lance-pipnn/cpp/kernels.h
+ create mode 100644 rust/lance-pipnn/cpp/kernels_sve.c
+
+diff --git a/rust/lance-index-bench/Cargo.toml b/rust/lance-index-bench/Cargo.toml
+index 65708841e..39deb06a1 100644
+--- a/rust/lance-index-bench/Cargo.toml
++++ b/rust/lance-index-bench/Cargo.toml
+@@ -4,6 +4,10 @@ version.workspace = true
+ edition.workspace = true
+ license.workspace = true
+ rust-version.workspace = true
++repository.workspace = true
++readme = "README.md"
++keywords.workspace = true
++categories.workspace = true
+ publish = false
+ description = "Index-build benchmark runner (tree / PiPNN assignment, partition graphs)"
+ 
+diff --git a/rust/lance-index-bench/README.md b/rust/lance-index-bench/README.md
+new file mode 100644
+index 000000000..21610d52d
+--- /dev/null
++++ b/rust/lance-index-bench/README.md
+@@ -0,0 +1,5 @@
++# lance-index-bench
++
++Benchmark runner for Lance index build experiments (tree / PiPNN centroid
++assignment and partition graphs). Configuration is read from environment
++variables; see the module docs in `src/main.rs`. Not published.
+diff --git a/rust/lance-index-bench/src/main.rs b/rust/lance-index-bench/src/main.rs
+index 03df774f1..2288d7c3f 100644
+--- a/rust/lance-index-bench/src/main.rs
++++ b/rust/lance-index-bench/src/main.rs
+@@ -38,7 +38,7 @@ use arrow_array::types::Int32Type;
+ use arrow_array::{
+     Array, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
+ };
+-use arrow_schema::{ArrowError, DataType, Field, Schema as ArrowSchema};
++use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+ use async_trait::async_trait;
+ use futures::TryStreamExt;
+ use lance::dataset::{Dataset, WriteMode, WriteParams};
+@@ -112,8 +112,10 @@ struct Truth {
+ fn read_f32_matrix(path: &Path, dim: usize) -> Matrix {
+     let bytes = read_bytes(path);
+     let values: Vec<f32> = bytes
+-        .chunks_exact(4)
+-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
++        .as_chunks::<4>()
++        .0
++        .iter()
++        .map(|b| f32::from_le_bytes(*b))
+         .collect();
+     let rows = values.len() / dim;
+     Matrix { values, rows, dim }
+@@ -142,8 +144,17 @@ fn read_ibin_truth(path: &Path, queries: usize) -> Truth {
+     let nq = le_u32(&bytes[..4]) as usize;
+     let k = le_u32(&bytes[4..8]) as usize;
+     assert_eq!(nq, queries, "ground truth query count");
+-    assert_eq!(bytes.len(), 8 + nq * k * 8, "ibin must hold ids then distances");
+-    let ids = bytes[8..8 + nq * k * 4].chunks_exact(4).map(le_u32).collect();
++    assert_eq!(
++        bytes.len(),
++        8 + nq * k * 8,
++        "ibin must hold ids then distances"
++    );
++    let ids = bytes[8..8 + nq * k * 4]
++        .as_chunks::<4>()
++        .0
++        .iter()
++        .map(|b| u32::from_le_bytes(*b))
++        .collect();
+     Truth { ids, k }
+ }
+ 
+@@ -176,7 +187,10 @@ fn load_data(kind: &str, dir: &Path, limit: Option<usize>) -> Data {
+     let (base, queries, truth) = match kind {
+         "gist" => {
+             let meta = std::fs::read_to_string(dir.join("meta.txt")).unwrap();
+-            let meta: Vec<usize> = meta.split_whitespace().map(|v| v.parse().unwrap()).collect();
++            let meta: Vec<usize> = meta
++                .split_whitespace()
++                .map(|v| v.parse().unwrap())
++                .collect();
+             let (n, dim, nq, gt_k) = (meta[0], meta[1], meta[2], meta[3]);
+             let mut base = read_f32_matrix(&dir.join("base.f32"), dim);
+             assert_eq!(base.rows, n, "GIST base rows");
+@@ -187,7 +201,12 @@ fn load_data(kind: &str, dir: &Path, limit: Option<usize>) -> Data {
+             let queries = read_f32_matrix(&dir.join("query.f32"), dim);
+             assert_eq!(queries.rows, nq, "GIST query rows");
+             let gt = read_bytes(&dir.join("gt.i32"));
+-            let ids: Vec<u32> = gt.chunks_exact(4).map(le_u32).collect();
++            let ids: Vec<u32> = gt
++                .as_chunks::<4>()
++                .0
++                .iter()
++                .map(|b| u32::from_le_bytes(*b))
++                .collect();
+             assert_eq!(ids.len(), nq * gt_k, "GIST ground truth size");
+             (base, queries, Truth { ids, k: gt_k })
+         }
+@@ -246,10 +265,7 @@ async fn write_dataset(base: &Matrix, uri: &str) {
+         let ids = Int32Array::from_iter_values(start as i32..end as i32);
+         let values = Float32Array::from(base.values[start * base.dim..end * base.dim].to_vec());
+         let fsl = FixedSizeListArray::try_new_from_values(values, base.dim as i32)?;
+-        Ok::<_, ArrowError>(RecordBatch::try_new(
+-            s.clone(),
+-            vec![Arc::new(ids), Arc::new(fsl)],
+-        )?)
++        RecordBatch::try_new(s.clone(), vec![Arc::new(ids), Arc::new(fsl)])
+     });
+     let batches: Vec<_> = batches.collect();
+     let reader = RecordBatchIterator::new(batches, schema);
+@@ -350,6 +366,17 @@ fn pipnn_params() -> lance_index::vector::pipnn::PipnnBuildParams {
+     }
+ }
+ 
++fn pipnn_kernel() -> Option<&'static str> {
++    #[cfg(feature = "pipnn")]
++    {
++        Some(lance_index::vector::pipnn::native_kernel_name())
++    }
++    #[cfg(not(feature = "pipnn"))]
++    {
++        None
++    }
++}
++
+ fn pipnn_flags() -> Option<&'static str> {
+     #[cfg(feature = "pipnn")]
+     {
+@@ -421,7 +448,7 @@ fn splitmix(mut x: u64) -> u64 {
+ 
+ /// Deterministic 20% tuning / 80% final split, independent of the build seed.
+ fn is_tuning_query(id: usize) -> bool {
+-    splitmix(id as u64 ^ 0x7475_6e65) % 5 == 0
++    splitmix(id as u64 ^ 0x7475_6e65).is_multiple_of(5)
+ }
+ 
+ fn peak_rss_reset() {
+@@ -556,6 +583,11 @@ fn manifest(data: &Data, kind: &str, run_dir: &Path) -> Value {
+         "logical_cpus": std::thread::available_parallelism().map_or(0, |n| n.get()),
+         "pipnn_feature": cfg!(feature = "pipnn"),
+         "pipnn_native_flags": pipnn_flags(),
++        "kernels": {
++            "dot_tile": lance_linalg::distance::tile::dot_tile_kernel_name(),
++            "blocked_l2": lance_index::vector::blocked_l2_kernel_name(),
++            "pipnn": pipnn_kernel(),
++        },
+         "dataset": kind,
+         "base_rows": data.base.rows,
+         "dim": data.base.dim,
+@@ -583,7 +615,11 @@ async fn assignment_quality(
+         ids.swap(i, j);
+     }
+     ids.truncate(sample);
+-    let values: Vec<f32> = ids.iter().flat_map(|&i| data.base.row(i)).copied().collect();
++    let values: Vec<f32> = ids
++        .iter()
++        .flat_map(|&i| data.base.row(i))
++        .copied()
++        .collect();
+     let vectors =
+         FixedSizeListArray::try_new_from_values(Float32Array::from(values), data.base.dim as i32)
+             .unwrap();
+@@ -611,16 +647,17 @@ async fn assignment_quality(
+     let (_, exact_secs, exact_ids, exact_d, _) =
+         run(CentroidAssignment::Exact).await.unwrap().unwrap();
+     for spec in specs {
+-        let (prepare, assign, got_ids, got_d, graph) = match run(parse_assignment(spec)).await.unwrap() {
+-            Ok(r) => r,
+-            Err(e) => {
+-                Output::line(
+-                    &out.assignments,
+-                    &json!({"assign": spec, "status": "error", "error": e.to_string()}),
+-                );
+-                continue;
+-            }
+-        };
++        let (prepare, assign, got_ids, got_d, graph) =
++            match run(parse_assignment(spec)).await.unwrap() {
++                Ok(r) => r,
++                Err(e) => {
++                    Output::line(
++                        &out.assignments,
++                        &json!({"assign": spec, "status": "error", "error": e.to_string()}),
++                    );
++                    continue;
++                }
++            };
+         let mut id_agree = 0usize;
+         let mut dist_agree = 0usize;
+         let mut unassigned = 0usize;
+@@ -721,7 +758,12 @@ async fn run_query(
+     if let Some(ef) = ef {
+         scan.ef(ef);
+     }
+-    scan.try_into_stream().await.unwrap().try_collect().await.unwrap()
++    scan.try_into_stream()
++        .await
++        .unwrap()
++        .try_collect()
++        .await
++        .unwrap()
+ }
+ 
+ #[allow(clippy::too_many_arguments)]
+@@ -741,7 +783,10 @@ async fn evaluate(
+         .filter(|&n| n <= num_partitions)
+         .collect();
+     let efs: Vec<Option<usize>> = if graph {
+-        env_list("EFS", "32,64,128,256,512").into_iter().map(Some).collect()
++        env_list("EFS", "32,64,128,256,512")
++            .into_iter()
++            .map(Some)
++            .collect()
+     } else {
+         vec![None]
+     };
+@@ -796,7 +841,11 @@ async fn evaluate(
+                         returned.len()
+                     ));
+                 }
+-                out.queries.lock().unwrap().write_all(rows.as_bytes()).unwrap();
++                out.queries
++                    .lock()
++                    .unwrap()
++                    .write_all(rows.as_bytes())
++                    .unwrap();
+                 let recall = hits_total as f64 / (plan.ids.len() * truth_k) as f64;
+                 let mean = latencies.iter().sum::<f64>() / latencies.len() as f64;
+                 latencies.sort_by(f64::total_cmp);
+@@ -843,7 +892,9 @@ async fn main() {
+         )
+     }));
+     // Fail fast on malformed configurations before loading data.
+-    specs.iter().for_each(|s| drop(parse_assignment(s)));
++    for spec in &specs {
++        parse_assignment(spec);
++    }
+     let _ = index_params(&index_kind, IvfBuildParams::default());
+     assert!(
+         matches!(mode.as_str(), "complete" | "fixed"),
+@@ -863,7 +914,10 @@ async fn main() {
+     if !Path::new(&uri).exists() {
+         let t = Instant::now();
+         write_dataset(&data.base, &uri).await;
+-        println!("ingested dataset in {:.1}s (untimed)", t.elapsed().as_secs_f64());
++        println!(
++            "ingested dataset in {:.1}s (untimed)",
++            t.elapsed().as_secs_f64()
++        );
+     }
+     if std::env::var("INGEST_ONLY").is_ok() {
+         println!("INGEST_ONLY set: dataset ready at {uri}");
+@@ -945,7 +999,10 @@ async fn main() {
+             }
+             let params = index_params(&index_kind, ivf);
+             let build_id = format!("{index_kind}-{mode}-{spec}-r{repeat}");
+-            println!("[{build_id}] building on {}x{}", data.base.rows, data.base.dim);
++            println!(
++                "[{build_id}] building on {}x{}",
++                data.base.rows, data.base.dim
++            );
+             let timer = Arc::new(StageTimer::default());
+             let rss_before = current_rss_bytes();
+             peak_rss_reset();
+@@ -999,7 +1056,11 @@ async fn main() {
+                 .into_iter()
+                 .next()
+                 .expect("committed index");
+-            let bytes = dir_bytes(&Path::new(&uri).join("_indices").join(index.uuid.to_string()));
++            let bytes = dir_bytes(
++                &Path::new(&uri)
++                    .join("_indices")
++                    .join(index.uuid.to_string()),
++            );
+             row["status"] = json!("ok");
+             row["index_bytes"] = json!(bytes);
+             // Lance may cap the requested partition count on small datasets; record
+@@ -1008,7 +1069,9 @@ async fn main() {
+                 let parsed: Value = serde_json::from_str(&stats).unwrap_or(Value::Null);
+                 row["actual_num_partitions"] = find_key(&parsed, "num_partitions");
+                 let _ = std::fs::write(
+-                    run_dir.join("logs").join(format!("index_stats-{build_id}.json")),
++                    run_dir
++                        .join("logs")
++                        .join(format!("index_stats-{build_id}.json")),
+                     stats,
+                 );
+             }
+diff --git a/rust/lance-index/src/vector.rs b/rust/lance-index/src/vector.rs
+index ebe492035..fa218f1d4 100644
+--- a/rust/lance-index/src/vector.rs
++++ b/rust/lance-index/src/vector.rs
+@@ -28,6 +28,8 @@ use v3::subindex::SubIndexType;
+ 
+ pub mod assignment_tree;
+ pub(crate) mod blocked_l2;
++/// Tile kernel used by exact blocked L2 assignment (`None`: per-vector path).
++pub use blocked_l2::kernel_name as blocked_l2_kernel_name;
+ pub mod bq;
+ pub mod distributed;
+ pub(crate) mod exact_buffers;
+diff --git a/rust/lance-index/src/vector/assignment_tree.rs b/rust/lance-index/src/vector/assignment_tree.rs
+index 1a1451385..c73d6d944 100644
+--- a/rust/lance-index/src/vector/assignment_tree.rs
++++ b/rust/lance-index/src/vector/assignment_tree.rs
+@@ -2,11 +2,17 @@
+ // SPDX-FileCopyrightText: Copyright The Lance Authors
+ 
+ //! Build-only routing tree retained from hierarchical k-means.
++//!
++//! Nodes are numbered breadth-first, so the children of every internal node
++//! are one contiguous block of centers. Expanding a node is a single call to
++//! the dispatched f32 L2 batch kernel (SVE, AVX+FMA, ...) over that block
++//! instead of one pairwise call per child.
+ 
+-use std::collections::BTreeMap;
++use std::collections::{BTreeMap, VecDeque};
+ 
+ use lance_core::deepsize::DeepSizeOf;
+ use lance_core::{Error, Result};
++use lance_linalg::distance::L2;
+ use lance_linalg::distance::l2::l2;
+ use rayon::prelude::*;
+ 
+@@ -18,8 +24,11 @@ use rayon::prelude::*;
+ #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+ pub struct AssignmentTree {
+     dimension: usize,
++    /// Node centers in breadth-first order; leaf centers equal their centroid.
+     centers: Vec<f32>,
+-    children: Vec<Vec<usize>>,
++    /// Children of node `v` are nodes `child_offsets[v]..child_offsets[v + 1]`.
++    child_offsets: Vec<u32>,
++    /// IVF partition of each leaf node; `None` for internal nodes.
+     partitions: Vec<Option<u32>>,
+     paths: Vec<Vec<usize>>,
+     weights: Vec<usize>,
+@@ -35,8 +44,9 @@ struct RoutingNode {
+ 
+ #[derive(Default)]
+ struct SearchScratch {
+-    frontier: Vec<(f32, usize)>,
+-    candidates: Vec<(f32, usize)>,
++    frontier: Vec<(f32, u32)>,
++    candidates: Vec<(f32, u32)>,
++    distances: Vec<f32>,
+ }
+ 
+ impl AssignmentTree {
+@@ -54,9 +64,12 @@ impl AssignmentTree {
+             || weights.contains(&0)
+             || centroids.iter().any(|v| !v.is_finite())
+         {
+-            return Err(Error::invalid_input(
+-                "assignment tree requires finite centroids, nonzero dimension and positive leaf weights",
+-            ));
++            return Err(Error::invalid_input(format!(
++                "assignment tree requires finite centroids, nonzero dimension and positive leaf weights; got dimension={dimension}, paths={}, centroid values={}, weights={}",
++                paths.len(),
++                centroids.len(),
++                weights.len()
++            )));
+         }
+         let mut nodes = vec![RoutingNode::default()];
+         for (partition, path) in paths.iter().enumerate() {
+@@ -64,9 +77,9 @@ impl AssignmentTree {
+             let mut ancestors = vec![0];
+             for &label in path {
+                 if nodes[node].partition.is_some() {
+-                    return Err(Error::invalid_input(
+-                        "assignment tree paths must be prefix-free",
+-                    ));
++                    return Err(Error::invalid_input(format!(
++                        "assignment tree paths must be prefix-free; path of partition {partition} passes through a leaf"
++                    )));
+                 }
+                 node = if let Some(&child) = nodes[node].children.get(&label) {
+                     child
+@@ -79,9 +92,9 @@ impl AssignmentTree {
+                 ancestors.push(node);
+             }
+             if nodes[node].partition.is_some() || !nodes[node].children.is_empty() {
+-                return Err(Error::invalid_input(
+-                    "assignment tree paths must be unique and prefix-free",
+-                ));
++                return Err(Error::invalid_input(format!(
++                    "assignment tree paths must be unique and prefix-free; partition {partition} collides"
++                )));
+             }
+             nodes[node].partition = Some(partition as u32);
+             let center = &centroids[partition * dimension..(partition + 1) * dimension];
+@@ -93,10 +106,22 @@ impl AssignmentTree {
+                 }
+             }
+         }
++        // Breadth-first renumbering keeps siblings adjacent.
++        let mut order = Vec::with_capacity(nodes.len());
++        let mut queue = VecDeque::from([0usize]);
++        let mut child_offsets = Vec::with_capacity(nodes.len() + 1);
++        let mut next_child = 1u32;
++        while let Some(node) = queue.pop_front() {
++            order.push(node);
++            child_offsets.push(next_child);
++            next_child += nodes[node].children.len() as u32;
++            queue.extend(nodes[node].children.values().copied());
++        }
++        child_offsets.push(next_child);
+         let mut centers = Vec::with_capacity(nodes.len() * dimension);
+-        let mut children = Vec::with_capacity(nodes.len());
+         let mut partitions = Vec::with_capacity(nodes.len());
+-        for node in nodes {
++        for &node in &order {
++            let node = &nodes[node];
+             // Keep leaf coordinates bit-identical to the original centroid table.
+             if let Some(partition) = node.partition {
+                 let start = partition as usize * dimension;
+@@ -104,13 +129,12 @@ impl AssignmentTree {
+             } else {
+                 centers.extend(node.sum.iter().map(|sum| (sum / node.weight) as f32));
+             }
+-            children.push(node.children.into_values().collect());
+             partitions.push(node.partition);
+         }
+         Ok(Self {
+             dimension,
+             centers,
+-            children,
++            child_offsets,
+             partitions,
+             paths,
+             weights,
+@@ -139,8 +163,7 @@ impl AssignmentTree {
+             && self.partitions.iter().enumerate().all(|(node, partition)| {
+                 partition.is_none_or(|partition| {
+                     let start = partition as usize * dimension;
+-                    self.centers[node * dimension..(node + 1) * dimension]
+-                        == centroids[start..start + dimension]
++                    self.center(node as u32) == &centroids[start..start + dimension]
+                 })
+             })
+     }
+@@ -149,7 +172,8 @@ impl AssignmentTree {
+     ///
+     /// A beam of one is greedy. A beam at least as wide as the number of leaves
+     /// visits every leaf. Returned distances are squared L2 to the selected leaf,
+-    /// with the lowest partition ID winning ties. Nonfinite rows are unassigned.
++    /// computed with the pairwise kernel used by exact assignment, with the
++    /// lowest partition ID winning ties. Nonfinite rows are unassigned.
+     pub fn assign(&self, vectors: &[f32], beam: usize) -> Result<Vec<Option<(u32, f32)>>> {
+         if beam == 0 || !vectors.len().is_multiple_of(self.dimension) {
+             return Err(Error::invalid_input(format!(
+@@ -166,6 +190,11 @@ impl AssignmentTree {
+             .collect())
+     }
+ 
++    fn center(&self, node: u32) -> &[f32] {
++        let start = node as usize * self.dimension;
++        &self.centers[start..start + self.dimension]
++    }
++
+     fn search(
+         &self,
+         query: &[f32],
+@@ -176,41 +205,46 @@ impl AssignmentTree {
+             return None;
+         }
+         scratch.frontier.clear();
++        // The root distance is never compared: it is either expanded or, for a
++        // single-centroid tree, the only leaf and recomputed below.
+         scratch.frontier.push((0.0, 0));
+-        let mut best: Option<(u32, f32)> = None;
++        // (partition, routing distance, leaf node)
++        let mut best: Option<(u32, f32, u32)> = None;
+         while !scratch.frontier.is_empty() {
+             scratch.candidates.clear();
+-            for &(_, node) in &scratch.frontier {
+-                if let Some(partition) = self.partitions[node] {
+-                    let distance = l2(
+-                        query,
+-                        &self.centers[node * self.dimension..(node + 1) * self.dimension],
+-                    );
++            for &(distance, node) in &scratch.frontier {
++                if let Some(partition) = self.partitions[node as usize] {
++                    // A leaf's routing distance is its exact distance under the
++                    // batch kernel, computed when its parent was expanded.
+                     if !distance.is_nan()
+-                        && best
+-                            .is_none_or(|(id, d)| distance < d || (distance == d && partition < id))
++                        && best.is_none_or(|(id, d, _)| {
++                            distance < d || (distance == d && partition < id)
++                        })
+                     {
+-                        best = Some((partition, distance));
++                        best = Some((partition, distance, node));
+                     }
+                 } else {
+-                    for &child in &self.children[node] {
+-                        let distance = l2(
+-                            query,
+-                            &self.centers[child * self.dimension..(child + 1) * self.dimension],
+-                        );
+-                        scratch.candidates.push((distance, child));
+-                    }
++                    let first = self.child_offsets[node as usize];
++                    let last = self.child_offsets[node as usize + 1];
++                    let block = &self.centers
++                        [first as usize * self.dimension..last as usize * self.dimension];
++                    scratch.distances.resize((last - first) as usize, 0.0);
++                    f32::l2_batch_into(query, block, self.dimension, &mut scratch.distances);
++                    scratch
++                        .candidates
++                        .extend(scratch.distances.iter().copied().zip(first..last));
+                 }
+             }
+-            let compare =
+-                |a: &(f32, usize), b: &(f32, usize)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
++            let compare = |a: &(f32, u32), b: &(f32, u32)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
+             if scratch.candidates.len() > beam {
+                 scratch.candidates.select_nth_unstable_by(beam, compare);
+                 scratch.candidates.truncate(beam);
+             }
+             std::mem::swap(&mut scratch.frontier, &mut scratch.candidates);
+         }
+-        best
++        // Report the same distance an exact assignment would (the pairwise kernel
++        // can differ from the batch kernel in the last bits on some hosts).
++        best.map(|(partition, _, node)| (partition, l2(query, self.center(node))))
+     }
+ }
+ 
+diff --git a/rust/lance-index/src/vector/blocked_l2.rs b/rust/lance-index/src/vector/blocked_l2.rs
+index a33b3d51c..a0c557e55 100644
+--- a/rust/lance-index/src/vector/blocked_l2.rs
++++ b/rust/lance-index/src/vector/blocked_l2.rs
+@@ -20,61 +20,55 @@
+ //! the strictly smallest `dist + bias` wins, and a row whose distances are all
+ //! NaN gets `None`. Near-ties can resolve differently from the per-vector
+ //! kernel because the dot products are summed in a different order.
++//!
++//! The 4x4 tile kernel is [`lance_linalg::distance::tile::dot_tile`]
++//! (AVX-512 / AVX2+FMA on x86_64, SVE / NEON on aarch64). Hosts where only the
++//! portable tile exists keep the per-vector path.
+ 
+ use std::sync::LazyLock;
+ 
+ use lance_linalg::distance::L2;
++use lance_linalg::distance::tile::{
++    DotTile, TILE_COLS as NR, TILE_ROWS as MR, dot_tile, dot_tile_is_accelerated,
++    dot_tile_kernel_name,
++};
+ use rayon::prelude::*;
+ 
+-const MR: usize = 4;
+-const NR: usize = 4;
+ const ROW_BLOCK: usize = 64;
+ /// Target bytes for one centroid tile; sized to stay resident in L2 next to a
+ /// row block of similar size.
+ const TILE_BYTES: usize = 256 * 1024;
+ /// Below these sizes the per-vector kernel is already cache resident.
+-pub(crate) const MIN_DIMENSION: usize = 32;
+-pub(crate) const MIN_CENTROIDS: usize = 8;
+-
+-#[derive(Clone, Copy)]
+-enum Kernel {
+-    #[cfg(target_arch = "x86_64")]
+-    Avx512,
+-    #[cfg(target_arch = "x86_64")]
+-    Avx2,
+-}
++pub const MIN_DIMENSION: usize = 32;
++pub const MIN_CENTROIDS: usize = 8;
+ 
+-static KERNEL: LazyLock<Option<Kernel>> = LazyLock::new(|| {
+-    if std::env::var_os("LANCE_DISABLE_BLOCKED_L2").is_some() {
+-        return None;
+-    }
+-    #[cfg(target_arch = "x86_64")]
+-    {
+-        if std::arch::is_x86_feature_detected!("avx512f") {
+-            return Some(Kernel::Avx512);
+-        }
+-        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+-        {
+-            return Some(Kernel::Avx2);
+-        }
+-    }
+-    None
++/// `LANCE_DISABLE_BLOCKED_L2` is the kill switch / ablation for this path.
++static ENABLED: LazyLock<bool> = LazyLock::new(|| {
++    std::env::var_os("LANCE_DISABLE_BLOCKED_L2").is_none() && dot_tile_is_accelerated()
+ });
+ 
++/// Tile kernel used by blocked assignment on this host, or `None` when the
++/// per-vector path is used for every shape. Recorded in benchmark manifests.
++pub fn kernel_name() -> Option<&'static str> {
++    ENABLED.then(dot_tile_kernel_name)
++}
++
+ /// Whether the blocked path will be used for this shape.
+-pub(crate) fn applies(num_centroids: usize, dimension: usize) -> bool {
+-    KERNEL.is_some() && dimension >= MIN_DIMENSION && num_centroids >= MIN_CENTROIDS
++pub fn applies(num_centroids: usize, dimension: usize) -> bool {
++    *ENABLED && dimension >= MIN_DIMENSION && num_centroids >= MIN_CENTROIDS
+ }
+ 
+ /// Exact nearest centroid (with optional additive per-centroid bias) for each
+-/// row of `data`. Returns `None` when no SIMD kernel is available.
+-pub(crate) fn l2_argmin(
++/// row of `data`. Returns `None` when the blocked path is disabled.
++pub fn l2_argmin(
+     centroids: &[f32],
+     data: &[f32],
+     dimension: usize,
+     biases: Option<&[f32]>,
+ ) -> Option<Vec<Option<(u32, f32)>>> {
+-    let kernel = (*KERNEL)?;
++    if !*ENABLED {
++        return None;
++    }
+     let k = centroids.len() / dimension;
+     debug_assert_eq!(centroids.len(), k * dimension);
+     debug_assert_eq!(data.len() % dimension, 0);
+@@ -105,24 +99,17 @@ pub(crate) fn l2_argmin(
+                     .collect();
+                 let mut best_score = vec![f32::INFINITY; n];
+                 let mut best_idx: Vec<Option<u32>> = vec![None; n];
+-                let mut out = [0.0f32; MR * NR];
++                let mut out: DotTile = [0.0; MR * NR];
+                 for tile_start in (0..k_pad).step_by(tile) {
+                     let tile_end = (tile_start + tile).min(k_pad);
+                     for r in (0..n_pad).step_by(MR) {
+                         for j in (tile_start..tile_end).step_by(NR) {
+-                            // SAFETY: rows r..r+MR and centroids j..j+NR are in
+-                            // bounds of the padded buffers, and the kernel was
+-                            // chosen by runtime feature detection.
+-                            unsafe {
+-                                let x = xbuf.as_ptr().add(r * dimension);
+-                                let c = padded.as_ptr().add(j * dimension);
+-                                match kernel {
+-                                    #[cfg(target_arch = "x86_64")]
+-                                    Kernel::Avx512 => x86::tile_avx512(x, c, dimension, &mut out),
+-                                    #[cfg(target_arch = "x86_64")]
+-                                    Kernel::Avx2 => x86::tile_avx2(x, c, dimension, &mut out),
+-                                }
+-                            }
++                            dot_tile(
++                                &xbuf[r * dimension..(r + MR) * dimension],
++                                &padded[j * dimension..(j + NR) * dimension],
++                                dimension,
++                                &mut out,
++                            );
+                             for a in 0..MR {
+                                 let row = r + a;
+                                 if row >= n {
+@@ -169,161 +156,6 @@ pub(crate) fn l2_argmin(
+     Some(results)
+ }
+ 
+-#[cfg(target_arch = "x86_64")]
+-mod x86 {
+-    use std::arch::x86_64::*;
+-
+-    use super::{MR, NR};
+-
+-    /// `out[a * NR + b] = dot(x[a], c[b])` for a 4x4 tile.
+-    #[target_feature(enable = "avx512f")]
+-    pub(super) unsafe fn tile_avx512(
+-        x: *const f32,
+-        c: *const f32,
+-        dim: usize,
+-        out: &mut [f32; MR * NR],
+-    ) {
+-        unsafe {
+-            let (x0, x1, x2, x3) = (x, x.add(dim), x.add(2 * dim), x.add(3 * dim));
+-            let (c0, c1, c2, c3) = (c, c.add(dim), c.add(2 * dim), c.add(3 * dim));
+-            let mut a00 = _mm512_setzero_ps();
+-            let mut a01 = _mm512_setzero_ps();
+-            let mut a02 = _mm512_setzero_ps();
+-            let mut a03 = _mm512_setzero_ps();
+-            let mut a10 = _mm512_setzero_ps();
+-            let mut a11 = _mm512_setzero_ps();
+-            let mut a12 = _mm512_setzero_ps();
+-            let mut a13 = _mm512_setzero_ps();
+-            let mut a20 = _mm512_setzero_ps();
+-            let mut a21 = _mm512_setzero_ps();
+-            let mut a22 = _mm512_setzero_ps();
+-            let mut a23 = _mm512_setzero_ps();
+-            let mut a30 = _mm512_setzero_ps();
+-            let mut a31 = _mm512_setzero_ps();
+-            let mut a32 = _mm512_setzero_ps();
+-            let mut a33 = _mm512_setzero_ps();
+-            let full = dim / 16 * 16;
+-            let mut d = 0;
+-            while d < full {
+-                let v0 = _mm512_loadu_ps(x0.add(d));
+-                let v1 = _mm512_loadu_ps(x1.add(d));
+-                let v2 = _mm512_loadu_ps(x2.add(d));
+-                let v3 = _mm512_loadu_ps(x3.add(d));
+-                let w = _mm512_loadu_ps(c0.add(d));
+-                a00 = _mm512_fmadd_ps(v0, w, a00);
+-                a10 = _mm512_fmadd_ps(v1, w, a10);
+-                a20 = _mm512_fmadd_ps(v2, w, a20);
+-                a30 = _mm512_fmadd_ps(v3, w, a30);
+-                let w = _mm512_loadu_ps(c1.add(d));
+-                a01 = _mm512_fmadd_ps(v0, w, a01);
+-                a11 = _mm512_fmadd_ps(v1, w, a11);
+-                a21 = _mm512_fmadd_ps(v2, w, a21);
+-                a31 = _mm512_fmadd_ps(v3, w, a31);
+-                let w = _mm512_loadu_ps(c2.add(d));
+-                a02 = _mm512_fmadd_ps(v0, w, a02);
+-                a12 = _mm512_fmadd_ps(v1, w, a12);
+-                a22 = _mm512_fmadd_ps(v2, w, a22);
+-                a32 = _mm512_fmadd_ps(v3, w, a32);
+-                let w = _mm512_loadu_ps(c3.add(d));
+-                a03 = _mm512_fmadd_ps(v0, w, a03);
+-                a13 = _mm512_fmadd_ps(v1, w, a13);
+-                a23 = _mm512_fmadd_ps(v2, w, a23);
+-                a33 = _mm512_fmadd_ps(v3, w, a33);
+-                d += 16;
+-            }
+-            let acc = [
+-                a00, a01, a02, a03, a10, a11, a12, a13, a20, a21, a22, a23, a30, a31, a32, a33,
+-            ];
+-            for (o, a) in out.iter_mut().zip(acc) {
+-                *o = _mm512_reduce_add_ps(a);
+-            }
+-            tail(x, c, dim, full, out);
+-        }
+-    }
+-
+-    #[inline]
+-    #[target_feature(enable = "avx2,fma")]
+-    unsafe fn hsum256(v: __m256) -> f32 {
+-        let lo = _mm256_castps256_ps128(v);
+-        let hi = _mm256_extractf128_ps(v, 1);
+-        let s = _mm_add_ps(lo, hi);
+-        let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+-        let s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 0x55));
+-        _mm_cvtss_f32(s)
+-    }
+-
+-    /// Same contract as [`tile_avx512`]; computed as two 2x4 halves so the
+-    /// accumulators fit in the 16 ymm registers.
+-    #[target_feature(enable = "avx2,fma")]
+-    pub(super) unsafe fn tile_avx2(
+-        x: *const f32,
+-        c: *const f32,
+-        dim: usize,
+-        out: &mut [f32; MR * NR],
+-    ) {
+-        unsafe {
+-            let (c0, c1, c2, c3) = (c, c.add(dim), c.add(2 * dim), c.add(3 * dim));
+-            let full = dim / 8 * 8;
+-            for half in 0..2 {
+-                let x0 = x.add(2 * half * dim);
+-                let x1 = x0.add(dim);
+-                let mut a00 = _mm256_setzero_ps();
+-                let mut a01 = _mm256_setzero_ps();
+-                let mut a02 = _mm256_setzero_ps();
+-                let mut a03 = _mm256_setzero_ps();
+-                let mut a10 = _mm256_setzero_ps();
+-                let mut a11 = _mm256_setzero_ps();
+-                let mut a12 = _mm256_setzero_ps();
+-                let mut a13 = _mm256_setzero_ps();
+-                let mut d = 0;
+-                while d < full {
+-                    let v0 = _mm256_loadu_ps(x0.add(d));
+-                    let v1 = _mm256_loadu_ps(x1.add(d));
+-                    let w = _mm256_loadu_ps(c0.add(d));
+-                    a00 = _mm256_fmadd_ps(v0, w, a00);
+-                    a10 = _mm256_fmadd_ps(v1, w, a10);
+-                    let w = _mm256_loadu_ps(c1.add(d));
+-                    a01 = _mm256_fmadd_ps(v0, w, a01);
+-                    a11 = _mm256_fmadd_ps(v1, w, a11);
+-                    let w = _mm256_loadu_ps(c2.add(d));
+-                    a02 = _mm256_fmadd_ps(v0, w, a02);
+-                    a12 = _mm256_fmadd_ps(v1, w, a12);
+-                    let w = _mm256_loadu_ps(c3.add(d));
+-                    a03 = _mm256_fmadd_ps(v0, w, a03);
+-                    a13 = _mm256_fmadd_ps(v1, w, a13);
+-                    d += 8;
+-                }
+-                let base = 2 * half * NR;
+-                let acc = [a00, a01, a02, a03, a10, a11, a12, a13];
+-                for (i, a) in acc.into_iter().enumerate() {
+-                    out[base + i] = hsum256(a);
+-                }
+-            }
+-            tail(x, c, dim, full, out);
+-        }
+-    }
+-
+-    #[inline(always)]
+-    unsafe fn tail(
+-        x: *const f32,
+-        c: *const f32,
+-        dim: usize,
+-        from: usize,
+-        out: &mut [f32; MR * NR],
+-    ) {
+-        unsafe {
+-            for d in from..dim {
+-                for a in 0..MR {
+-                    let xv = *x.add(a * dim + d);
+-                    for b in 0..NR {
+-                        out[a * NR + b] += xv * *c.add(b * dim + d);
+-                    }
+-                }
+-            }
+-        }
+-    }
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/rust/lance-index/src/vector/pipnn.rs b/rust/lance-index/src/vector/pipnn.rs
+index efac30e35..e2a46ea58 100644
+--- a/rust/lance-index/src/vector/pipnn.rs
++++ b/rust/lance-index/src/vector/pipnn.rs
+@@ -31,6 +31,11 @@ use crate::vector::{Query, VECTOR_RESULT_SCHEMA};
+ /// C++ flags of the linked native builder, for benchmark manifests.
+ pub const NATIVE_BUILD_FLAGS: &str = lance_pipnn::BUILD_FLAGS;
+ 
++/// Distance kernel the native builder selected for this process, for benchmark manifests.
++pub fn native_kernel_name() -> &'static str {
++    lance_pipnn::kernel_name()
++}
++
+ const METADATA_KEY: &str = "lance:pipnn";
+ const NEIGHBORS: &str = "neighbors";
+ 
+@@ -553,8 +558,10 @@ mod tests {
+         )
+         .unwrap()
+         .stats();
+-        println!("single-leaf {single:?}\nmulti-leaf {multi:?}");
+-        assert!(single.mean_degree < multi.mean_degree);
++        assert!(
++            single.mean_degree < multi.mean_degree,
++            "single-leaf {single:?} vs multi-leaf {multi:?}"
++        );
+         assert!(multi.reachable_fraction > 0.99, "{multi:?}");
+     }
+ 
+@@ -574,7 +581,10 @@ mod tests {
+             )
+             .unwrap();
+         assert_eq!(id, 37);
+-        assert_eq!(dist, l2(q, &points[id as usize * DIM..(id as usize + 1) * DIM]));
++        assert_eq!(
++            dist,
++            l2(q, &points[id as usize * DIM..(id as usize + 1) * DIM])
++        );
+     }
+ 
+     #[test]
+@@ -582,21 +592,20 @@ mod tests {
+         let empty = storage(0, 1);
+         let graph = PiPNN::index_vectors(&empty, params()).unwrap();
+         assert!(graph.is_empty());
+-        let batch = graph
+-            .search(
+-                Arc::new(Float32Array::from(vec![0.0; DIM])),
+-                5,
+-                HnswQueryParams {
+-                    ef: 16,
+-                    lower_bound: None,
+-                    upper_bound: None,
+-                    dist_q_c: 0.0,
+-                    use_acorn: false,
+-                },
+-                &empty,
+-                Arc::new(NoFilter),
+-                &NoOpMetricsCollector,
+-            );
++        let batch = graph.search(
++            Arc::new(Float32Array::from(vec![0.0; DIM])),
++            5,
++            HnswQueryParams {
++                ef: 16,
++                lower_bound: None,
++                upper_bound: None,
++                dist_q_c: 0.0,
++                use_acorn: false,
++            },
++            &empty,
++            Arc::new(NoFilter),
++            &NoOpMetricsCollector,
++        );
+         assert!(batch.is_err() || batch.unwrap().num_rows() == 0);
+ 
+         let one = storage(1, 2);
+@@ -617,6 +626,9 @@ mod tests {
+             false,
+         )]));
+         corrupt = RecordBatch::try_new(schema, corrupt.columns().to_vec()).unwrap();
+-        assert!(PiPNN::load(corrupt).is_err(), "missing metadata must be rejected");
++        assert!(
++            PiPNN::load(corrupt).is_err(),
++            "missing metadata must be rejected"
++        );
+     }
+ }
+diff --git a/rust/lance-linalg/benches/arm_kernels.rs b/rust/lance-linalg/benches/arm_kernels.rs
+index de3b98a41..07cf312a3 100644
+--- a/rust/lance-linalg/benches/arm_kernels.rs
++++ b/rust/lance-linalg/benches/arm_kernels.rs
+@@ -3,10 +3,14 @@
+ 
+ //! Run the same benchmark with and without LANCE_DISABLE_SVE_BUILD. This
+ //! isolates kernel selection while retaining algorithms, inputs and profiles.
++//! `index_tiles` covers the index-build shapes: 4x4 dot tiles (k-means and
++//! exact assignment) and one query against a small contiguous center block
++//! (tree routing), at dimensions 128/960 plus irregular tails.
+ 
+ use std::hint::black_box;
+ 
+ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
++use lance_linalg::distance::tile::{DotTile, dot_tile, dot_tile_kernel_name};
+ use lance_linalg::distance::{Dot, L2, dot::dot_f32, dot_u8::dot_u8, l2::l2_f32, l2_u8::l2_u8};
+ use lance_linalg::simd::dist_table::{sum_4bit_dist_table_f32_rows, sum_4bit_hacc_dist_table};
+ 
+@@ -84,5 +88,42 @@ fn lookup(c: &mut Criterion) {
+     group.finish();
+ }
+ 
+-criterion_group!(benches, distances, lookup);
++fn index_tiles(c: &mut Criterion) {
++    let mut group = c.benchmark_group(format!("index_tiles/{}", dot_tile_kernel_name()));
++    for dim in [100, 128, 131, 960] {
++        let x: Vec<f32> = (0..4 * dim).map(|i| (i % 101) as f32 / 101.0).collect();
++        let centers: Vec<f32> = (0..64 * dim).map(|i| (i % 79) as f32 / 79.0).collect();
++        let mut tile: DotTile = [0.0; 16];
++        group.throughput(Throughput::Elements((16 * dim) as u64));
++        group.bench_function(BenchmarkId::new("dot_tile_4x4", dim), |b| {
++            b.iter(|| {
++                dot_tile(
++                    black_box(&x),
++                    black_box(&centers[..4 * dim]),
++                    dim,
++                    &mut tile,
++                );
++                black_box(&tile);
++            })
++        });
++        for count in [4, 6, 16, 32, 64] {
++            let mut out = vec![0.0; count];
++            group.throughput(Throughput::Elements((count * dim) as u64));
++            group.bench_function(BenchmarkId::new(format!("l2_block_{count}"), dim), |b| {
++                b.iter(|| {
++                    f32::l2_batch_into(
++                        black_box(&x[..dim]),
++                        black_box(&centers[..count * dim]),
++                        dim,
++                        &mut out,
++                    );
++                    black_box(&out);
++                })
++            });
++        }
++    }
++    group.finish();
++}
++
++criterion_group!(benches, distances, lookup, index_tiles);
+ criterion_main!(benches);
+diff --git a/rust/lance-linalg/src/distance.rs b/rust/lance-linalg/src/distance.rs
+index 78f0b22ba..188df62b6 100644
+--- a/rust/lance-linalg/src/distance.rs
++++ b/rust/lance-linalg/src/distance.rs
+@@ -27,6 +27,7 @@ pub mod hamming;
+ pub mod l2;
+ pub mod l2_u8;
+ pub mod norm_l2;
++pub mod tile;
+ 
+ // `#[track_caller]` on these helpers is load-bearing: without it a length-contract
+ // panic reports this file rather than the distance function the caller reached.
+diff --git a/rust/lance-linalg/src/distance/l2.rs b/rust/lance-linalg/src/distance/l2.rs
+index 5f4d4609c..d95b8fc46 100644
+--- a/rust/lance-linalg/src/distance/l2.rs
++++ b/rust/lance-linalg/src/distance/l2.rs
+@@ -425,9 +425,16 @@ lance_core::target_kernel! {
+     #[candidate(L2_F32_BATCH_SVE: BatchKernel)]
+     fn l2_batch_f32_sve(x: &[f32], batch: &[f32], dimension: usize, output: &mut [f32]) {
+         assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
+-        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+-            // SAFETY: validated slices have dimension elements; dispatch checks SVE.
+-            *distance = unsafe { crate::simd::arm::lance_l2_f32_sve(x.as_ptr(), y.as_ptr(), dimension) };
++        // SAFETY: the layout check bounds `output.len()` rows of `dimension`
++        // elements in `batch` and `dimension` in `x`; dispatch checks SVE.
++        unsafe {
++            crate::simd::arm::lance_l2_batch_f32_sve(
++                x.as_ptr(),
++                batch.as_ptr(),
++                dimension,
++                output.len(),
++                output.as_mut_ptr(),
++            )
+         }
+     }
+ }
+@@ -1133,6 +1140,33 @@ mod tests {
+         }
+     }
+ 
++    /// Tree routing and k-means mix batch and pair distances, so the SVE batch
++    /// kernel must reproduce the pair kernel exactly, including row remainders.
++    #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++    #[test]
++    fn sve_batch_is_bit_identical_to_pair() {
++        let (Some(pair), Some(batch_kernel)) = (L2_F32_SVE.kernel(), L2_F32_BATCH_SVE.kernel())
++        else {
++            return;
++        };
++        for dimension in [1, 3, 4, 7, 8, 15, 16, 17, 33, 64, 100, 128, 960] {
++            for rows in [1, 3, 4, 5, 8, 9] {
++                let x: Vec<f32> = (0..dimension)
++                    .map(|i| (i % 13) as f32 * 0.37 - 2.0)
++                    .collect();
++                let batch: Vec<f32> = (0..rows * dimension)
++                    .map(|i| (i % 29) as f32 * 0.11 - 1.5)
++                    .collect();
++                let mut out = vec![f32::NAN; rows];
++                batch_kernel.call(&x, &batch, dimension, &mut out);
++                for (row, got) in out.iter().enumerate() {
++                    let want = pair.call(&x, &batch[row * dimension..(row + 1) * dimension]);
++                    assert_eq!(got.to_bits(), want.to_bits(), "dim={dimension} row={row}");
++                }
++            }
++        }
++    }
++
+     use super::*;
+     use arrow_array::{cast::AsArray, types::Float32Type};
+ 
+diff --git a/rust/lance-linalg/src/distance/tile.rs b/rust/lance-linalg/src/distance/tile.rs
+new file mode 100644
+index 000000000..7f9a18874
+--- /dev/null
++++ b/rust/lance-linalg/src/distance/tile.rs
+@@ -0,0 +1,365 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright The Lance Authors
++
++//! Register-blocked f32 dot-product tiles for dense nearest-centroid search.
++//!
++//! [`dot_tile`] computes the 4x4 block `out[a * 4 + b] = <x[a], c[b]>` for four
++//! contiguous rows `x` and four contiguous centroids `c`. Iterating tiles over a
++//! cache-resident centroid block makes every loaded row lane feed four FMAs and
++//! every loaded centroid lane feed four, which is what k-means training and exact
++//! IVF assignment need once the centroid table no longer fits in L2.
++//!
++//! Candidates sum in different orders (lane-partitioned, fused multiply-add), so
++//! results can differ from each other and from [`crate::distance::dot`] in the
++//! last bits. Callers use tiles to rank candidates and recompute the winning
++//! distance with the pairwise kernel.
++
++/// Rows per tile.
++pub const TILE_ROWS: usize = 4;
++/// Centroids per tile.
++pub const TILE_COLS: usize = 4;
++/// One tile of dot products, row-major: `out[a * TILE_COLS + b] = <x[a], c[b]>`.
++pub type DotTile = [f32; TILE_ROWS * TILE_COLS];
++
++type DotTileKernel = unsafe fn(&[f32], &[f32], usize, &mut DotTile);
++
++/// Writes the 4x4 dot products of the rows in `x` with the rows in `c`.
++///
++/// `x` holds [`TILE_ROWS`] and `c` holds [`TILE_COLS`] contiguous rows of
++/// `dimension` elements each.
++///
++/// # Panics
++///
++/// Panics if `dimension == 0` or either slice is not exactly four rows long.
++pub fn dot_tile(x: &[f32], c: &[f32], dimension: usize, out: &mut DotTile) {
++    DOT_TILE.get().call(x, c, dimension, out);
++}
++
++/// Whether [`dot_tile`] runs a SIMD kernel on this host.
++///
++/// The portable fallback is slower than scoring each row with the per-vector
++/// batch kernel, so blocked callers should only use tiles when this is true.
++pub fn dot_tile_is_accelerated() -> bool {
++    DOT_TILE.selected().name() != DOT_TILE_SCALAR.name()
++}
++
++/// Name of the [`dot_tile`] kernel selected for this host, for benchmark records.
++pub fn dot_tile_kernel_name() -> &'static str {
++    DOT_TILE.selected().name()
++}
++
++#[inline(always)]
++#[track_caller]
++fn check_tile_layout(x_len: usize, c_len: usize, dimension: usize) {
++    // Every kernel dereferences raw row pointers, so this is a safety check.
++    assert!(
++        dimension > 0 && x_len == TILE_ROWS * dimension && c_len == TILE_COLS * dimension,
++        "dot tile needs {TILE_ROWS} rows and {TILE_COLS} centroids of dimension {dimension}: rows={x_len}, centroids={c_len}"
++    );
++}
++
++/// Adds the products of elements `from..dimension` to `out` (SIMD remainders).
++#[inline(always)]
++fn add_tail(x: &[f32], c: &[f32], dimension: usize, from: usize, out: &mut DotTile) {
++    for d in from..dimension {
++        for a in 0..TILE_ROWS {
++            let xv = x[a * dimension + d];
++            for b in 0..TILE_COLS {
++                out[a * TILE_COLS + b] += xv * c[b * dimension + d];
++            }
++        }
++    }
++}
++
++lance_core::dispatch! {
++    static DOT_TILE: Dispatch<DotTileKernel> = {
++        #[cfg(target_arch = "x86_64")]
++        {
++            &[x86::DOT_TILE_AVX512, x86::DOT_TILE_AVX2_FMA, DOT_TILE_SCALAR]
++        }
++        #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++        {
++            &[DOT_TILE_SVE, aarch64::DOT_TILE_NEON, DOT_TILE_SCALAR]
++        }
++        #[cfg(all(target_arch = "aarch64", not(kernel_support = "sve")))]
++        {
++            &[aarch64::DOT_TILE_NEON, DOT_TILE_SCALAR]
++        }
++        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++        {
++            &[DOT_TILE_SCALAR]
++        }
++    };
++}
++
++lance_core::target_kernel! {
++    #[target_features()]
++    #[candidate(DOT_TILE_SCALAR: DotTileKernel)]
++    fn dot_tile_scalar(x: &[f32], c: &[f32], dimension: usize, out: &mut DotTile) {
++        check_tile_layout(x.len(), c.len(), dimension);
++        out.fill(0.0);
++        add_tail(x, c, dimension, 0, out);
++    }
++}
++
++#[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++lance_core::target_kernel! {
++    #[target_features("sve")]
++    #[candidate(DOT_TILE_SVE: DotTileKernel)]
++    fn dot_tile_sve(x: &[f32], c: &[f32], dimension: usize, out: &mut DotTile) {
++        check_tile_layout(x.len(), c.len(), dimension);
++        // SAFETY: the layout check bounds every row the C kernel reads, `out`
++        // holds the 16 values it writes, and the candidate checks SVE.
++        unsafe {
++            crate::simd::arm::lance_dot_tile_f32_sve(
++                x.as_ptr(),
++                c.as_ptr(),
++                dimension,
++                out.as_mut_ptr(),
++            )
++        }
++    }
++}
++
++#[cfg(target_arch = "aarch64")]
++mod aarch64 {
++    use std::arch::aarch64::*;
++
++    use super::{DotTile, DotTileKernel, TILE_COLS, TILE_ROWS, add_tail, check_tile_layout};
++
++    lance_core::target_kernel! {
++        #[target_features("neon")]
++        #[candidate(pub(super) DOT_TILE_NEON: DotTileKernel)]
++        fn dot_tile_neon(x: &[f32], c: &[f32], dimension: usize, out: &mut DotTile) {
++            check_tile_layout(x.len(), c.len(), dimension);
++            let full = dimension / 4 * 4;
++            // SAFETY: the layout check gives four rows of `dimension` elements in
++            // each slice, and every load reads lanes `d..d + 4 <= full`.
++            unsafe {
++                let xp = x.as_ptr();
++                let cp = c.as_ptr();
++                // 16 accumulators + 4 row lanes + 1 centroid lane fit in the 32
++                // NEON registers, so the constant-bound loops stay in registers.
++                // acc[b][a] accumulates <x[a], c[b]>.
++                let mut acc = [[vdupq_n_f32(0.0); TILE_ROWS]; TILE_COLS];
++                let mut d = 0;
++                while d < full {
++                    let rows = [
++                        vld1q_f32(xp.add(d)),
++                        vld1q_f32(xp.add(dimension + d)),
++                        vld1q_f32(xp.add(2 * dimension + d)),
++                        vld1q_f32(xp.add(3 * dimension + d)),
++                    ];
++                    for (b, column) in acc.iter_mut().enumerate() {
++                        let w = vld1q_f32(cp.add(b * dimension + d));
++                        for (sum, &row) in column.iter_mut().zip(&rows) {
++                            *sum = vfmaq_f32(*sum, row, w);
++                        }
++                    }
++                    d += 4;
++                }
++                for (b, column) in acc.iter().enumerate() {
++                    for (a, &sum) in column.iter().enumerate() {
++                        out[a * TILE_COLS + b] = vaddvq_f32(sum);
++                    }
++                }
++            }
++            add_tail(x, c, dimension, full, out);
++        }
++    }
++}
++
++#[cfg(target_arch = "x86_64")]
++mod x86 {
++    use std::arch::x86_64::*;
++
++    use super::{DotTile, DotTileKernel, TILE_COLS, TILE_ROWS, add_tail, check_tile_layout};
++
++    lance_core::target_kernel! {
++        #[target_features("avx512f")]
++        #[candidate(pub(super) DOT_TILE_AVX512: DotTileKernel)]
++        fn dot_tile_avx512(x: &[f32], c: &[f32], dimension: usize, out: &mut DotTile) {
++            check_tile_layout(x.len(), c.len(), dimension);
++            let full = dimension / 16 * 16;
++            // SAFETY: the layout check gives four rows of `dimension` elements in
++            // each slice, and every load reads lanes `d..d + 16 <= full`.
++            unsafe {
++                let xp = x.as_ptr();
++                let cp = c.as_ptr();
++                // acc[b][a] accumulates <x[a], c[b]>.
++                let mut acc = [[_mm512_setzero_ps(); TILE_ROWS]; TILE_COLS];
++                let mut d = 0;
++                while d < full {
++                    let rows = [
++                        _mm512_loadu_ps(xp.add(d)),
++                        _mm512_loadu_ps(xp.add(dimension + d)),
++                        _mm512_loadu_ps(xp.add(2 * dimension + d)),
++                        _mm512_loadu_ps(xp.add(3 * dimension + d)),
++                    ];
++                    for (b, column) in acc.iter_mut().enumerate() {
++                        let w = _mm512_loadu_ps(cp.add(b * dimension + d));
++                        for (sum, &row) in column.iter_mut().zip(&rows) {
++                            *sum = _mm512_fmadd_ps(row, w, *sum);
++                        }
++                    }
++                    d += 16;
++                }
++                for (b, column) in acc.iter().enumerate() {
++                    for (a, &sum) in column.iter().enumerate() {
++                        out[a * TILE_COLS + b] = _mm512_reduce_add_ps(sum);
++                    }
++                }
++            }
++            add_tail(x, c, dimension, full, out);
++        }
++    }
++
++    #[inline]
++    #[target_feature(enable = "avx2,fma")]
++    fn hsum256(v: __m256) -> f32 {
++        let lo = _mm256_castps256_ps128(v);
++        let hi = _mm256_extractf128_ps(v, 1);
++        let s = _mm_add_ps(lo, hi);
++        let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
++        let s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 0x55));
++        _mm_cvtss_f32(s)
++    }
++
++    lance_core::target_kernel! {
++        #[target_features("avx2", "fma")]
++        #[candidate(pub(super) DOT_TILE_AVX2_FMA: DotTileKernel)]
++        /// Computed as two 2x4 halves so the accumulators fit in 16 ymm registers.
++        fn dot_tile_avx2_fma(x: &[f32], c: &[f32], dimension: usize, out: &mut DotTile) {
++            check_tile_layout(x.len(), c.len(), dimension);
++            let full = dimension / 8 * 8;
++            // SAFETY: the layout check gives four rows of `dimension` elements in
++            // each slice, and every load reads lanes `d..d + 8 <= full`.
++            unsafe {
++                let cp = c.as_ptr();
++                for half in 0..2 {
++                    let x0 = x.as_ptr().add(2 * half * dimension);
++                    let x1 = x0.add(dimension);
++                    // acc[b] holds <x0, c[b]> and <x1, c[b]>.
++                    let mut acc = [[_mm256_setzero_ps(); 2]; TILE_COLS];
++                    let mut d = 0;
++                    while d < full {
++                        let v0 = _mm256_loadu_ps(x0.add(d));
++                        let v1 = _mm256_loadu_ps(x1.add(d));
++                        for (b, [s0, s1]) in acc.iter_mut().enumerate() {
++                            let w = _mm256_loadu_ps(cp.add(b * dimension + d));
++                            *s0 = _mm256_fmadd_ps(v0, w, *s0);
++                            *s1 = _mm256_fmadd_ps(v1, w, *s1);
++                        }
++                        d += 8;
++                    }
++                    for (b, column) in acc.iter().enumerate() {
++                        for (r, &v) in column.iter().enumerate() {
++                            out[(2 * half + r) * TILE_COLS + b] = hsum256(v);
++                        }
++                    }
++                }
++            }
++            add_tail(x, c, dimension, full, out);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use rstest::rstest;
++
++    fn candidates() -> &'static [lance_core::utils::cpu::Candidate<DotTileKernel>] {
++        DOT_TILE.candidates()
++    }
++
++    fn reference(x: &[f32], c: &[f32], dimension: usize) -> [f64; 16] {
++        let mut out = [0.0; 16];
++        for a in 0..TILE_ROWS {
++            for b in 0..TILE_COLS {
++                out[a * TILE_COLS + b] = (0..dimension)
++                    .map(|d| x[a * dimension + d] as f64 * c[b * dimension + d] as f64)
++                    .sum();
++            }
++        }
++        out
++    }
++
++    fn values(len: usize, seed: u32) -> Vec<f32> {
++        // Deterministic values in [-1, 1) without a RNG dependency.
++        (0..len as u32)
++            .map(|i| {
++                let h = (i.wrapping_add(seed)).wrapping_mul(2_654_435_761) >> 8;
++                (h % 2001) as f32 / 1000.0 - 1.0
++            })
++            .collect()
++    }
++
++    #[rstest]
++    #[case::one(1)]
++    #[case::below_neon(3)]
++    #[case::neon(4)]
++    #[case::irregular(7)]
++    #[case::avx2(8)]
++    #[case::avx512_tail(17)]
++    #[case::sift(128)]
++    #[case::prime(131)]
++    #[case::gist(960)]
++    fn every_candidate_matches_reference(#[case] dimension: usize) {
++        let x = values(TILE_ROWS * dimension, 1);
++        let c = values(TILE_COLS * dimension, 7);
++        let want = reference(&x, &c, dimension);
++        for candidate in candidates() {
++            let Some(kernel) = candidate.kernel() else {
++                continue;
++            };
++            let mut out = [f32::NAN; 16];
++            kernel.call(&x, &c, dimension, &mut out);
++            for (got, want) in out.iter().zip(want) {
++                let tolerance = 1e-5 * (dimension as f64).sqrt().max(1.0);
++                assert!(
++                    (*got as f64 - want).abs() <= tolerance,
++                    "{} dim={dimension}: got {got}, want {want}",
++                    candidate.name()
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn non_finite_inputs_propagate() {
++        let dimension = 9;
++        let mut x = values(TILE_ROWS * dimension, 3);
++        let c = values(TILE_COLS * dimension, 5);
++        x[dimension + 2] = f32::NAN;
++        for candidate in candidates() {
++            let Some(kernel) = candidate.kernel() else {
++                continue;
++            };
++            let mut out = [0.0; 16];
++            kernel.call(&x, &c, dimension, &mut out);
++            for (i, v) in out.iter().enumerate() {
++                assert_eq!(
++                    v.is_nan(),
++                    i / TILE_COLS == 1,
++                    "{} lane {i}",
++                    candidate.name()
++                );
++            }
++        }
++    }
++
++    #[test]
++    #[should_panic(expected = "dot tile needs 4 rows")]
++    fn rejects_short_inputs() {
++        let mut out = [0.0; 16];
++        dot_tile(&[0.0; 15], &[0.0; 16], 4, &mut out);
++    }
++
++    #[test]
++    fn selection_is_reported() {
++        assert!(!dot_tile_kernel_name().is_empty());
++        #[cfg(target_arch = "aarch64")]
++        assert!(dot_tile_is_accelerated(), "NEON is baseline on aarch64");
++    }
++}
+diff --git a/rust/lance-linalg/src/simd/arm.rs b/rust/lance-linalg/src/simd/arm.rs
+index b5bac4134..7951b3c3f 100644
+--- a/rust/lance-linalg/src/simd/arm.rs
++++ b/rust/lance-linalg/src/simd/arm.rs
+@@ -8,6 +8,19 @@
+ unsafe extern "C" {
+     pub(crate) fn lance_dot_f32_sve(x: *const f32, y: *const f32, n: usize) -> f32;
+     pub(crate) fn lance_l2_f32_sve(x: *const f32, y: *const f32, n: usize) -> f32;
++    pub(crate) fn lance_l2_batch_f32_sve(
++        x: *const f32,
++        batch: *const f32,
++        dimension: usize,
++        count: usize,
++        out: *mut f32,
++    );
++    pub(crate) fn lance_dot_tile_f32_sve(
++        x: *const f32,
++        c: *const f32,
++        dimension: usize,
++        out: *mut f32,
++    );
+     pub(crate) fn lance_dot_u8_sve(x: *const u8, y: *const u8, n: usize) -> u32;
+     pub(crate) fn lance_l2_u8_sve(x: *const u8, y: *const u8, n: usize) -> u32;
+     pub(crate) fn lance_sum_f32_rows_sve(
+diff --git a/rust/lance-linalg/src/simd/sve.c b/rust/lance-linalg/src/simd/sve.c
+index eb3319d01..1c9454afe 100644
+--- a/rust/lance-linalg/src/simd/sve.c
++++ b/rust/lance-linalg/src/simd/sve.c
+@@ -42,6 +42,104 @@ float lance_l2_f32_sve(const float *x, const float *y, size_t n) {
+   return svaddv_f32(svptrue_b32(), svadd_f32_x(svptrue_b32(), a, b));
+ }
+ 
++// Four rows per pass share each load of x. Every row keeps the two-accumulator
++// schedule of lance_l2_f32_sve, so batch and pair distances are bit-identical.
++#define LANCE_L2_ROW_STEP(r)                                                   \
++  do {                                                                         \
++    svfloat32_t d0 = svsub_f32_x(all, xl, svld1_f32(all, y##r + i));            \
++    svfloat32_t d1 = svsub_f32_x(all, xh, svld1_f32(all, y##r + i + lanes));    \
++    a##r = svmla_f32_m(all, a##r, d0, d0);                                      \
++    b##r = svmla_f32_m(all, b##r, d1, d1);                                      \
++  } while (0)
++#define LANCE_L2_ROW_TAIL(r)                                                   \
++  do {                                                                         \
++    svfloat32_t d = svsub_f32_x(pg, xv, svld1_f32(pg, y##r + i));               \
++    a##r = svmla_f32_m(pg, a##r, d, d);                                         \
++  } while (0)
++
++void lance_l2_batch_f32_sve(const float *x, const float *batch, size_t dim,
++                            size_t count, float *out) {
++  const svbool_t all = svptrue_b32();
++  const size_t lanes = svcntw();
++  size_t row = 0;
++  for (; count - row >= 4; row += 4) {
++    const float *y0 = batch + row * dim, *y1 = y0 + dim, *y2 = y1 + dim,
++                *y3 = y2 + dim;
++    svfloat32_t a0 = svdup_f32(0), a1 = svdup_f32(0), a2 = svdup_f32(0),
++                a3 = svdup_f32(0);
++    svfloat32_t b0 = svdup_f32(0), b1 = svdup_f32(0), b2 = svdup_f32(0),
++                b3 = svdup_f32(0);
++    size_t i = 0;
++    for (; dim - i >= 2 * lanes; i += 2 * lanes) {
++      svfloat32_t xl = svld1_f32(all, x + i), xh = svld1_f32(all, x + i + lanes);
++      LANCE_L2_ROW_STEP(0);
++      LANCE_L2_ROW_STEP(1);
++      LANCE_L2_ROW_STEP(2);
++      LANCE_L2_ROW_STEP(3);
++    }
++    for (; i < dim; i += lanes) {
++      svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)dim);
++      svfloat32_t xv = svld1_f32(pg, x + i);
++      LANCE_L2_ROW_TAIL(0);
++      LANCE_L2_ROW_TAIL(1);
++      LANCE_L2_ROW_TAIL(2);
++      LANCE_L2_ROW_TAIL(3);
++    }
++    out[row] = svaddv_f32(all, svadd_f32_x(all, a0, b0));
++    out[row + 1] = svaddv_f32(all, svadd_f32_x(all, a1, b1));
++    out[row + 2] = svaddv_f32(all, svadd_f32_x(all, a2, b2));
++    out[row + 3] = svaddv_f32(all, svadd_f32_x(all, a3, b3));
++  }
++  for (; row < count; ++row) out[row] = lance_l2_f32_sve(x, batch + row * dim, dim);
++}
++#undef LANCE_L2_ROW_STEP
++#undef LANCE_L2_ROW_TAIL
++
++// out[a * 4 + b] = <x[a], c[b]> for four rows and four centroids of `dim`
++// elements: each loaded lane feeds four FMAs (16 accumulators of 32 registers).
++// Sizeless SVE types cannot form arrays, hence the named accumulators.
++#define LANCE_TILE_COL(b)                                                      \
++  do {                                                                         \
++    svfloat32_t w = svld1_f32(pg, c + (b) * dim + i);                          \
++    s0##b = svmla_f32_m(pg, s0##b, v0, w);                                      \
++    s1##b = svmla_f32_m(pg, s1##b, v1, w);                                      \
++    s2##b = svmla_f32_m(pg, s2##b, v2, w);                                      \
++    s3##b = svmla_f32_m(pg, s3##b, v3, w);                                      \
++  } while (0)
++#define LANCE_TILE_STORE(a)                                                    \
++  do {                                                                         \
++    out[(a) * 4 + 0] = svaddv_f32(svptrue_b32(), s##a##0);                     \
++    out[(a) * 4 + 1] = svaddv_f32(svptrue_b32(), s##a##1);                     \
++    out[(a) * 4 + 2] = svaddv_f32(svptrue_b32(), s##a##2);                     \
++    out[(a) * 4 + 3] = svaddv_f32(svptrue_b32(), s##a##3);                     \
++  } while (0)
++
++void lance_dot_tile_f32_sve(const float *x, const float *c, size_t dim,
++                            float *out) {
++  svfloat32_t s00 = svdup_f32(0), s01 = svdup_f32(0), s02 = svdup_f32(0),
++              s03 = svdup_f32(0), s10 = svdup_f32(0), s11 = svdup_f32(0),
++              s12 = svdup_f32(0), s13 = svdup_f32(0), s20 = svdup_f32(0),
++              s21 = svdup_f32(0), s22 = svdup_f32(0), s23 = svdup_f32(0),
++              s30 = svdup_f32(0), s31 = svdup_f32(0), s32 = svdup_f32(0),
++              s33 = svdup_f32(0);
++  for (size_t i = 0; i < dim; i += svcntw()) {
++    svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)dim);
++    svfloat32_t v0 = svld1_f32(pg, x + i), v1 = svld1_f32(pg, x + dim + i),
++                v2 = svld1_f32(pg, x + 2 * dim + i),
++                v3 = svld1_f32(pg, x + 3 * dim + i);
++    LANCE_TILE_COL(0);
++    LANCE_TILE_COL(1);
++    LANCE_TILE_COL(2);
++    LANCE_TILE_COL(3);
++  }
++  LANCE_TILE_STORE(0);
++  LANCE_TILE_STORE(1);
++  LANCE_TILE_STORE(2);
++  LANCE_TILE_STORE(3);
++}
++#undef LANCE_TILE_COL
++#undef LANCE_TILE_STORE
++
+ // The ABI receives validated, column-major packed codes. Each byte holds
+ // low/high nibble indices into two consecutive 16-entry tables.
+ void lance_sum_f32_rows_sve(const uint8_t *codes, const float *tables,
+diff --git a/rust/lance-pipnn/Cargo.toml b/rust/lance-pipnn/Cargo.toml
+index bf1d83b64..9c6a120f6 100644
+--- a/rust/lance-pipnn/Cargo.toml
++++ b/rust/lance-pipnn/Cargo.toml
+@@ -4,6 +4,10 @@ version.workspace = true
+ edition.workspace = true
+ license.workspace = true
+ rust-version.workspace = true
++repository.workspace = true
++readme = "README.md"
++keywords.workspace = true
++categories.workspace = true
+ description = "Optional native PiPNN graph construction for Lance"
+ 
+ [build-dependencies]
+diff --git a/rust/lance-pipnn/README.md b/rust/lance-pipnn/README.md
+new file mode 100644
+index 000000000..32930c322
+--- /dev/null
++++ b/rust/lance-pipnn/README.md
+@@ -0,0 +1,10 @@
++# lance-pipnn
++
++Optional native PiPNN graph builder for Lance (feature `pipnn` of `lance-index`).
++It backs the PiPNN centroid assigner and the `IVF_PIPNN_FLAT` partition sub-index.
++
++The C++ builder (`cpp/fastpipnn.hpp`) is compiled with portable flags and needs Eigen
++headers (`EIGEN_INCLUDE_DIR`). Distance kernels are chosen once per process
++(`kernel_name()`): SSE2 on x86_64, NEON on aarch64, and SVE when the compiler
++builds `cpp/kernels_sve.c` and Linux reports SVE. `LANCE_PIPNN_SCALAR=1` forces
++the scalar kernels; `LANCE_PIPNN_NATIVE=1` builds with `-march=native`.
+diff --git a/rust/lance-pipnn/build.rs b/rust/lance-pipnn/build.rs
+index 2a1449c47..0feff363e 100644
+--- a/rust/lance-pipnn/build.rs
++++ b/rust/lance-pipnn/build.rs
+@@ -3,6 +3,7 @@ use std::path::PathBuf;
+ fn main() {
+     println!("cargo:rerun-if-env-changed=EIGEN_INCLUDE_DIR");
+     println!("cargo:rerun-if-env-changed=LANCE_PIPNN_NATIVE");
++    println!("cargo:rerun-if-env-changed=LANCE_DISABLE_SVE_BUILD");
+     println!("cargo:rerun-if-changed=cpp");
+     let eigen = std::env::var_os("EIGEN_INCLUDE_DIR")
+         .map(PathBuf::from)
+@@ -12,7 +13,32 @@ fn main() {
+             "PiPNN requires Eigen headers: set EIGEN_INCLUDE_DIR to a directory containing Eigen/Dense"
+         );
+     }
++    // Optional SVE object, selected at runtime from HWCAP; the baseline stays portable.
++    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
++    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
++    let mut has_sve = false;
++    if target_arch == "aarch64"
++        && target_os == "linux"
++        && std::env::var_os("LANCE_DISABLE_SVE_BUILD").is_none()
++    {
++        match cc::Build::new()
++            .std("c11")
++            .file("cpp/kernels_sve.c")
++            .flag("-march=armv8-a+sve")
++            .flag("-msve-vector-bits=scalable")
++            .flag("-fno-fast-math")
++            .flag("-ffp-contract=off")
++            .opt_level(3)
++            .try_compile("lance_pipnn_sve")
++        {
++            Ok(()) => has_sve = true,
++            Err(err) => println!("cargo:warning=Skipping PiPNN SVE kernels: {err}"),
++        }
++    }
+     let mut build = cc::Build::new();
++    if has_sve {
++        build.define("LANCE_PIPNN_HAVE_SVE", None);
++    }
+     build
+         .cpp(true)
+         .std("c++17")
+@@ -24,11 +50,21 @@ fn main() {
+     // (e.g. the AVX-512 paths of the reference builder) for labelled benchmark runs
+     // only; the chosen flags are exported so results can record them.
+     let native = std::env::var_os("LANCE_PIPNN_NATIVE").is_some_and(|v| v == "1");
+-    let mut flags = vec!["-std=c++17", "-ffp-contract=off", "-DEIGEN_DONT_PARALLELIZE"];
++    let mut flags = vec![
++        "-std=c++17",
++        "-ffp-contract=off",
++        "-DEIGEN_DONT_PARALLELIZE",
++    ];
++    if has_sve {
++        flags.push("-DLANCE_PIPNN_HAVE_SVE");
++    }
+     if native {
+         build.flag("-march=native");
+         flags.push("-march=native");
+     }
+-    println!("cargo:rustc-env=LANCE_PIPNN_BUILD_FLAGS={}", flags.join(" "));
++    println!(
++        "cargo:rustc-env=LANCE_PIPNN_BUILD_FLAGS={}",
++        flags.join(" ")
++    );
+     build.compile("lance_pipnn");
+ }
+diff --git a/rust/lance-pipnn/cpp/bridge.cpp b/rust/lance-pipnn/cpp/bridge.cpp
+index 21834ec87..b2a4f286a 100644
+--- a/rust/lance-pipnn/cpp/bridge.cpp
++++ b/rust/lance-pipnn/cpp/bridge.cpp
+@@ -48,3 +48,37 @@ extern "C" int lance_pipnn_build(const float* points, size_t n, size_t dim,
+     return 2;
+   }
+ }
++
++// Kernel selected for this process ("neon", "sve+neon", "sse2", "scalar", ...).
++extern "C" const char* lance_pipnn_kernel_name() noexcept { return fastpipnn::kernels::selected.name; }
++
++extern "C" float lance_pipnn_sqdist(const float* a, const float* b, size_t d) noexcept {
++  return fastpipnn::sqdist(a, b, d);
++}
++
++// Leaf k-NN exactly as the builder computes it (Gram matrix + top-k scan), for
++// parity tests of the vector scan. Writes k ids/distances per point, nearest first.
++extern "C" int lance_pipnn_leaf_knn(const float* points, size_t m, size_t dim, size_t k, int simd,
++                                    uint32_t* ids, float* dists) noexcept {
++  try {
++    if (m < 2 || dim == 0 || k == 0 || k >= m) return 1;
++    using RowMat = fastpipnn::RowMat;
++    std::vector<float> gram(m * m), norms(m);
++    Eigen::Map<const RowMat> P(points, m, dim);
++    Eigen::Map<RowMat> G(gram.data(), m, m);
++    Eigen::Map<Eigen::VectorXf>(norms.data(), m) = P.rowwise().squaredNorm();
++    G.triangularView<Eigen::Lower>().setZero();
++    G.selfadjointView<Eigen::Lower>().rankUpdate(P);
++    std::vector<float> kd(k * m, std::numeric_limits<float>::infinity());
++    std::vector<uint32_t> ki(k * m, fastpipnn::kNone);
++    fastpipnn::Index<float>::leaf_topk(gram.data(), m, norms.data(), m, k, kd.data(), ki.data(), simd != 0);
++    for (size_t a = 0; a < m; ++a)
++      for (size_t t = 0; t < k; ++t) {
++        ids[a * k + t] = ki[t * m + a];
++        dists[a * k + t] = kd[t * m + a];
++      }
++    return 0;
++  } catch (...) {
++    return 2;
++  }
++}
+diff --git a/rust/lance-pipnn/cpp/fastpipnn.hpp b/rust/lance-pipnn/cpp/fastpipnn.hpp
+index 1cbb70dc9..03ffeca8d 100644
+--- a/rust/lance-pipnn/cpp/fastpipnn.hpp
++++ b/rust/lance-pipnn/cpp/fastpipnn.hpp
+@@ -35,6 +35,7 @@
+ #elif defined(__aarch64__)
+ #include <arm_neon.h>
+ #endif
++#include "kernels.h"
+ 
+ namespace fastpipnn {
+ 
+@@ -73,9 +74,7 @@ inline double now() {
+ }
+ 
+ inline float sqdist(const float* a, const float* b, size_t d) {
+-  float s = 0;
+-  for (size_t i = 0; i < d; ++i) { float t = a[i] - b[i]; s += t * t; }
+-  return s;
++  return kernels::selected.sqdist(a, b, d);
+ }
+ inline float sqdist(const uint8_t* a, const uint8_t* b, size_t d) {
+   int32_t s = 0;  // exact for d <= 33,000
+@@ -558,6 +557,112 @@ template <class T> class Index {
+   }
+ #endif
+ 
++#if defined(__aarch64__) && !defined(__AVX512F__)
++  // NEON port of insert16/scan_row: four candidates into four top-K lists.
++  // vbslq(mask, a, b) = mask ? a : b, matching the AVX-512 masked blends.
++  template <size_t K>
++  static inline void insert4(float32x4_t* bd, uint32x4_t* bi, float32x4_t d, uint32x4_t id) {
++    uint32x4_t lt[K];
++    for (size_t t = 0; t < K; ++t) lt[t] = vcltq_f32(d, bd[t]);
++    for (size_t t = K - 1; t > 0; --t) {
++      bd[t] = vbslq_f32(lt[t - 1], bd[t - 1], vbslq_f32(lt[t], d, bd[t]));
++      bi[t] = vbslq_u32(lt[t - 1], bi[t - 1], vbslq_u32(lt[t], id, bi[t]));
++    }
++    bd[0] = vbslq_f32(lt[0], d, bd[0]);
++    bi[0] = vbslq_u32(lt[0], id, bi[0]);
++  }
++
++  template <size_t K>
++  static size_t scan_row4(const float* row, const float* norms, float ni, size_t i, size_t m,
++                          float* kd, Id* ki, float* lane_d, Id* lane_i) {
++    float32x4_t own_d[K], col_d[K];
++    uint32x4_t own_i[K], col_i[K];
++    for (size_t t = 0; t < K; ++t) {
++      own_d[t] = vdupq_n_f32(std::numeric_limits<float>::infinity());
++      own_i[t] = vdupq_n_u32(kNone);
++    }
++    const float32x4_t vni = vdupq_n_f32(ni);
++    const uint32x4_t vi = vdupq_n_u32(uint32_t(i));
++    const uint32_t first[4] = {0, 1, 2, 3};
++    uint32x4_t vj = vld1q_u32(first);
++    const uint32x4_t step = vdupq_n_u32(4);
++    size_t j = 0;
++    for (; j + 4 <= i; j += 4, vj = vaddq_u32(vj, step)) {
++      // Same rounding as the scalar (ni + norms[j]) - 2 * row[j]: doubling is exact.
++      float32x4_t d = vsubq_f32(vaddq_f32(vni, vld1q_f32(norms + j)), vmulq_n_f32(vld1q_f32(row + j), 2.f));
++      for (size_t t = 0; t < K; ++t) {
++        col_d[t] = vld1q_f32(kd + t * m + j);
++        col_i[t] = vld1q_u32(ki + t * m + j);
++      }
++      insert4<K>(col_d, col_i, d, vi);
++      for (size_t t = 0; t < K; ++t) {
++        vst1q_f32(kd + t * m + j, col_d[t]);
++        vst1q_u32(ki + t * m + j, col_i[t]);
++      }
++      insert4<K>(own_d, own_i, d, vj);
++    }
++    for (size_t t = 0; t < K; ++t) {
++      vst1q_f32(lane_d + 4 * t, own_d[t]);
++      vst1q_u32(lane_i + 4 * t, own_i[t]);
++    }
++    return j;
++  }
++#endif
++
++ public:
++  // Exact k-NN lists of one leaf from the lower triangle of its Gram matrix `dist`
++  // (row stride ld) and squared norms. Lists are structure-of-arrays: slot t of
++  // point a is kd/ki[t * m + a], nearest first, initialized by the caller to
++  // (inf, kNone). `simd` selects the vector scan where one exists.
++  static void leaf_topk(const float* dist, size_t ld, const float* norms, size_t m, size_t k,
++                        float* kd, Id* ki, bool simd) {
++    auto push = [&](size_t a, Id b, float d) {
++      if (d >= kd[(k - 1) * m + a]) return;
++      size_t t = k - 1;
++      for (; t > 0 && kd[(t - 1) * m + a] > d; --t) { kd[t * m + a] = kd[(t - 1) * m + a]; ki[t * m + a] = ki[(t - 1) * m + a]; }
++      kd[t * m + a] = d; ki[t * m + a] = b;
++    };
++    (void)simd;
++    // Row i holds pairs (i, j < i); each pair may improve both lists. Point i's list is
++    // untouched before row i, so it can be built from per-lane partial lists.
++    for (size_t i = 1; i < m; ++i) {
++      const float* row = dist + i * ld;
++      const float ni = norms[i];
++      size_t j = 0;
++#if defined(__AVX512F__)
++      alignas(64) float lane_d[4 * 16];
++      alignas(64) Id lane_i[4 * 16];
++      constexpr size_t lanes = 16;
++#define LANCE_PIPNN_SCAN scan_row
++#elif defined(__aarch64__)
++      alignas(16) float lane_d[4 * 4];
++      alignas(16) Id lane_i[4 * 4];
++      constexpr size_t lanes = 4;
++#define LANCE_PIPNN_SCAN scan_row4
++#endif
++#if defined(LANCE_PIPNN_SCAN)
++      if (simd) {
++        switch (k) {  // compile-time K keeps the lane lists in registers
++          case 1: j = LANCE_PIPNN_SCAN<1>(row, norms, ni, i, m, kd, ki, lane_d, lane_i); break;
++          case 2: j = LANCE_PIPNN_SCAN<2>(row, norms, ni, i, m, kd, ki, lane_d, lane_i); break;
++          case 3: j = LANCE_PIPNN_SCAN<3>(row, norms, ni, i, m, kd, ki, lane_d, lane_i); break;
++          case 4: j = LANCE_PIPNN_SCAN<4>(row, norms, ni, i, m, kd, ki, lane_d, lane_i); break;
++          default: break;
++        }
++        if (j > 0)
++          for (size_t l = 0; l < k * lanes; ++l) if (lane_i[l] != kNone) push(i, lane_i[l], lane_d[l]);
++      }
++#undef LANCE_PIPNN_SCAN
++#endif
++      for (; j < i; ++j) {
++        float d = ni + norms[j] - 2 * row[j];
++        push(i, Id(j), d);
++        push(j, Id(i), d);
++      }
++    }
++  }
++
++ private:
+   // Lower triangle of the leaf Gram matrix P P^T into `out` (row stride returned) and
+   // squared norms. uint8 input uses an exact bfloat16 dot-product kernel when available:
+   // 0..255 are exact in bf16 and fp32 sums of products stay exact below 2^24.
+@@ -635,37 +740,7 @@ template <class T> class Index {
+     const size_t ld = gram(ids, dist, norms);  // lower triangle of the Gram matrix, row stride ld
+     float* kd = knn_d.data();
+     Id* ki = knn_i.data();
+-    auto push = [&](size_t a, Id b, float d) {
+-      if (d >= kd[(k - 1) * m + a]) return;
+-      size_t t = k - 1;
+-      for (; t > 0 && kd[(t - 1) * m + a] > d; --t) { kd[t * m + a] = kd[(t - 1) * m + a]; ki[t * m + a] = ki[(t - 1) * m + a]; }
+-      kd[t * m + a] = d; ki[t * m + a] = b;
+-    };
+-    // Row i holds pairs (i, j < i); each pair may improve both lists. Point i's list is
+-    // untouched before row i, so it can be built from per-lane partial lists.
+-    for (size_t i = 1; i < m; ++i) {
+-      const float* row = dist.data() + i * ld;
+-      const float ni = norms[i];
+-      size_t j = 0;
+-#if defined(__AVX512F__)
+-      alignas(64) float lane_d[4 * 16];
+-      alignas(64) Id lane_i[4 * 16];
+-      switch (k) {  // compile-time K keeps the lane lists in registers
+-        case 1: j = scan_row<1>(row, norms.data(), ni, i, m, kd, ki, lane_d, lane_i); break;
+-        case 2: j = scan_row<2>(row, norms.data(), ni, i, m, kd, ki, lane_d, lane_i); break;
+-        case 3: j = scan_row<3>(row, norms.data(), ni, i, m, kd, ki, lane_d, lane_i); break;
+-        case 4: j = scan_row<4>(row, norms.data(), ni, i, m, kd, ki, lane_d, lane_i); break;
+-        default: break;
+-      }
+-      if (j > 0)
+-        for (size_t l = 0; l < k * 16; ++l) if (lane_i[l] != kNone) push(i, lane_i[l], lane_d[l]);
+-#endif
+-      for (; j < i; ++j) {
+-        float d = ni + norms[j] - 2 * row[j];
+-        push(i, Id(j), d);
+-        push(j, Id(i), d);
+-      }
+-    }
++    leaf_topk(dist.data(), ld, norms.data(), m, k, kd, ki, kernels::selected.simd_scan);
+     // Group the directed offers (i -> j and j -> i) by target with a counting sort, so each
+     // reservoir is locked once per leaf and the next targets can be prefetched.
+     thread_local std::vector<uint32_t> start;
+diff --git a/rust/lance-pipnn/cpp/kernels.h b/rust/lance-pipnn/cpp/kernels.h
+new file mode 100644
+index 000000000..e8b0cd858
+--- /dev/null
++++ b/rust/lance-pipnn/cpp/kernels.h
+@@ -0,0 +1,114 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++// Distance kernels for the PiPNN builder, selected once per process.
++//
++// The builder compiles with -ffp-contract=off and without fast-math, so a plain
++// float reduction loop is not vectorized. These kernels vectorize explicitly:
++// SSE2 (x86_64 baseline), NEON (aarch64 baseline) and SVE when the object was
++// built and the kernel reports SVE (Linux HWCAP). LANCE_PIPNN_SCALAR=1 forces
++// the scalar loop, for ablations. Lane-partitioned sums round differently from
++// the scalar loop; RobustPrune and the medoid only rank by these distances.
++#include <cstddef>
++#include <cstdint>
++#include <cstdlib>
++#if defined(__x86_64__)
++#include <emmintrin.h>
++#elif defined(__aarch64__)
++#include <arm_neon.h>
++#if defined(__linux__)
++#include <sys/auxv.h>
++#ifndef HWCAP_SVE
++#define HWCAP_SVE (1 << 22)
++#endif
++#endif
++#endif
++
++#if defined(LANCE_PIPNN_HAVE_SVE)
++extern "C" float lance_pipnn_sqdist_sve(const float* a, const float* b, size_t d);
++#endif
++
++namespace fastpipnn::kernels {
++
++using SqdistFn = float (*)(const float*, const float*, size_t);
++
++inline float sqdist_scalar(const float* a, const float* b, size_t d) {
++  float s = 0;
++  for (size_t i = 0; i < d; ++i) { float t = a[i] - b[i]; s += t * t; }
++  return s;
++}
++
++#if defined(__x86_64__)
++inline float sqdist_sse2(const float* a, const float* b, size_t d) {
++  __m128 s0 = _mm_setzero_ps(), s1 = _mm_setzero_ps();
++  size_t i = 0;
++  for (; i + 8 <= d; i += 8) {
++    __m128 t0 = _mm_sub_ps(_mm_loadu_ps(a + i), _mm_loadu_ps(b + i));
++    __m128 t1 = _mm_sub_ps(_mm_loadu_ps(a + i + 4), _mm_loadu_ps(b + i + 4));
++    s0 = _mm_add_ps(s0, _mm_mul_ps(t0, t0));
++    s1 = _mm_add_ps(s1, _mm_mul_ps(t1, t1));
++  }
++  alignas(16) float lanes[4];
++  _mm_store_ps(lanes, _mm_add_ps(s0, s1));
++  float s = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
++  for (; i < d; ++i) { float t = a[i] - b[i]; s += t * t; }
++  return s;
++}
++#endif
++
++#if defined(__aarch64__)
++inline float sqdist_neon(const float* a, const float* b, size_t d) {
++  float32x4_t s0 = vdupq_n_f32(0), s1 = vdupq_n_f32(0);
++  size_t i = 0;
++  for (; i + 8 <= d; i += 8) {
++    float32x4_t t0 = vsubq_f32(vld1q_f32(a + i), vld1q_f32(b + i));
++    float32x4_t t1 = vsubq_f32(vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
++    s0 = vfmaq_f32(s0, t0, t0);
++    s1 = vfmaq_f32(s1, t1, t1);
++  }
++  float s = vaddvq_f32(vaddq_f32(s0, s1));
++  for (; i < d; ++i) { float t = a[i] - b[i]; s += t * t; }
++  return s;
++}
++#endif
++
++inline bool force_scalar() {
++  const char* v = std::getenv("LANCE_PIPNN_SCALAR");
++  return v && v[0] == '1';
++}
++
++inline bool host_has_sve() {
++#if defined(LANCE_PIPNN_HAVE_SVE) && defined(__aarch64__) && defined(__linux__)
++  return (getauxval(AT_HWCAP) & HWCAP_SVE) != 0;
++#else
++  return false;
++#endif
++}
++
++struct Selection {
++  SqdistFn sqdist;
++  bool simd_scan;  // vector leaf top-k scan (NEON, or AVX-512 in -march=native builds)
++  const char* name;
++};
++
++inline Selection select() {
++  if (force_scalar()) return {sqdist_scalar, false, "scalar"};
++#if defined(LANCE_PIPNN_HAVE_SVE)
++  if (host_has_sve()) return {lance_pipnn_sqdist_sve, true, "sve+neon"};
++#endif
++#if defined(__aarch64__)
++  return {sqdist_neon, true, "neon"};
++#elif defined(__x86_64__)
++#if defined(__AVX512F__)
++  return {sqdist_sse2, true, "sse2+avx512"};
++#else
++  return {sqdist_sse2, false, "sse2"};
++#endif
++#else
++  return {sqdist_scalar, false, "scalar"};
++#endif
++}
++
++// Chosen once at load time; LANCE_PIPNN_SCALAR must be set before the process starts.
++inline const Selection selected = select();
++
++}  // namespace fastpipnn::kernels
+diff --git a/rust/lance-pipnn/cpp/kernels_sve.c b/rust/lance-pipnn/cpp/kernels_sve.c
+new file mode 100644
+index 000000000..2cfa65d03
+--- /dev/null
++++ b/rust/lance-pipnn/cpp/kernels_sve.c
+@@ -0,0 +1,26 @@
++// SPDX-License-Identifier: Apache-2.0
++// Built only when the compiler supports SVE; selected at runtime from HWCAP.
++// Uses the calling thread's vector length (no fixed -msve-vector-bits).
++#include <arm_sve.h>
++#include <stddef.h>
++#include <stdint.h>
++
++float lance_pipnn_sqdist_sve(const float *a, const float *b, size_t d) {
++  const svbool_t all = svptrue_b32();
++  const size_t lanes = svcntw();
++  svfloat32_t s0 = svdup_f32(0), s1 = svdup_f32(0);
++  size_t i = 0;
++  for (; d - i >= 2 * lanes; i += 2 * lanes) {
++    svfloat32_t t0 = svsub_f32_x(all, svld1_f32(all, a + i), svld1_f32(all, b + i));
++    svfloat32_t t1 = svsub_f32_x(all, svld1_f32(all, a + i + lanes),
++                                 svld1_f32(all, b + i + lanes));
++    s0 = svmla_f32_m(all, s0, t0, t0);
++    s1 = svmla_f32_m(all, s1, t1, t1);
++  }
++  for (; i < d; i += lanes) {
++    svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)d);
++    svfloat32_t t = svsub_f32_x(pg, svld1_f32(pg, a + i), svld1_f32(pg, b + i));
++    s0 = svmla_f32_m(pg, s0, t, t);
++  }
++  return svaddv_f32(all, svadd_f32_x(all, s0, s1));
++}
+diff --git a/rust/lance-pipnn/src/lib.rs b/rust/lance-pipnn/src/lib.rs
+index 3e12d0038..0fffdfd68 100644
+--- a/rust/lance-pipnn/src/lib.rs
++++ b/rust/lance-pipnn/src/lib.rs
+@@ -58,6 +58,72 @@ unsafe extern "C" {
+         error: *mut c_char,
+         error_capacity: usize,
+     ) -> i32;
++    fn lance_pipnn_kernel_name() -> *const c_char;
++    fn lance_pipnn_sqdist(a: *const f32, b: *const f32, d: usize) -> f32;
++    fn lance_pipnn_leaf_knn(
++        points: *const f32,
++        m: usize,
++        dim: usize,
++        k: usize,
++        simd: i32,
++        ids: *mut u32,
++        dists: *mut f32,
++    ) -> i32;
++}
++
++/// Distance kernel the native builder selected for this process (`"neon"`,
++/// `"sve+neon"`, `"sse2"`, `"scalar"`, ...). `LANCE_PIPNN_SCALAR=1` set before
++/// process start forces `"scalar"`, for kernel ablations.
++pub fn kernel_name() -> &'static str {
++    // SAFETY: the bridge returns a pointer to a static NUL-terminated literal.
++    unsafe { CStr::from_ptr(lance_pipnn_kernel_name()) }
++        .to_str()
++        .unwrap_or("unknown")
++}
++
++/// Squared L2 distance with the builder's selected kernel (RobustPrune, medoid).
++pub fn sqdist(a: &[f32], b: &[f32]) -> f32 {
++    assert_eq!(a.len(), b.len(), "sqdist inputs must have equal lengths");
++    // SAFETY: both slices hold `a.len()` elements.
++    unsafe { lance_pipnn_sqdist(a.as_ptr(), b.as_ptr(), a.len()) }
++}
++
++/// Exact `k`-NN inside one leaf as the builder computes it, for kernel parity
++/// checks: `(ids, distances)` with `k` entries per point, nearest first.
++/// `simd` selects the vector top-k scan where the build has one.
++pub fn leaf_knn(
++    points: &[f32],
++    dimension: usize,
++    k: usize,
++    simd: bool,
++) -> Result<(Vec<u32>, Vec<f32>), String> {
++    if dimension == 0 || !points.len().is_multiple_of(dimension) {
++        return Err("leaf_knn requires a positive dimension dividing the input length".into());
++    }
++    let m = points.len() / dimension;
++    if m < 2 || k == 0 || k >= m {
++        return Err(format!(
++            "leaf_knn requires 0 < k < points; got k={k}, points={m}"
++        ));
++    }
++    let mut ids = vec![0u32; m * k];
++    let mut dists = vec![0f32; m * k];
++    // SAFETY: input holds m * dimension values; outputs hold m * k entries.
++    let status = unsafe {
++        lance_pipnn_leaf_knn(
++            points.as_ptr(),
++            m,
++            dimension,
++            k,
++            simd as i32,
++            ids.as_mut_ptr(),
++            dists.as_mut_ptr(),
++        )
++    };
++    if status != 0 {
++        return Err(format!("native leaf_knn failed with status {status}"));
++    }
++    Ok((ids, dists))
+ }
+ 
+ /// Build a graph over contiguous float32 L2 vectors. Empty/singleton graphs are valid.
+@@ -175,4 +241,70 @@ mod tests {
+         assert!(build(&[f32::NAN, 0.0], 2, &params).is_err());
+         assert!(build(&points, 0, &params).is_err());
+     }
++
++    fn values(len: usize, seed: u64) -> Vec<f32> {
++        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
++        (0..len)
++            .map(|_| {
++                state = state
++                    .wrapping_mul(6364136223846793005)
++                    .wrapping_add(1442695040888963407);
++                ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
++            })
++            .collect()
++    }
++
++    #[test]
++    fn sqdist_matches_double_reference_at_every_tail() {
++        assert!(!kernel_name().is_empty());
++        for d in [0, 1, 3, 4, 7, 8, 9, 15, 16, 17, 31, 64, 100, 128, 129, 960] {
++            let a = values(d, 1);
++            let b = values(d, 2);
++            let want: f64 = a
++                .iter()
++                .zip(&b)
++                .map(|(x, y)| (*x as f64 - *y as f64).powi(2))
++                .sum();
++            let got = sqdist(&a, &b) as f64;
++            assert!(
++                (got - want).abs() <= 1e-5 * want.max(1.0),
++                "{} d={d}: got {got}, want {want}",
++                kernel_name()
++            );
++        }
++    }
++
++    #[test]
++    fn vector_leaf_scan_matches_scalar_and_brute_force() {
++        // Random floats have no distance ties, so the lists are unique.
++        for (m, dim) in [(2, 3), (5, 8), (37, 16), (130, 128), (257, 33)] {
++            let points = values(m * dim, m as u64);
++            for k in 1..=4.min(m - 1) {
++                let (scalar_ids, _) = leaf_knn(&points, dim, k, false).unwrap();
++                let (simd_ids, simd_d) = leaf_knn(&points, dim, k, true).unwrap();
++                assert_eq!(simd_ids, scalar_ids, "m={m} dim={dim} k={k}");
++                for a in 0..m {
++                    let row = |i: usize| &points[i * dim..(i + 1) * dim];
++                    let mut exact: Vec<(f64, u32)> = (0..m)
++                        .filter(|&b| b != a)
++                        .map(|b| {
++                            let d: f64 = row(a)
++                                .iter()
++                                .zip(row(b))
++                                .map(|(x, y)| (*x as f64 - *y as f64).powi(2))
++                                .sum();
++                            (d, b as u32)
++                        })
++                        .collect();
++                    exact.sort_by(|x, y| x.0.total_cmp(&y.0));
++                    let want: Vec<u32> = exact[..k].iter().map(|e| e.1).collect();
++                    assert_eq!(&simd_ids[a * k..(a + 1) * k], want.as_slice(), "point {a}");
++                    for t in 0..k {
++                        assert!((simd_d[a * k + t] as f64 - exact[t].0).abs() < 1e-3);
++                    }
++                }
++            }
++        }
++        assert!(leaf_knn(&[0.0; 6], 3, 2, true).is_err());
++    }
+ }
+diff --git a/rust/lance/src/index/loading.rs b/rust/lance/src/index/loading.rs
+index fcbed4f9c..c65eb4f5f 100644
+--- a/rust/lance/src/index/loading.rs
++++ b/rust/lance/src/index/loading.rs
+@@ -1234,20 +1234,18 @@ impl Dataset {
+ 
+                     #[cfg(feature = "pipnn")]
+                     "IVF_PIPNN_FLAT" => {
+-                        let ivf = IVFIndex::<
+-                            lance_index::vector::pipnn::PiPNN,
+-                            FlatQuantizer,
+-                        >::try_new(
+-                            object_store.clone(),
+-                            index_dir,
+-                            uuid.to_owned(),
+-                            remapping,
+-                            self.metadata_cache.as_ref(),
+-                            index_cache,
+-                            file_sizes,
+-                            open_context,
+-                        )
+-                        .await?;
++                        let ivf =
++                            IVFIndex::<lance_index::vector::pipnn::PiPNN, FlatQuantizer>::try_new(
++                                object_store.clone(),
++                                index_dir,
++                                uuid.to_owned(),
++                                remapping,
++                                self.metadata_cache.as_ref(),
++                                index_cache,
++                                file_sizes,
++                                open_context,
++                            )
++                            .await?;
+                         Ok(wrap_ivf(ivf))
+                     }
+ 
+diff --git a/rust/lance/src/index/vector/builder.rs b/rust/lance/src/index/vector/builder.rs
+index 7cbdbed69..02305fac1 100644
+--- a/rust/lance/src/index/vector/builder.rs
++++ b/rust/lance/src/index/vector/builder.rs
+@@ -1242,8 +1242,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q>
+         }
+         let partition_adjustment = Arc::new(partition_adjustment);
+         let cpus = get_num_compute_intensive_cpus().max(1);
+-        let build_concurrency = S::max_concurrent_builds(&sub_index_params)
+-            .map_or(cpus, |limit| limit.clamp(1, cpus));
++        let build_concurrency =
++            S::max_concurrent_builds(&sub_index_params).map_or(cpus, |limit| limit.clamp(1, cpus));
+         let build_iter = (0..num_partitions).map(move |partition| {
+             let output_partition_id = partition;
+             let reader = reader.clone();
+@@ -1349,9 +1349,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q>
+                 .await
+             }
+         });
+-        Ok(stream::iter(build_iter)
+-            .buffered(build_concurrency)
+-            .boxed())
++        Ok(stream::iter(build_iter).buffered(build_concurrency).boxed())
+     }
+ 
+     #[allow(clippy::too_many_arguments)]
+@@ -1366,8 +1364,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q>
+         limits: FreshPartitionBuildLimits,
+     ) -> Result<BuildStream<S, Q>> {
+         let cpus = get_num_compute_intensive_cpus().max(1);
+-        let concurrency = S::max_concurrent_builds(&sub_index_params)
+-            .map_or(cpus, |limit| limit.clamp(1, cpus));
++        let concurrency =
++            S::max_concurrent_builds(&sub_index_params).map_or(cpus, |limit| limit.clamp(1, cpus));
+         let max_entries = concurrency.saturating_mul(PARTITION_BUILD_ENTRIES_PER_WORKER);
+         let cpu_permits = Arc::new(Semaphore::new(concurrency));
+         let jobs = stream::try_unfold(0usize, move |next_partition_id| {
+-- 
+2.25.1
+

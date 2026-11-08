@@ -3,6 +3,21 @@
 A small Python/NumPy implementation with build, add, delete, update, graph search,
 and recall monitoring. This is an educational prototype, not the authors implementation.
 
+## Reproducing the index-build benchmarks (x86_64 and ARM)
+
+Everything for the Lance index-build work (ARM NEON/SVE kernels, tree assignment, PiPNN
+centroid assignment and `IVF_PIPNN_FLAT` partition graphs, Suites A/B/C, kernel
+ablations) runs from one script, identically on x86_64 and aarch64:
+
+```bash
+./lance_index_build/bench.sh doctor && ./lance_index_build/bench.sh all
+```
+
+See [lance_index_build/README.md](lance_index_build/README.md) for the subcommands, kernels and
+result layout. The Lance changes are versioned in `lance_index_build/patches/` and applied to
+a pinned upstream revision by `bench.sh setup`; `lance_arm_sve/` and `lance_ivf_rq/` are the
+earlier standalone patches, now folded into that series.
+
 ## Run with uv
 
 Requires Python 3.10+ and uv. The checked-in uv.lock pins the dependency resolution.

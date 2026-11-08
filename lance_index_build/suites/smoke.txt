@@ -1,0 +1,6 @@
+# Correctness smoke on a 100k BIGANN prefix (exact ground truth recomputed). Minutes.
+# <config> <run-name> [KEY=VALUE ...]
+configs/smoke-bigann100k-assign.env      smoke-assign
+configs/smoke-bigann100k-graphs.env      smoke-graphs-hnsw   INDEX=ivf_hnsw_flat
+configs/smoke-bigann100k-graphs.env      smoke-graphs-pipnn  INDEX=ivf_pipnn_flat
+configs/smoke-bigann100k-pipnn-sweep.env smoke-pipnn-sweep

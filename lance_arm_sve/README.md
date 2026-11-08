@@ -1,5 +1,9 @@
 # ARM SVE/SVE2 kernels for Lance
 
+> **Superseded.** These changes are part of the Lance patch series in
+> [`lance_index_build/patches/`](../lance_index_build/patches/); run experiments with
+> [`lance_index_build/bench.sh`](../lance_index_build/bench.sh). Kept for history.
+
 This patch adds ARM implementations of existing Lance operations and selects
 them through Lance's CPU dispatcher. It does not introduce blocked-L2 IVF,
 change vector-search algorithms, or change file/index layouts.

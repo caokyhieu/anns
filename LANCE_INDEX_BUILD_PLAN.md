@@ -1,6 +1,6 @@
 # Lance index build optimization plan
 
-Status: plan defaults accepted on 7 November 2026, with mandatory x86_64 and AArch64 support. Implementation is in progress in `lance_index_build/worktrees/lance` (branch `index-build-tree-pipnn`); see [`lance_index_build/README.md`](lance_index_build/README.md) for per-phase state. Phases 0, 2, 4 and the benchmark runner (phase 1) are done; phase 3 is done for full-dataset assignment; phase 5 builds and searches `IVF_PIPNN_FLAT`; phase 6 has only the ported SVE kernels. x86 smoke tests pass. No full A/B/C measurements or native ARM runs yet.
+Status: plan defaults accepted on 7 November 2026, with mandatory x86_64 and AArch64 support. Implementation lives in the Lance patch series [`lance_index_build/patches/`](lance_index_build/patches/) (branch `index-build-tree-pipnn`, applied by `lance_index_build/bench.sh setup`); see [`lance_index_build/README.md`](lance_index_build/README.md) for per-phase state. Phases 0–5 are done; phase 6 has the P0/P1 ARM kernels (NEON/SVE dot tiles, SVE L2 batch, contiguous tree routing, PiPNN NEON/SVE distance and NEON leaf scan), verified on x86 and under QEMU AArch64. No native ARM measurements or full A/B/C evaluation yet.
 
 Prepared 7 November 2026. Primary objective: reduce complete index build time while measuring the effect on query latency, recall, memory, and index size.
 

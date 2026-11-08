@@ -1,0 +1,2 @@
+# Suite B: centroid assignment backends (exact, HNSW, PiPNN, tree) with fixed centroids, K > 10,000.
+configs/suiteB-bigann10m-k16384-fixed.env  B-bigann10m-k16384

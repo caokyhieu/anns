@@ -1,0 +1,10 @@
+# Kernel ablations (plan §5.5): identical configs, kernels switched off one at a time.
+#  LANCE_DISABLE_BLOCKED_L2=1  per-vector exact assignment / k-means instead of 4x4 tiles (runtime)
+#  LANCE_DISABLE_SVE_BUILD=1   build without SVE objects -> NEON on aarch64 (separate target dir; no-op on x86)
+#  LANCE_PIPNN_SCALAR=1        scalar PiPNN distance kernels and leaf scan (runtime)
+configs/suiteA-gist-k1000.env       abl-gist-k1000-default    ASSIGN=exact,tree:8 REPEATS=1
+configs/suiteA-gist-k1000.env       abl-gist-k1000-noblocked  ASSIGN=exact,tree:8 REPEATS=1 LANCE_DISABLE_BLOCKED_L2=1
+configs/suiteA-gist-k1000.env       abl-gist-k1000-nosve      ASSIGN=exact,tree:8 REPEATS=1 LANCE_DISABLE_SVE_BUILD=1
+configs/suiteC-memory-pilot-1m.env  abl-pipnn-1m-default      INDEX=ivf_pipnn_flat
+configs/suiteC-memory-pilot-1m.env  abl-pipnn-1m-scalar       INDEX=ivf_pipnn_flat LANCE_PIPNN_SCALAR=1
+configs/suiteC-memory-pilot-1m.env  abl-pipnn-1m-nosve        INDEX=ivf_pipnn_flat LANCE_DISABLE_SVE_BUILD=1
