@@ -1,0 +1,102 @@
+[
+ {
+  "slide": 1,
+  "title": "— Huawei Confidential —",
+  "notes_chars": 915
+ },
+ {
+  "slide": 2,
+  "title": "Three build wins measured; Kunpeng kernels next",
+  "notes_chars": 1831
+ },
+ {
+  "slide": 3,
+  "title": "Target (3): faster index construction",
+  "notes_chars": 971
+ },
+ {
+  "slide": 4,
+  "title": "Build time sits in three dense-distance loops",
+  "notes_chars": 1696
+ },
+ {
+  "slide": 5,
+  "title": "One project: three work packages, one kernel layer",
+  "notes_chars": 1542
+ },
+ {
+  "slide": 6,
+  "title": "Tiling the distance loop doubled x86 build speed",
+  "notes_chars": 1298
+ },
+ {
+  "slide": 7,
+  "title": "One tiled L2 + argmin kernel serves every new loop",
+  "notes_chars": 1512
+ },
+ {
+  "slide": 8,
+  "title": "Six SVE kernels ready; tiled kernels are next",
+  "notes_chars": 1346
+ },
+ {
+  "slide": 9,
+  "title": "Kunpeng runs reuse frozen configs, five ablations",
+  "notes_chars": 1482
+ },
+ {
+  "slide": 10,
+  "title": "Reuse the trained tree to assign rows",
+  "notes_chars": 1561
+ },
+ {
+  "slide": 11,
+  "title": "Tree assignment cuts BIGANN10M build time 2.5×",
+  "notes_chars": 1349
+ },
+ {
+  "slide": 12,
+  "title": "PiPNN swaps insertion search for leaf matrix math",
+  "notes_chars": 1423
+ },
+ {
+  "slide": 13,
+  "title": "PiPNN builds partition graphs 4.9× faster",
+  "notes_chars": 1868
+ },
+ {
+  "slide": 14,
+  "title": "Kunpeng baseline first; every step has a gate",
+  "notes_chars": 1099
+ },
+ {
+  "slide": 15,
+  "title": "Approve WP1 on Kunpeng, then WP2 and WP3",
+  "notes_chars": 1315
+ },
+ {
+  "slide": 16,
+  "title": "Appendix A1 · All assignment methods, both datasets",
+  "notes_chars": 696
+ },
+ {
+  "slide": 17,
+  "title": "Appendix A2 · Recall grid and tail latency",
+  "notes_chars": 1045
+ },
+ {
+  "slide": 18,
+  "title": "Appendix A3 · Blocked L2 + constant scale",
+  "notes_chars": 690
+ },
+ {
+  "slide": 19,
+  "title": "Appendix A4 · PiPNN memory: model and measurements",
+  "notes_chars": 975
+ },
+ {
+  "slide": 20,
+  "title": "Appendix A5 · Runs, sources and references",
+  "notes_chars": 1989
+ }
+]

@@ -1,0 +1,23 @@
+{
+  "layout": "Research-to-Product",
+  "color_reference": "../../uncertainty-aware-scheduler-condensed-v6.pptx",
+  "override": "User requested reference deck colors on 5 November 2026",
+  "font": "Microsoft YaHei",
+  "palette": {
+    "title": "C00000", "red": "C7000B", "kicker": "0070C0", "corner": "00B0F0",
+    "ink": "1D1D1A", "body": "595757", "muted": "898989", "surface": "F5F5F5", "border": "DDDDDD",
+    "blue": "2A78D6", "blue_dark": "1C5CAB", "blue_light": "E4EEFA",
+    "green": "1BAF7A", "green_dark": "0F7A55", "green_light": "E1F5EE",
+    "purple": "4A3AA7", "purple_dark": "3B2E86", "purple_light": "ECE9F6",
+    "orange": "EB6834", "orange_light": "FDF3D9"
+  },
+  "roles": {
+    "red": "ADS target (3), decision emphasis and selected optimization",
+    "blue": "assignment / blocked L2",
+    "green": "constant-scale encoding / optimized output",
+    "purple": "partition organization or prospective adaptive algorithm",
+    "orange": "quality trade-off and profiling gaps",
+    "grey": "baseline and supporting context"
+  },
+  "status_encoding": "Text labels and dashed borders distinguish proposed from implemented; colors identify mechanisms, not evidence strength."
+}
