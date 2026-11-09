@@ -1,0 +1,9 @@
+{
+"algorithm":"fastpipnn","n":10000000,"dimension":128,"query_count":200,"threads":4,"query_threads":1,"load_seconds":1.881701474,"build_seconds":222.2711932,"build_peak_mib":18846.01562,"degree":64,"leaf_size":1024,"local_k":2,"reservoir":160,"hash_bits":12,"alpha":1.2,"fanout":"10,3,1","leaders":1000,"m":32,"ef_construction":200,"entry":"medoid","distance":"squared_l2_uint8","phases":{"sketch_seconds":0.512111595,"partition_seconds":72.21785992,"leaf_seconds":118.2116132,"prune_seconds":31.32684119,"leaves":987609,"leaf_points":299999613,"depth":8,"random_splits":0,"mean_reservoir":50.1469063,"mean_degree":35.3361577},"queries":[
+{"beam":16,"recall_at_10":0.7795,"qps":11431.6534,"median_seconds":0.017495282},
+{"beam":32,"recall_at_10":0.888,"qps":6825.844216,"median_seconds":0.029300405},
+{"beam":64,"recall_at_10":0.955,"qps":3787.007418,"median_seconds":0.052812149},
+{"beam":128,"recall_at_10":0.986,"qps":2127.457511,"median_seconds":0.094008928},
+{"beam":256,"recall_at_10":0.995,"qps":1181.189314,"median_seconds":0.169320868},
+{"beam":512,"recall_at_10":0.9995,"qps":574.9058996,"median_seconds":0.347883019}
+],"peak_mib":18846.01562}

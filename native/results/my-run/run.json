@@ -1,0 +1,206 @@
+{
+  "parameters": {
+    "base": "data/bigann10m/base.10M.u8bin",
+    "queries": "data/bigann10m/query.u8bin",
+    "gt": "data/bigann10m/gt.10M.ibin",
+    "threads": 4,
+    "query_threads": 1,
+    "query_count": 200,
+    "repeats": 1,
+    "beams": "16,32,64,128,256,512",
+    "output": "native/results/my-run",
+    "m": 32,
+    "ef_construction": 200,
+    "alpha": 1.2,
+    "degree": 64,
+    "algorithms": "pipnn,hnsw,fastpipnn",
+    "allow_small": true
+  },
+  "dataset_label": "custom/smoke",
+  "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.31",
+  "cpu": "x86_64",
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "start_load_average": [
+    1.25,
+    1.76,
+    1.78
+  ],
+  "sources": {
+    "PiPNN": {
+      "url": "https://github.com/ParAlg/PiPNN.git",
+      "commit": "443a328dc71a3b7be753d52ca2b3c9a4ba77f3fd"
+    },
+    "PiPNN/parlaylib": {
+      "url": "https://github.com/cmuparlay/parlaylib.git",
+      "commit": "7cdb4cae8f020525f5eb4ad82e2565d1e38cfbc3"
+    },
+    "hnswlib": {
+      "url": "https://github.com/nmslib/hnswlib.git",
+      "commit": "3f3429661187e4c24a490a0f148fc6bc89042b3d"
+    },
+    "eigen": {
+      "url": "https://github.com/eigen-mirror/eigen.git",
+      "commit": "3147391d946bb4b6c68edd901f2add6ac1f31f8c"
+    },
+    "abseil": {
+      "url": "https://github.com/abseil/abseil-cpp.git",
+      "commit": "bc257a88f7c1939f24e0379f14a3589e926c950c"
+    },
+    "highway": {
+      "url": "https://github.com/google/highway.git",
+      "commit": "ac0d5d297b13ab1b89f48484fc7911082d76a93f"
+    }
+  },
+  "inputs": [
+    {
+      "path": "/home/caokyhieu/anns/data/bigann10m/base.10M.u8bin",
+      "bytes": 1280000008,
+      "sha256": "3f92342f582ebe3aa50751be105791e11894c4caac5b9d3321999457c56b054d"
+    },
+    {
+      "path": "/home/caokyhieu/anns/data/bigann10m/query.u8bin",
+      "bytes": 1280008,
+      "sha256": "eca755831fc9a8004e14886df48b81109a8ed3bfc6b632509c93c0460a30d552"
+    },
+    {
+      "path": "/home/caokyhieu/anns/data/bigann10m/gt.10M.ibin",
+      "bytes": 8000008,
+      "sha256": "80a4e35d5dc918e00e55f81e133e333e3b65f4de1426728c8a3ca93ac5ce74df"
+    }
+  ],
+  "binary_sha256": "1408950338a16ffcb315469a27b0f1ac47a7754054d711562dcae2bcd17ce7c3",
+  "commands": [
+    [
+      "/home/caokyhieu/anns/native/build/ann_bench",
+      "--algorithm",
+      "pipnn",
+      "--base",
+      "/home/caokyhieu/anns/data/bigann10m/base.10M.u8bin",
+      "--queries",
+      "/home/caokyhieu/anns/data/bigann10m/query.u8bin",
+      "--gt",
+      "/home/caokyhieu/anns/data/bigann10m/gt.10M.ibin",
+      "--threads",
+      "4",
+      "--query-threads",
+      "1",
+      "--query-count",
+      "200",
+      "--beams",
+      "16,32,64,128,256,512",
+      "--m",
+      "32",
+      "--ef-construction",
+      "200",
+      "--alpha",
+      "1.2",
+      "--degree",
+      "64",
+      "--reservoir",
+      "160",
+      "--output",
+      "/home/caokyhieu/anns/native/results/my-run/pipnn-0.json"
+    ],
+    [
+      "/home/caokyhieu/anns/native/build/ann_bench",
+      "--algorithm",
+      "hnsw",
+      "--base",
+      "/home/caokyhieu/anns/data/bigann10m/base.10M.u8bin",
+      "--queries",
+      "/home/caokyhieu/anns/data/bigann10m/query.u8bin",
+      "--gt",
+      "/home/caokyhieu/anns/data/bigann10m/gt.10M.ibin",
+      "--threads",
+      "4",
+      "--query-threads",
+      "1",
+      "--query-count",
+      "200",
+      "--beams",
+      "16,32,64,128,256,512",
+      "--m",
+      "32",
+      "--ef-construction",
+      "200",
+      "--alpha",
+      "1.2",
+      "--degree",
+      "64",
+      "--reservoir",
+      "160",
+      "--output",
+      "/home/caokyhieu/anns/native/results/my-run/hnsw-0.json"
+    ],
+    [
+      "/home/caokyhieu/anns/native/build/ann_bench",
+      "--algorithm",
+      "fastpipnn",
+      "--base",
+      "/home/caokyhieu/anns/data/bigann10m/base.10M.u8bin",
+      "--queries",
+      "/home/caokyhieu/anns/data/bigann10m/query.u8bin",
+      "--gt",
+      "/home/caokyhieu/anns/data/bigann10m/gt.10M.ibin",
+      "--threads",
+      "4",
+      "--query-threads",
+      "1",
+      "--query-count",
+      "200",
+      "--beams",
+      "16,32,64,128,256,512",
+      "--m",
+      "32",
+      "--ef-construction",
+      "200",
+      "--alpha",
+      "1.2",
+      "--degree",
+      "64",
+      "--reservoir",
+      "160",
+      "--output",
+      "/home/caokyhieu/anns/native/results/my-run/fastpipnn-0.json"
+    ]
+  ],
+  "status": "complete",
+  "end_load_average": [
+    4.14,
+    4.34,
+    4.45
+  ]
+}

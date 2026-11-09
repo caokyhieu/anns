@@ -1,0 +1,306 @@
+{
+  "results": [
+    {
+      "algorithm": "pipnn",
+      "n": 10000000,
+      "dimension": 128,
+      "query_count": 200,
+      "threads": 4,
+      "query_threads": 1,
+      "load_seconds": 1.851298241,
+      "build_seconds": 1128.4822,
+      "build_peak_mib": 20150.81641,
+      "degree": 64,
+      "leaf_size": 1024,
+      "local_k": 2,
+      "reservoir": 160,
+      "hash_bits": 12,
+      "alpha": 1.2,
+      "fanout": "10,3,1",
+      "leaders": 1000,
+      "m": 32,
+      "ef_construction": 200,
+      "entry": "medoid",
+      "distance": "squared_l2_uint8",
+      "queries": [
+        {
+          "beam": 16,
+          "recall_at_10": 0.7905,
+          "qps": 10187.8445,
+          "median_seconds": 0.019631238
+        },
+        {
+          "beam": 32,
+          "recall_at_10": 0.9,
+          "qps": 5850.020908,
+          "median_seconds": 0.034187912
+        },
+        {
+          "beam": 64,
+          "recall_at_10": 0.9565,
+          "qps": 3198.02132,
+          "median_seconds": 0.06253867
+        },
+        {
+          "beam": 128,
+          "recall_at_10": 0.986,
+          "qps": 1817.385407,
+          "median_seconds": 0.110048204
+        },
+        {
+          "beam": 256,
+          "recall_at_10": 0.9965,
+          "qps": 1015.662191,
+          "median_seconds": 0.196915866
+        },
+        {
+          "beam": 512,
+          "recall_at_10": 0.999,
+          "qps": 542.2738103,
+          "median_seconds": 0.368817369
+        }
+      ],
+      "peak_mib": 20150.81641,
+      "repeat": 0,
+      "process_wall_seconds": 1137.0421420000494
+    },
+    {
+      "algorithm": "hnsw",
+      "n": 10000000,
+      "dimension": 128,
+      "query_count": 200,
+      "threads": 4,
+      "query_threads": 1,
+      "load_seconds": 1.841402493,
+      "build_seconds": 1556.538571,
+      "build_peak_mib": 6070.625,
+      "degree": 64,
+      "leaf_size": 1024,
+      "local_k": 2,
+      "reservoir": 160,
+      "hash_bits": 12,
+      "alpha": 1.2,
+      "fanout": "10,3,1",
+      "leaders": 1000,
+      "m": 32,
+      "ef_construction": 200,
+      "entry": "medoid",
+      "distance": "squared_l2_uint8",
+      "queries": [
+        {
+          "beam": 16,
+          "recall_at_10": 0.798,
+          "qps": 14107.84062,
+          "median_seconds": 0.014176514
+        },
+        {
+          "beam": 32,
+          "recall_at_10": 0.8925,
+          "qps": 8845.623177,
+          "median_seconds": 0.022610052
+        },
+        {
+          "beam": 64,
+          "recall_at_10": 0.9575,
+          "qps": 5025.45645,
+          "median_seconds": 0.03979738
+        },
+        {
+          "beam": 128,
+          "recall_at_10": 0.9845,
+          "qps": 2780.064149,
+          "median_seconds": 0.071940786
+        },
+        {
+          "beam": 256,
+          "recall_at_10": 0.9945,
+          "qps": 1493.689728,
+          "median_seconds": 0.133896616
+        },
+        {
+          "beam": 512,
+          "recall_at_10": 0.998,
+          "qps": 805.8861538,
+          "median_seconds": 0.248174012
+        }
+      ],
+      "peak_mib": 6070.875,
+      "repeat": 0,
+      "process_wall_seconds": 1562.1040271599777
+    },
+    {
+      "algorithm": "fastpipnn",
+      "n": 10000000,
+      "dimension": 128,
+      "query_count": 200,
+      "threads": 4,
+      "query_threads": 1,
+      "load_seconds": 1.881701474,
+      "build_seconds": 222.2711932,
+      "build_peak_mib": 18846.01562,
+      "degree": 64,
+      "leaf_size": 1024,
+      "local_k": 2,
+      "reservoir": 160,
+      "hash_bits": 12,
+      "alpha": 1.2,
+      "fanout": "10,3,1",
+      "leaders": 1000,
+      "m": 32,
+      "ef_construction": 200,
+      "entry": "medoid",
+      "distance": "squared_l2_uint8",
+      "phases": {
+        "sketch_seconds": 0.512111595,
+        "partition_seconds": 72.21785992,
+        "leaf_seconds": 118.2116132,
+        "prune_seconds": 31.32684119,
+        "leaves": 987609,
+        "leaf_points": 299999613,
+        "depth": 8,
+        "random_splits": 0,
+        "mean_reservoir": 50.1469063,
+        "mean_degree": 35.3361577
+      },
+      "queries": [
+        {
+          "beam": 16,
+          "recall_at_10": 0.7795,
+          "qps": 11431.6534,
+          "median_seconds": 0.017495282
+        },
+        {
+          "beam": 32,
+          "recall_at_10": 0.888,
+          "qps": 6825.844216,
+          "median_seconds": 0.029300405
+        },
+        {
+          "beam": 64,
+          "recall_at_10": 0.955,
+          "qps": 3787.007418,
+          "median_seconds": 0.052812149
+        },
+        {
+          "beam": 128,
+          "recall_at_10": 0.986,
+          "qps": 2127.457511,
+          "median_seconds": 0.094008928
+        },
+        {
+          "beam": 256,
+          "recall_at_10": 0.995,
+          "qps": 1181.189314,
+          "median_seconds": 0.169320868
+        },
+        {
+          "beam": 512,
+          "recall_at_10": 0.9995,
+          "qps": 574.9058996,
+          "median_seconds": 0.347883019
+        }
+      ],
+      "peak_mib": 18846.01562,
+      "repeat": 0,
+      "process_wall_seconds": 227.9953427668661
+    }
+  ],
+  "matched_recall": [
+    {
+      "target_recall": 0.9,
+      "measurements": [
+        {
+          "algorithm": "pipnn",
+          "repeat": 0,
+          "build_seconds": 1128.4822,
+          "beam": 32,
+          "recall_at_10": 0.9,
+          "qps": 5850.020908,
+          "median_seconds": 0.034187912
+        },
+        {
+          "algorithm": "hnsw",
+          "repeat": 0,
+          "build_seconds": 1556.538571,
+          "beam": 64,
+          "recall_at_10": 0.9575,
+          "qps": 5025.45645,
+          "median_seconds": 0.03979738
+        },
+        {
+          "algorithm": "fastpipnn",
+          "repeat": 0,
+          "build_seconds": 222.2711932,
+          "beam": 64,
+          "recall_at_10": 0.955,
+          "qps": 3787.007418,
+          "median_seconds": 0.052812149
+        }
+      ]
+    },
+    {
+      "target_recall": 0.95,
+      "measurements": [
+        {
+          "algorithm": "pipnn",
+          "repeat": 0,
+          "build_seconds": 1128.4822,
+          "beam": 64,
+          "recall_at_10": 0.9565,
+          "qps": 3198.02132,
+          "median_seconds": 0.06253867
+        },
+        {
+          "algorithm": "hnsw",
+          "repeat": 0,
+          "build_seconds": 1556.538571,
+          "beam": 64,
+          "recall_at_10": 0.9575,
+          "qps": 5025.45645,
+          "median_seconds": 0.03979738
+        },
+        {
+          "algorithm": "fastpipnn",
+          "repeat": 0,
+          "build_seconds": 222.2711932,
+          "beam": 64,
+          "recall_at_10": 0.955,
+          "qps": 3787.007418,
+          "median_seconds": 0.052812149
+        }
+      ]
+    },
+    {
+      "target_recall": 0.99,
+      "measurements": [
+        {
+          "algorithm": "pipnn",
+          "repeat": 0,
+          "build_seconds": 1128.4822,
+          "beam": 256,
+          "recall_at_10": 0.9965,
+          "qps": 1015.662191,
+          "median_seconds": 0.196915866
+        },
+        {
+          "algorithm": "hnsw",
+          "repeat": 0,
+          "build_seconds": 1556.538571,
+          "beam": 256,
+          "recall_at_10": 0.9945,
+          "qps": 1493.689728,
+          "median_seconds": 0.133896616
+        },
+        {
+          "algorithm": "fastpipnn",
+          "repeat": 0,
+          "build_seconds": 222.2711932,
+          "beam": 256,
+          "recall_at_10": 0.995,
+          "qps": 1181.189314,
+          "median_seconds": 0.169320868
+        }
+      ]
+    }
+  ]
+}
