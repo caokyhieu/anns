@@ -48,6 +48,8 @@ are self-describing. Cross-machine timings are context, not speedup ratios (plan
 | Switch | Effect | Kind |
 |---|---|---|
 | `LANCE_DISABLE_BLOCKED_L2=1` | exact assignment / k-means use per-vector distances instead of 4x4 tiles | runtime |
+| `LANCE_SIMD_MAX_WIDTH=256` | hide AVX-512 from runtime dispatch: every dispatched kernel is ≤ 256-bit (equal-width ablations) | runtime |
+| `LANCE_L2_BATCH_AVX512=1` | per-vector f32 L2 batch on 512-bit registers (default dispatch has no AVX-512 batch) | runtime |
 | `LANCE_DISABLE_SVE_BUILD=1` | build without SVE objects (NEON on aarch64); `run.sh` uses `target-nosve/` | build |
 | `LANCE_PIPNN_SCALAR=1` | scalar PiPNN distance kernel and leaf top-k scan | runtime |
 | `LANCE_PIPNN_NATIVE=1` | compile the PiPNN builder with `-march=native` (label such runs) | build |

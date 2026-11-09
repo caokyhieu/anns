@@ -1,0 +1,357 @@
+From 25a661d0ee0daaecfd45a01b049c3addb3504d90 Mon Sep 17 00:00:00 2001
+From: lance-index-build <lance-index-build@localhost>
+Date: Mon, 9 Nov 2026 10:25:01 +0000
+Subject: [PATCH] bench(index): equal-width controls for blocked vs per-vector
+ assignment
+
+The blocked-L2 ablation compared an AVX-512 4x4 tile with the 256-bit
+per-vector batch kernel on AVX-512 hosts, so tiling and vector width were
+confounded. Add:
+
+- LANCE_SIMD_MAX_WIDTH=256: hide AVX-512 from runtime dispatch, so every
+  dispatched kernel (tile, batch, pair) is at most 256-bit.
+- LANCE_L2_BATCH_AVX512=1: opt-in 512-bit per-vector f32 L2 batch
+  (l2_f32_avx512 per row); default dispatch is unchanged.
+- Manifest records the selected f32 L2 batch and pair kernels.
+- assign_micro: exact-assignment microbenchmark through
+  compute_partitions_arrow_array on real BIGANN / GIST rows.
+---
+ rust/lance-core/src/utils/cpu.rs              |  53 ++++++-
+ .../lance-index-bench/src/bin/assign_micro.rs | 133 ++++++++++++++++++
+ rust/lance-index-bench/src/main.rs            |   2 +
+ rust/lance-linalg/src/distance/l2.rs          |  84 +++++++++++
+ 4 files changed, 271 insertions(+), 1 deletion(-)
+ create mode 100644 rust/lance-index-bench/src/bin/assign_micro.rs
+
+diff --git a/rust/lance-core/src/utils/cpu.rs b/rust/lance-core/src/utils/cpu.rs
+index ef29a6cae..f665401fa 100644
+--- a/rust/lance-core/src/utils/cpu.rs
++++ b/rust/lance-core/src/utils/cpu.rs
+@@ -312,7 +312,58 @@ const BASELINE: CpuFeatures = {
+ // assumes. `Dispatch` relies on the host set containing the baseline, so add
+ // it explicitly.
+ static HOST_FEATURES: LazyLock<CpuFeatures> =
+-    LazyLock::new(|| detect_host_features().union(BASELINE));
++    LazyLock::new(|| cap_vector_width(detect_host_features()).union(BASELINE));
++
++/// Every AVX-512 feature bit, which `LANCE_SIMD_MAX_WIDTH=256` hides.
++const AVX512_ALL: CpuFeatures = CpuFeatures(
++    CpuFeatures::AVX512F.0
++        | CpuFeatures::AVX512BW.0
++        | CpuFeatures::AVX512CD.0
++        | CpuFeatures::AVX512DQ.0
++        | CpuFeatures::AVX512VL.0
++        | CpuFeatures::AVX512FP16.0
++        | CpuFeatures::AVX512VNNI.0
++        | CpuFeatures::AVX512VPOPCNTDQ.0
++        | CpuFeatures::AVX512VBMI.0
++        | CpuFeatures::AVX512BF16.0,
++);
++
++/// Benchmark control: `LANCE_SIMD_MAX_WIDTH=256` removes AVX-512 from the
++/// host set, so every [`Dispatch`] picks its best kernel of at most 256 bits.
++/// Kernel comparisons can then hold vector width fixed. Code that calls
++/// `is_x86_feature_detected!` itself is not affected. Any other value, or no
++/// value, leaves detection unchanged.
++fn cap_vector_width(features: CpuFeatures) -> CpuFeatures {
++    cap_vector_width_to(features, std::env::var("LANCE_SIMD_MAX_WIDTH").ok().as_deref())
++}
++
++fn cap_vector_width_to(features: CpuFeatures, max_width: Option<&str>) -> CpuFeatures {
++    match max_width {
++        Some("256") => CpuFeatures(features.0 & !AVX512_ALL.0),
++        _ => features,
++    }
++}
++
++#[cfg(test)]
++mod width_cap_tests {
++    use super::*;
++
++    #[test]
++    fn cap_256_removes_only_avx512() {
++        let all = CpuFeatures::AVX2
++            .union(CpuFeatures::FMA)
++            .union(CpuFeatures::AVX512F)
++            .union(CpuFeatures::AVX512BF16)
++            .union(CpuFeatures::AVX512VL);
++        let capped = cap_vector_width_to(all, Some("256"));
++        assert!(capped.contains(CpuFeatures::AVX2.union(CpuFeatures::FMA)));
++        assert!(!capped.contains(CpuFeatures::AVX512F));
++        assert!(!capped.contains(CpuFeatures::AVX512BF16));
++        assert!(!capped.contains(CpuFeatures::AVX512VL));
++        assert_eq!(cap_vector_width_to(all, None).0, all.0);
++        assert_eq!(cap_vector_width_to(all, Some("512")).0, all.0);
++    }
++}
+ 
+ #[cfg(target_arch = "x86_64")]
+ fn detect_host_features() -> CpuFeatures {
+diff --git a/rust/lance-index-bench/src/bin/assign_micro.rs b/rust/lance-index-bench/src/bin/assign_micro.rs
+new file mode 100644
+index 000000000..7dfe8c960
+--- /dev/null
++++ b/rust/lance-index-bench/src/bin/assign_micro.rs
+@@ -0,0 +1,133 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright The Lance Authors
++
++//! Exact nearest-centroid microbenchmark through Lance's public assignment entry
++//! point (`compute_partitions_arrow_array`, the code IVF builds use), so kernel
++//! selection follows the same environment switches as a full build:
++//!
++//! * `LANCE_DISABLE_BLOCKED_L2=1`  per-vector (pairwise) instead of blocked 4x4 tiles
++//! * `LANCE_SIMD_MAX_WIDTH=256`    hide AVX-512 from runtime dispatch
++//! * `LANCE_L2_BATCH_AVX512=1`     per-vector batch on 512-bit registers
++//!
++//! Each process measures one kernel arm; run arms as separate processes because
++//! dispatch is decided once per process.
++//!
++//! Usage: assign_micro <bigann|gist> <data_dir> <rows> <k1,k2,..> <reps> <out_prefix>
++//! Rows are the first `rows` base vectors; centroids are `k` base vectors taken
++//! at a fixed stride from the second half of the file, identical for every arm.
++//! Prints one JSON line per k and writes the assignments to `<out_prefix>-k<k>.u32`.
++
++use std::fs::File;
++use std::io::{Read, Seek, SeekFrom, Write};
++use std::path::Path;
++use std::sync::Arc;
++use std::time::Instant;
++
++use arrow_array::{FixedSizeListArray, Float32Array};
++use arrow_schema::{DataType, Field};
++use lance_linalg::distance::DistanceType;
++use serde_json::json;
++
++fn read_rows(kind: &str, dir: &Path, start: usize, count: usize) -> (Vec<f32>, usize, usize) {
++    match kind {
++        "bigann" => {
++            let mut f = File::open(dir.join("base.10M.u8bin")).unwrap();
++            let mut h = [0u8; 8];
++            f.read_exact(&mut h).unwrap();
++            let total = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
++            let dim = u32::from_le_bytes(h[4..8].try_into().unwrap()) as usize;
++            f.seek(SeekFrom::Start(8 + (start * dim) as u64)).unwrap();
++            let mut raw = vec![0u8; count * dim];
++            f.read_exact(&mut raw).unwrap();
++            (raw.into_iter().map(f32::from).collect(), dim, total)
++        }
++        "gist" => {
++            let meta = std::fs::read_to_string(dir.join("meta.txt")).unwrap();
++            let mut it = meta.split_whitespace().map(|v| v.parse::<usize>().unwrap());
++            let (total, dim) = (it.next().unwrap(), it.next().unwrap());
++            let mut f = File::open(dir.join("base.f32")).unwrap();
++            f.seek(SeekFrom::Start((start * dim * 4) as u64)).unwrap();
++            let mut raw = vec![0u8; count * dim * 4];
++            f.read_exact(&mut raw).unwrap();
++            let v = raw
++                .chunks_exact(4)
++                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
++                .collect();
++            (v, dim, total)
++        }
++        _ => panic!("dataset must be bigann or gist"),
++    }
++}
++
++fn fsl(values: Vec<f32>, dim: usize) -> FixedSizeListArray {
++    FixedSizeListArray::try_new(
++        Arc::new(Field::new("item", DataType::Float32, true)),
++        dim as i32,
++        Arc::new(Float32Array::from(values)),
++        None,
++    )
++    .unwrap()
++}
++
++fn main() {
++    let a: Vec<String> = std::env::args().collect();
++    assert!(a.len() == 7, "usage: assign_micro <bigann|gist> <data_dir> <rows> <k,..> <reps> <out_prefix>");
++    let (kind, dir) = (a[1].as_str(), Path::new(&a[2]));
++    let rows: usize = a[3].parse().unwrap();
++    let ks: Vec<usize> = a[4].split(',').map(|k| k.parse().unwrap()).collect();
++    let reps: usize = a[5].parse().unwrap();
++    let out_prefix = &a[6];
++
++    let (data, dim, total) = read_rows(kind, dir, 0, rows);
++    let vectors = fsl(data, dim);
++    let threads = rayon::current_num_threads();
++    for &k in &ks {
++        // k centroids at a fixed stride from the second half of the file.
++        let half = total / 2;
++        let stride = (total - half) / k;
++        let mut cent = Vec::with_capacity(k * dim);
++        for j in 0..k {
++            cent.extend(read_rows(kind, dir, half + j * stride, 1).0);
++        }
++        let centroids = fsl(cent, dim);
++        // One warm-up, then `reps` timed calls.
++        let (parts, _) =
++            lance_index::vector::kmeans::compute_partitions_arrow_array(&centroids, &vectors, DistanceType::L2).unwrap();
++        let mut times = Vec::with_capacity(reps);
++        for _ in 0..reps {
++            let t = Instant::now();
++            let r = lance_index::vector::kmeans::compute_partitions_arrow_array(&centroids, &vectors, DistanceType::L2)
++                .unwrap();
++            times.push(t.elapsed().as_secs_f64());
++            std::hint::black_box(r);
++        }
++        let mut sorted = times.clone();
++        sorted.sort_by(f64::total_cmp);
++        let median = sorted[reps / 2];
++        let mut f = File::create(format!("{out_prefix}-k{k}.u32")).unwrap();
++        let ids: Vec<u8> = parts.iter().flat_map(|p| p.unwrap_or(u32::MAX).to_le_bytes()).collect();
++        f.write_all(&ids).unwrap();
++        let pairs = (rows * k) as f64;
++        println!(
++            "{}",
++            json!({
++                "dataset": kind, "dim": dim, "rows": rows, "k": k, "threads": threads,
++                "table_bytes": k * dim * 4,
++                "times_s": times, "median_s": median,
++                "ns_per_distance": median * 1e9 / pairs,
++                "gflops_2kd": 2.0 * pairs * dim as f64 / median / 1e9,
++                "kernels": {
++                    "blocked_l2": lance_index::vector::blocked_l2_kernel_name(),
++                    "dot_tile": lance_linalg::distance::tile::dot_tile_kernel_name(),
++                    "l2_f32_batch": lance_linalg::distance::l2::l2_f32_batch_kernel_name(),
++                    "l2_f32_pair": lance_linalg::distance::l2::l2_f32_kernel_name(),
++                },
++                "env": {
++                    "LANCE_DISABLE_BLOCKED_L2": std::env::var("LANCE_DISABLE_BLOCKED_L2").ok(),
++                    "LANCE_SIMD_MAX_WIDTH": std::env::var("LANCE_SIMD_MAX_WIDTH").ok(),
++                    "LANCE_L2_BATCH_AVX512": std::env::var("LANCE_L2_BATCH_AVX512").ok(),
++                },
++            })
++        );
++    }
++}
+diff --git a/rust/lance-index-bench/src/main.rs b/rust/lance-index-bench/src/main.rs
+index 2288d7c3f..edfa26e3e 100644
+--- a/rust/lance-index-bench/src/main.rs
++++ b/rust/lance-index-bench/src/main.rs
+@@ -586,6 +586,8 @@ fn manifest(data: &Data, kind: &str, run_dir: &Path) -> Value {
+         "kernels": {
+             "dot_tile": lance_linalg::distance::tile::dot_tile_kernel_name(),
+             "blocked_l2": lance_index::vector::blocked_l2_kernel_name(),
++            "l2_f32_batch": lance_linalg::distance::l2::l2_f32_batch_kernel_name(),
++            "l2_f32_pair": lance_linalg::distance::l2::l2_f32_kernel_name(),
+             "pipnn": pipnn_kernel(),
+         },
+         "dataset": kind,
+diff --git a/rust/lance-linalg/src/distance/l2.rs b/rust/lance-linalg/src/distance/l2.rs
+index d95b8fc46..5d9e3d379 100644
+--- a/rust/lance-linalg/src/distance/l2.rs
++++ b/rust/lance-linalg/src/distance/l2.rs
+@@ -358,10 +358,42 @@ impl L2 for f32 {
+ 
+     fn l2_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
+         assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
++        #[cfg(target_arch = "x86_64")]
++        if let Some(kernel) = *L2_F32_BATCH_AVX512_OPT_IN {
++            return kernel.call(x, batch, dimension, output);
++        }
+         L2_F32_BATCH.get().call(x, batch, dimension, output);
+     }
+ }
+ 
++/// Benchmark control: `LANCE_L2_BATCH_AVX512=1` runs the per-vector f32 L2
++/// batch on 512-bit registers (`l2_f32_avx512` per row) when the host allows
++/// AVX-512 (see `LANCE_SIMD_MAX_WIDTH`). Default dispatch has no AVX-512 batch
++/// candidate, so without this a per-vector vs. blocked comparison on an
++/// AVX-512 host would compare 256-bit against 512-bit kernels.
++#[cfg(target_arch = "x86_64")]
++static L2_F32_BATCH_AVX512_OPT_IN: std::sync::LazyLock<
++    Option<lance_core::utils::cpu::Kernel<BatchKernel>>,
++> = std::sync::LazyLock::new(|| {
++    std::env::var_os("LANCE_L2_BATCH_AVX512")
++        .and_then(|_| x86::L2_F32_BATCH_AVX512.kernel())
++});
++
++/// Name of the f32 L2 batch kernel `l2_distance_batch` uses on this host, for
++/// benchmark records.
++pub fn l2_f32_batch_kernel_name() -> &'static str {
++    #[cfg(target_arch = "x86_64")]
++    if L2_F32_BATCH_AVX512_OPT_IN.is_some() {
++        return x86::L2_F32_BATCH_AVX512.name();
++    }
++    L2_F32_BATCH.selected().name()
++}
++
++/// Name of the f32 pairwise L2 kernel on this host, for benchmark records.
++pub fn l2_f32_kernel_name() -> &'static str {
++    L2_F32.selected().name()
++}
++
+ lance_core::dispatch! {
+     static L2_F32: Dispatch<PairKernel> = {
+         #[cfg(target_arch = "x86_64")]
+@@ -791,6 +823,28 @@ mod x86 {
+         (acc_sum + tail) as f32
+     }
+ 
++    lance_core::target_kernel! {
++        #[target_features("avx512f")]
++        #[candidate(pub(super) L2_F32_BATCH_AVX512: BatchKernel)]
++        /// Opt-in (`LANCE_L2_BATCH_AVX512=1`) per-vector batch at 512 bits: the
++        /// same subtract + FMA per element as the default batch, one row at a
++        /// time, on `__m512`. Dimensions up to 16 keep the AVX+FMA kernel.
++        pub(super) fn l2_batch_f32_avx512(
++            x: &[f32],
++            batch: &[f32],
++            dimension: usize,
++            output: &mut [f32],
++        ) {
++            if dimension <= 16 {
++                l2_batch_f32_avx_fma(x, batch, dimension, output);
++                return;
++            }
++            for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
++                *distance = l2_f32_avx512(x, y);
++            }
++        }
++    }
++
+     lance_core::target_kernel! {
+         #[target_features("avx512f")]
+         #[candidate(pub(super) L2_F32_AVX512: PairKernel)]
+@@ -1129,6 +1183,36 @@ pub fn l2_distance_arrow_batch(
+ 
+ #[cfg(test)]
+ mod tests {
++    /// The opt-in AVX-512 batch must equal the AVX-512 pair kernel row by row
++    /// above 16 dimensions, and the AVX+FMA batch at or below 16.
++    #[cfg(target_arch = "x86_64")]
++    #[rstest::rstest]
++    fn avx512_batch_matches_reference(#[values(8, 16, 17, 128, 960, 1001)] dimension: usize) {
++        let (Some(batch512), Some(pair512), Some(batch256)) = (
++            x86::L2_F32_BATCH_AVX512.kernel(),
++            x86::L2_F32_AVX512.kernel(),
++            x86::L2_F32_BATCH_AVX_FMA.kernel(),
++        ) else {
++            return;
++        };
++        let n = 37;
++        let x: Vec<f32> = (0..dimension).map(|i| (i as f32 * 0.37).sin()).collect();
++        let batch: Vec<f32> = (0..dimension * n).map(|i| (i as f32 * 0.73).cos() * 2.0).collect();
++        let mut got = vec![f32::NAN; n];
++        batch512.call(&x, &batch, dimension, &mut got);
++        let mut want = vec![f32::NAN; n];
++        if dimension <= 16 {
++            batch256.call(&x, &batch, dimension, &mut want);
++        } else {
++            for (w, y) in want.iter_mut().zip(batch.chunks_exact(dimension)) {
++                *w = pair512.call(&x, y);
++            }
++        }
++        for (g, w) in got.iter().zip(&want) {
++            assert_eq!(g.to_bits(), w.to_bits(), "dim {dimension}: {g} != {w}");
++        }
++    }
++
+     #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
+     #[test]
+     fn sve_candidate_is_selected_when_supported() {
+-- 
+2.25.1
+
