@@ -8,3 +8,7 @@ configs/suiteA-gist-k1000.env       abl-gist-k1000-nosve      ASSIGN=exact,tree:
 configs/suiteC-memory-pilot-1m.env  abl-pipnn-1m-default      INDEX=ivf_pipnn_flat
 configs/suiteC-memory-pilot-1m.env  abl-pipnn-1m-scalar       INDEX=ivf_pipnn_flat LANCE_PIPNN_SCALAR=1
 configs/suiteC-memory-pilot-1m.env  abl-pipnn-1m-nosve        INDEX=ivf_pipnn_flat LANCE_DISABLE_SVE_BUILD=1
+# Same assignment ablations on BIGANN10M (D=128), so a BIGANN-only host still measures them.
+configs/suiteA-bigann10m.env        abl-bigann-k4096-default    NUM_PARTITIONS=4096 ASSIGN=exact,tree:8 REPEATS=1
+configs/suiteA-bigann10m.env        abl-bigann-k4096-noblocked  NUM_PARTITIONS=4096 ASSIGN=exact,tree:8 REPEATS=1 LANCE_DISABLE_BLOCKED_L2=1
+configs/suiteA-bigann10m.env        abl-bigann-k4096-nosve      NUM_PARTITIONS=4096 ASSIGN=exact,tree:8 REPEATS=1 LANCE_DISABLE_SVE_BUILD=1

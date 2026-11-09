@@ -20,6 +20,17 @@ git clone <this repo> anns && cd anns          # or: git pull
 ./lance_index_build/bench.sh all
 ```
 
+Choose datasets with `--data` (or `BENCH_DATA`, default `bigann,gist`). `data` then fetches
+only those, and suite runs on an unselected or missing dataset are skipped and listed at the
+end of the suite, so a BIGANN-only host still runs every BIGANN experiment:
+
+```bash
+./lance_index_build/bench.sh --data bigann all     # skips A-gist-k1000 and abl-gist-*
+```
+
+`suites/ablation.txt` repeats the assignment ablations on BIGANN10M (K=4096), so the
+SVE / NEON / no-tile comparison exists without GIST.
+
 Requirements: git, a C/C++ compiler (Clang ≥ 14 or GCC ≥ 11 for SVE intrinsics), cmake,
 python3, uv, curl and rustup (Lance pins Rust 1.98.1 in `rust-toolchain.toml`; `setup`
 installs it). Disk: ~13 GB raw data plus ingested Lance datasets and shuffle spill;

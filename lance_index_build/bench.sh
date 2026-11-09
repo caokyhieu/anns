@@ -3,7 +3,7 @@
 #
 #   ./lance_index_build/bench.sh doctor            host, toolchain, kernels, data status
 #   ./lance_index_build/bench.sh setup             Lance checkout (base + patches), C++ deps
-#   ./lance_index_build/bench.sh data [bigann|gist|all]   download + convert + verify hashes
+#   ./lance_index_build/bench.sh data [bigann|gist|all]   download + convert + verify (default: selected)
 #   ./lance_index_build/bench.sh test              kernel / tree / PiPNN correctness tests
 #   ./lance_index_build/bench.sh kernels           criterion kernel microbenchmarks (+ no-SVE on ARM)
 #   ./lance_index_build/bench.sh suite <name>...   run suites/<name>.txt (smoke, A, B, C, ablation)
@@ -11,6 +11,11 @@
 #   ./lance_index_build/bench.sh python            mutable PiPNN Python demo
 #   ./lance_index_build/bench.sh report [dir...]   summary.md + plots per run (default: this host)
 #   ./lance_index_build/bench.sh all               setup data test kernels smoke A B C ablation report
+#
+# Choose datasets with --data before the command, or BENCH_DATA (default: bigann,gist):
+#   ./lance_index_build/bench.sh --data bigann all
+# `data` fetches only the selected datasets; suite lines whose dataset is not selected,
+# or not on disk, are skipped with a note instead of stopping the suite.
 #
 # Environment: ANNS_DATA, DATASETS_DIR, RESULTS_DIR (see scripts/run.sh), JOBS (cargo -j).
 # Results land in results/<arch>-<host>/<run>-<UTC stamp>/; nothing is overwritten.
@@ -23,12 +28,28 @@ HOST="$(hostname -s)"
 : "${ANNS_DATA:=$ROOT/data}"
 : "${RESULTS_DIR:=$HERE/results/$ARCH-$HOST}"
 : "${EIGEN_INCLUDE_DIR:=$ROOT/native/third_party/eigen}"
-export ANNS_DATA RESULTS_DIR EIGEN_INCLUDE_DIR
+: "${BENCH_DATA:=bigann,gist}"
+if [ "${1:-}" = --data ]; then BENCH_DATA="${2:?--data needs a list, e.g. bigann or bigann,gist}"; shift 2; fi
+export ANNS_DATA RESULTS_DIR EIGEN_INCLUDE_DIR BENCH_DATA
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 CRATES=(-p lance-linalg -p lance-pipnn -p lance-index)
 
 log() { printf '\n==> %s\n' "$*"; }
 need() { command -v "$1" >/dev/null || { echo "missing required tool: $1" >&2; exit 1; }; }
+
+# Datasets: names match DATASET= in configs/*.env and the prepare_data.sh targets.
+ALL_DATA=(bigann gist)
+for d in ${BENCH_DATA//,/ }; do
+  [[ " ${ALL_DATA[*]} " == *" $d "* ]] || { echo "unknown dataset in BENCH_DATA: $d (known: ${ALL_DATA[*]})" >&2; exit 1; }
+done
+data_files() {
+  case "$1" in
+    bigann) echo bigann10m/base.10M.u8bin bigann10m/query.u8bin bigann10m/gt.10M.ibin ;;
+    gist) echo base.f32 query.f32 gt.i32 meta.txt ;;
+  esac
+}
+data_selected() { [[ ",$BENCH_DATA," == *",$1,"* ]]; }
+data_present() { local f; for f in $(data_files "$1"); do [ -f "$ANNS_DATA/$f" ] || return 1; done; }
 
 cmd_doctor() {
   log "host"
@@ -58,9 +79,12 @@ cmd_doctor() {
     echo "  lance: not set up (run: bench.sh setup)"
   fi
   printf '  eigen:   %s\n' "$([ -f "$EIGEN_INCLUDE_DIR/Eigen/Dense" ] && echo "$EIGEN_INCLUDE_DIR" || echo MISSING)"
-  log "data ($ANNS_DATA)"
-  for f in bigann10m/base.10M.u8bin bigann10m/query.u8bin bigann10m/gt.10M.ibin base.f32 query.f32 gt.i32 meta.txt; do
-    printf '  %-26s %s\n' "$f" "$([ -f "$ANNS_DATA/$f" ] && du -h "$ANNS_DATA/$f" | cut -f1 || echo missing)"
+  log "data ($ANNS_DATA; selected: $BENCH_DATA)"
+  for d in "${ALL_DATA[@]}"; do
+    echo "  $d: $(data_selected "$d" && echo selected || echo 'not selected'), $(data_present "$d" && echo present || echo missing)"
+    for f in $(data_files "$d"); do
+      printf '    %-26s %s\n' "$f" "$([ -f "$ANNS_DATA/$f" ] && du -h "$ANNS_DATA/$f" | cut -f1 || echo missing)"
+    done
   done
 }
 
@@ -74,7 +98,11 @@ cmd_setup() {
   (cd "$WT" && rustup show active-toolchain || rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)")
 }
 
-cmd_data() { "$HERE/scripts/prepare_data.sh" "${1:-all}"; }
+cmd_data() {
+  local d sets=("$@")
+  [ ${#sets[@]} -gt 0 ] || read -ra sets <<<"${BENCH_DATA//,/ }"
+  for d in "${sets[@]}"; do "$HERE/scripts/prepare_data.sh" "$d"; done
+}
 
 cmd_test() {
   log "correctness tests on $ARCH (kernels: tile, L2 batch, tree, blocked L2, PiPNN, k-means, IVF)"
@@ -108,13 +136,21 @@ cmd_suite() {
     local list="$HERE/suites/$name.txt"
     [ -f "$list" ] || { echo "no such suite: $list" >&2; exit 1; }
     log "suite $name"
+    local skipped=()
     while read -r config run args; do
       [ -z "${config:-}" ] && continue
       case "$config" in \#*) continue ;; esac
+      local ds; ds="$(sed -n 's/^DATASET=//p' "$HERE/$config")"
+      if ! data_selected "$ds"; then skipped+=("$run ($ds not selected)"); continue; fi
+      if ! data_present "$ds"; then skipped+=("$run ($ds missing: bench.sh data $ds)"); continue; fi
       log "$name: $run ${args:-}"
       # shellcheck disable=SC2086
       (cd "$HERE" && scripts/run.sh "$config" "$run-$STAMP" ${args:-})
     done < "$list"
+    if [ ${#skipped[@]} -gt 0 ]; then
+      log "suite $name: skipped ${#skipped[@]} run(s)"
+      printf '  %s\n' "${skipped[@]}"
+    fi
   done
 }
 
@@ -150,7 +186,7 @@ cmd_report() {
 cmd_all() {
   cmd_doctor
   cmd_setup
-  cmd_data all
+  cmd_data
   cmd_test
   cmd_kernels
   cmd_suite smoke A B C ablation
