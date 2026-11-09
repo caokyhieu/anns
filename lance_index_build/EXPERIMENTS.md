@@ -38,6 +38,8 @@ Result: tree:4 cuts the build 2.49× and assignment CPU 12.8×; recall within 0.
 
 Run `pilotA-gist-k16384` · `MODE=complete`, `SAMPLE_RATE=32`, `NUM_BITS=5` · n = 1. Recall also varies with the retrained centroids.
 
+> Pilot only; dropped from Suite A. K = 16,384 on 1M rows is ~61 vectors per partition and needed `SAMPLE_RATE=32` to get past Lance's K cap, so it is not a realistic configuration. GIST is benchmarked at K = 1,000; large K is covered by BIGANN10M.
+
 | assign | build s | vs exact | assign thread-s | train_ivf s | R@10 np64 | np256 |
 |---|---|---|---|---|---|---|
 | exact | 31.38 | 1.00× | 384.7 | 9.33 | 0.7259 | 0.8984 |

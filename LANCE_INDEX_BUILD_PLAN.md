@@ -204,7 +204,7 @@ Avoid an uncontrolled Cartesian product. Run correctness/small-data screening fi
 
 | Suite | Primary matrix | Tuning / sensitivity |
 |---|---|---|
-| A | GIST1M K={1,000; 16,384}; BIGANN10M K={4,096; 16,384}; current auto, forced exact, greedy tree, beam tree | Tree beam={1,2,4,8,16}; initial branching=16; branching={8,32} on selected cases; refinement={0,2} as separate training conditions |
+| A | GIST1M K=1,000; BIGANN10M K={4,096; 16,384}; current auto, forced exact, greedy tree, beam tree | Tree beam={1,2,4,8,16}; initial branching=16; branching={8,32} on selected cases; refinement={0,2} as separate training conditions |
 | B | BIGANN10M K={16,384; 32,768; 65,536}; exact, HNSW, PiPNN, retained tree | Primary full run K=16,384, then scale winners; HNSW ef and PiPNN beam={15,32,64,128}; retain existing HNSW construction baseline and tune construction separately |
 | C | BIGANN10M K={4,5,6}; HNSW_FLAT versus PiPNN_FLAT | Start K=5; HNSW m={16,32}, ef_construction={100,200}; PiPNN degree={32,64}, local_k={2,4}, leaf_size={512,1024}; reservoir=160 initially |
 

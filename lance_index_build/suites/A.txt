@@ -1,5 +1,4 @@
 # Suite A: tree assignment vs current/exact, complete IVF_RQ5 builds (plan §5.2).
 configs/suiteA-gist-k1000.env   A-gist-k1000
-configs/suiteA-gist-k16384.env  A-gist-k16384
 configs/suiteA-bigann10m.env    A-bigann10m-k4096   NUM_PARTITIONS=4096
 configs/suiteA-bigann10m.env    A-bigann10m-k16384  NUM_PARTITIONS=16384
