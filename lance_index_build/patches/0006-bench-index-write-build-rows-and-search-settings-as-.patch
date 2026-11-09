@@ -1,0 +1,89 @@
+From 3d90a3df66c2d0d7d11fbf8dd807381ca40528fa Mon Sep 17 00:00:00 2001
+From: caokyhieu <caokyhieu253@gmail.com>
+Date: Mon, 9 Nov 2026 15:31:59 +0000
+Subject: [PATCH] bench(index): write build rows and search settings as they
+ finish
+
+built.jsonl gets each build's row as soon as the index is committed and
+searches.jsonl gets each search setting when it is measured (queries.csv is
+flushed with it). builds.jsonl still gets the full row at the end, so a run
+killed during a long query phase keeps its build stats and finished settings.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ rust/lance-index-bench/src/main.rs | 24 +++++++++++++++++++-----
+ 1 file changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/rust/lance-index-bench/src/main.rs b/rust/lance-index-bench/src/main.rs
+index edfa26e3e..42ab12440 100644
+--- a/rust/lance-index-bench/src/main.rs
++++ b/rust/lance-index-bench/src/main.rs
+@@ -25,6 +25,12 @@
+ //! - `ASSIGN_SAMPLE`: base vectors sampled for assignment quality (fixed mode; 0 = off).
+ //! - `RUN_DIR`: output directory for manifest.json, builds.jsonl, queries.csv,
+ //!   assignments.jsonl.  `SKIP_QUERY=1` skips search evaluation.
++//!
++//! Durability: `built.jsonl` gets each build's row (without `search`) as soon as the
++//! index is committed, `searches.jsonl` gets each search setting's summary as soon as
++//! it is measured (queries.csv is flushed with it), and `builds.jsonl` gets the full
++//! row once all settings are done. A run killed during queries keeps its build stats
++//! and every finished setting.
+ 
+ use std::collections::HashSet;
+ use std::fs::{File, OpenOptions};
+@@ -502,6 +508,8 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
+ 
+ struct Output {
+     builds: Mutex<File>,
++    built: Mutex<File>,
++    searches: Mutex<File>,
+     queries: Mutex<BufWriter<File>>,
+     assignments: Mutex<File>,
+ }
+@@ -528,6 +536,8 @@ impl Output {
+         }
+         Self {
+             builds: Mutex::new(append("builds.jsonl")),
++            built: Mutex::new(append("built.jsonl")),
++            searches: Mutex::new(append("searches.jsonl")),
+             queries: Mutex::new(queries),
+             assignments: Mutex::new(append("assignments.jsonl")),
+         }
+@@ -843,11 +853,11 @@ async fn evaluate(
+                         returned.len()
+                     ));
+                 }
+-                out.queries
+-                    .lock()
+-                    .unwrap()
+-                    .write_all(rows.as_bytes())
+-                    .unwrap();
++                {
++                    let mut queries = out.queries.lock().unwrap();
++                    queries.write_all(rows.as_bytes()).unwrap();
++                    queries.flush().unwrap();
++                }
+                 let recall = hits_total as f64 / (plan.ids.len() * truth_k) as f64;
+                 let mean = latencies.iter().sum::<f64>() / latencies.len() as f64;
+                 latencies.sort_by(f64::total_cmp);
+@@ -865,6 +875,9 @@ async fn evaluate(
+                     row["p50_us"].as_f64().unwrap(),
+                     row["p95_us"].as_f64().unwrap()
+                 );
++                let mut durable = row.clone();
++                durable["build_id"] = json!(build_id);
++                Output::line(&out.searches, &durable);
+                 summary.push(row);
+             }
+         }
+@@ -1083,6 +1096,7 @@ async fn main() {
+                 rss.unwrap_or(0) as f64 / 1e9,
+                 bytes as f64 / 1e6
+             );
++            Output::line(&out.built, &row);
+             if !skip_query {
+                 row["search"] = Value::Array(
+                     evaluate(
+-- 
+2.25.1
+

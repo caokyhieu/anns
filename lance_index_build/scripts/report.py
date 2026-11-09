@@ -5,6 +5,8 @@ Usage: scripts/report.py results/<run-id> [results/<run-id> ...] [-o OUT_DIR]
 
 Standard library only. Reads builds.jsonl and assignments.jsonl; per-query rows in
 queries.csv are already aggregated into builds.jsonl "search" entries by the runner.
+A build whose queries did not finish (run killed) has no builds.jsonl row; it is
+recovered from built.jsonl plus its finished settings in searches.jsonl and marked partial.
 Matched-recall comparisons pick, per build, the lowest-p95 search setting whose recall
 reaches the target; a configuration that never reaches it is reported as unattained.
 """
@@ -24,7 +26,13 @@ PALETTE = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c", "#0891b2",
 def load_jsonl(path):
     if not path.exists():
         return []
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    rows = []
+    for line in path.read_text().splitlines():
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass  # blank, or the last line of a killed run cut mid-write
+    return rows
 
 
 def config_key(b):
@@ -120,7 +128,14 @@ def main():
 
     builds, assigns, manifests = [], [], []
     for run in args.runs:
-        builds += [dict(b, _run=run.name) for b in load_jsonl(run / "builds.jsonl")]
+        done = [dict(b, _run=run.name) for b in load_jsonl(run / "builds.jsonl")]
+        done_ids = {b.get("build_id") for b in done}
+        searches = defaultdict(list)
+        for s in load_jsonl(run / "searches.jsonl"):
+            searches[s.pop("build_id", None)].append(s)
+        partial = [dict(b, _run=run.name, _partial=True, search=searches.get(b["build_id"], []))
+                   for b in load_jsonl(run / "built.jsonl") if b.get("build_id") not in done_ids]
+        builds += done + partial
         assigns += [dict(a, _run=run.name) for a in load_jsonl(run / "assignments.jsonl")]
         m = run / "manifest.json"
         if m.exists():
@@ -134,6 +149,13 @@ def main():
                   f"rev `{m.get('env', {}).get('GIT_REV', '?')[:10]}` · "
                   f"patch `{m.get('env', {}).get('PATCH_SHA256', '?')[:12]}`"]
     lines.append("")
+
+    partial = [b for b in builds if b.get("_partial")]
+    if partial:
+        lines += ["**Partial builds** (queries interrupted; build stats complete, search "
+                  "settings only those finished):", ""]
+        lines += [f"- `{b['_run']}` `{b['build_id']}`: {len(b['search'])} settings" for b in partial]
+        lines.append("")
 
     failed = [b for b in builds if b.get("status") != "ok"]
     ok = [b for b in builds if b.get("status") == "ok"]

@@ -37,7 +37,7 @@ What the pieces are:
 | `datasets.lock.json` | dataset sources, sizes and SHA-256 |
 | `scripts/run.sh` | builds the runner and executes one config with provenance |
 | `scripts/report.py` | summary tables and recall/latency/build-time plots |
-| `results/<arch>-<host>/<run>-<stamp>/` | `manifest.json` (git tree, patch hash, CPU features, **selected kernels**), `builds.jsonl`, `queries.csv`, `assignments.jsonl`, `logs/` (git-ignored) |
+| `results/<arch>-<host>/<run>-<stamp>/` | `manifest.json` (git tree, patch hash, CPU features, **selected kernels**), `builds.jsonl`, `queries.csv`, `assignments.jsonl`, `logs/` (git-ignored); `built.jsonl` and `searches.jsonl` are written as each build / search setting finishes, so a killed run keeps them and `report.py` lists it as partial |
 | `baseline/` | the pre-existing optimized IVF_RQ patch and the files it touches |
 
 Every manifest records `kernels.{dot_tile, blocked_l2, pipnn}`, so an x86 and an ARM run
