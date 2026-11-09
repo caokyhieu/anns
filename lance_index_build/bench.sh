@@ -89,7 +89,14 @@ cmd_doctor() {
 }
 
 cmd_setup() {
-  need git; need cargo; need cc; need c++; need python3
+  need git; need cc; need c++; need python3
+  if ! command -v rustup >/dev/null; then
+    echo "missing required tool: rustup (Lance pins its Rust version in rust-toolchain.toml;" >&2
+    echo "a distro cargo ignores that and is usually too old). Install it without root:" >&2
+    echo "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none" >&2
+    echo "  source \"\$HOME/.cargo/env\"" >&2
+    exit 1
+  fi
   log "Lance checkout"
   "$HERE/scripts/setup_lance.sh"
   log "C++ dependencies (Eigen, reference PiPNN, hnswlib, ...; pinned in native/sources.lock.json)"

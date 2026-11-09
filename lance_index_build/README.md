@@ -33,7 +33,7 @@ SVE / NEON / no-tile comparison exists without GIST.
 
 Requirements: git, a C/C++ compiler (Clang ≥ 14 or GCC ≥ 11 for SVE intrinsics), cmake,
 python3, uv, curl and rustup (Lance pins Rust 1.98.1 in `rust-toolchain.toml`; `setup`
-installs it). Disk: ~13 GB raw data plus ingested Lance datasets and shuffle spill;
+installs that toolchain through rustup, so a distro `cargo` alone is not enough). Disk: ~13 GB raw data plus ingested Lance datasets and shuffle spill;
 Suite C at 10M needs tens of GB of RAM (run the 1M memory pilot first, as `suites/C.txt` does).
 
 What the pieces are:
