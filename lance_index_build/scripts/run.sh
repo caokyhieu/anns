@@ -34,6 +34,12 @@ set +a
 if [ "$ARCH" = aarch64 ]; then
   export LANCE_F32_SVE="${LANCE_F32_SVE:-1}"
 fi
+# Hierarchical k-means nests rayon par_iters (sub-trees in parallel, each running
+# a parallel k-means); a worker blocked in a join steals other pending sub-trees
+# onto its own stack, which overflowed rayon's default 2 MiB at k=16384. std
+# applies RUST_MIN_STACK to the unnamed rayon workers. It is address space only:
+# untouched pages are not committed, so it does not count against HW_MEM_GB.
+export RUST_MIN_STACK="${RUST_MIN_STACK:-67108864}"
 : "${EIGEN_INCLUDE_DIR:=$ROOT/native/third_party/eigen}"
 if [ ! -f "$EIGEN_INCLUDE_DIR/Eigen/Dense" ]; then
   echo "Eigen headers missing at $EIGEN_INCLUDE_DIR; run: ./lance_index_build/bench.sh setup" >&2
