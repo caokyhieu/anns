@@ -28,6 +28,12 @@ shift; [ $# -gt 0 ] && shift
 OVERRIDES=("$@")
 for kv in "${OVERRIDES[@]}"; do export "$kv"; done
 set +a
+# Lance keeps f32 L2/dot on its 16-lane scalar kernels by default (other code
+# reproduces them bit for bit); experiments measure the SVE kernels unless a
+# config or override sets LANCE_F32_SVE=0. The manifest records the value.
+if [ "$ARCH" = aarch64 ]; then
+  export LANCE_F32_SVE="${LANCE_F32_SVE:-1}"
+fi
 : "${EIGEN_INCLUDE_DIR:=$ROOT/native/third_party/eigen}"
 if [ ! -f "$EIGEN_INCLUDE_DIR/Eigen/Dense" ]; then
   echo "Eigen headers missing at $EIGEN_INCLUDE_DIR; run: ./lance_index_build/bench.sh setup" >&2

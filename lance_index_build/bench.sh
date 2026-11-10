@@ -112,6 +112,9 @@ cmd_data() {
 }
 
 cmd_test() {
+  # The full lance-index suite opens more temporary files at once than the
+  # common 1024 default allows (EMFILE in the scalar index tests).
+  ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
   log "correctness tests on $ARCH (kernels: tile, L2 batch, tree, blocked L2, PiPNN, k-means, IVF)"
   (cd "$WT" && cargo test "${CRATES[@]}" --features lance-index/pipnn --lib -- \
       tile distance::l2 sve_ tests:: blocked_l2 assignment_tree vector::pipnn kmeans vector::ivf)
@@ -120,6 +123,8 @@ cmd_test() {
     (cd "$WT" && LANCE_DISABLE_SVE_BUILD=1 CARGO_TARGET_DIR="$WT/target-nosve" \
       cargo test "${CRATES[@]}" --features lance-index/pipnn --lib -- \
       tile distance::l2 tests:: blocked_l2 assignment_tree vector::pipnn kmeans)
+    log "lance-linalg with the opt-in SVE f32 kernels (LANCE_F32_SVE=1)"
+    (cd "$WT" && LANCE_F32_SVE=1 cargo test -p lance-linalg --lib -- distance::)
   fi
 }
 
@@ -127,7 +132,9 @@ cmd_kernels() {
   local out="$RESULTS_DIR/kernels-$STAMP"
   mkdir -p "$out"
   log "criterion microbenchmarks -> $out"
-  (cd "$WT" && cargo bench -p lance-linalg --bench arm_kernels -- --save-baseline default) \
+  # On aarch64 the "default" baseline opts into the SVE f32 kernels, as run.sh does.
+  (cd "$WT" && LANCE_F32_SVE="${LANCE_F32_SVE:-1}" \
+    cargo bench -p lance-linalg --bench arm_kernels -- --save-baseline default) \
     2>&1 | tee "$out/default.log"
   if [ "$ARCH" = aarch64 ]; then
     log "same benchmarks without SVE objects (NEON / upstream fallbacks)"

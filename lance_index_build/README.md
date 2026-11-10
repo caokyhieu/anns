@@ -61,6 +61,7 @@ are self-describing. Cross-machine timings are context, not speedup ratios (plan
 | `LANCE_DISABLE_BLOCKED_L2=1` | exact assignment / k-means use per-vector distances instead of 4x4 tiles | runtime |
 | `LANCE_SIMD_MAX_WIDTH=256` | hide AVX-512 from runtime dispatch: every dispatched kernel is ≤ 256-bit (equal-width ablations) | runtime |
 | `LANCE_L2_BATCH_AVX512=1` | per-vector f32 L2 batch on 512-bit registers (default dispatch has no AVX-512 batch) | runtime |
+| `LANCE_F32_SVE=0` | f32 L2/dot pair and batch on Lance's default 16-lane scalar kernels instead of SVE. Lance defaults to scalar (other code reproduces it bit for bit); `run.sh` and `bench.sh kernels` set `LANCE_F32_SVE=1` on aarch64 unless told otherwise | runtime |
 | `LANCE_DISABLE_SVE_BUILD=1` | build without SVE objects (NEON on aarch64); `run.sh` uses `target-nosve/` | build |
 | `LANCE_PIPNN_SCALAR=1` | scalar PiPNN distance kernel and leaf top-k scan | runtime |
 | `LANCE_PIPNN_NATIVE=1` | compile the PiPNN builder with `-march=native` (label such runs) | build |
@@ -75,8 +76,8 @@ process, and keep a portable fallback; nothing is compiled with a global `-march
 | Kernel | Candidates | Used by |
 |---|---|---|
 | `lance_linalg::distance::tile::dot_tile` — 4x4 f32 dot-product tile | AVX-512, AVX2+FMA, **SVE**, **NEON**, scalar | `blocked_l2`: k-means training, hierarchical node k-means, exact IVF assignment |
-| f32 L2 batch, one query vs N rows | AVX(+FMA), **SVE 4-row** (bit-identical to the pair kernel), scalar | tree beam expansion (contiguous child blocks), per-vector k-means |
-| f32 / u8 pairwise L2 and dot, 4-bit LUT sums | existing AVX*, SVE/SVE2 (from `lance_arm_sve/`) | everything |
+| f32 L2 batch, one query vs N rows | AVX(+FMA), **SVE 4-row** (bit-identical to the pair kernel; opt-in via `LANCE_F32_SVE=1`), scalar | tree beam expansion (contiguous child blocks), per-vector k-means |
+| f32 / u8 pairwise L2 and dot, 4-bit LUT sums | existing AVX*, SVE/SVE2 (from `lance_arm_sve/`; f32 SVE is opt-in via `LANCE_F32_SVE=1`) | everything |
 | PiPNN `sqdist` | SSE2, **NEON**, **SVE** (HWCAP-detected), scalar | RobustPrune, medoid |
 | PiPNN leaf top-k scan | AVX-512 (`-march=native`), **NEON**, scalar | leaf k-NN |
 

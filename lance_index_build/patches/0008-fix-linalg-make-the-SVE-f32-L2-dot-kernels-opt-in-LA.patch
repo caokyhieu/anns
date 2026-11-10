@@ -1,0 +1,350 @@
+From 6bc7e105d609ef2a9b15c7e622106faecb95c1a8 Mon Sep 17 00:00:00 2001
+From: lance-index-build <lance-index-build@localhost>
+Date: Tue, 10 Nov 2026 10:34:29 +0000
+Subject: [PATCH] fix(linalg): make the SVE f32 L2/dot kernels opt-in
+ (LANCE_F32_SVE=1)
+
+Default dispatch on aarch64 again selects the 16-lane scalar f32 L2 and
+dot kernels, which the blocked flat-search kernels reproduce bit for bit
+(vector::flat::pairwise::test_f32_rows_bit_identical). The SVE kernels
+fuse multiply-add and reduce in a vector-length-dependent order, so they
+agree only to rounding; LANCE_F32_SVE=1 selects them for pair and batch
+calls together. The accuracy proptests still cover the SVE candidates.
+---
+ .../lance-index-bench/src/bin/assign_micro.rs |  2 +
+ rust/lance-linalg/src/distance.rs             | 19 +++++
+ rust/lance-linalg/src/distance/dot.rs         | 64 ++++++++++++-----
+ rust/lance-linalg/src/distance/l2.rs          | 72 ++++++++++++++-----
+ 4 files changed, 119 insertions(+), 38 deletions(-)
+
+diff --git a/rust/lance-index-bench/src/bin/assign_micro.rs b/rust/lance-index-bench/src/bin/assign_micro.rs
+index 7dfe8c9..264ebb4 100644
+--- a/rust/lance-index-bench/src/bin/assign_micro.rs
++++ b/rust/lance-index-bench/src/bin/assign_micro.rs
+@@ -8,6 +8,7 @@
+ //! * `LANCE_DISABLE_BLOCKED_L2=1`  per-vector (pairwise) instead of blocked 4x4 tiles
+ //! * `LANCE_SIMD_MAX_WIDTH=256`    hide AVX-512 from runtime dispatch
+ //! * `LANCE_L2_BATCH_AVX512=1`     per-vector batch on 512-bit registers
++//! * `LANCE_F32_SVE=1`             f32 L2/dot pair and batch kernels on SVE (aarch64)
+ //!
+ //! Each process measures one kernel arm; run arms as separate processes because
+ //! dispatch is decided once per process.
+@@ -126,6 +127,7 @@ fn main() {
+                     "LANCE_DISABLE_BLOCKED_L2": std::env::var("LANCE_DISABLE_BLOCKED_L2").ok(),
+                     "LANCE_SIMD_MAX_WIDTH": std::env::var("LANCE_SIMD_MAX_WIDTH").ok(),
+                     "LANCE_L2_BATCH_AVX512": std::env::var("LANCE_L2_BATCH_AVX512").ok(),
++                    "LANCE_F32_SVE": std::env::var("LANCE_F32_SVE").ok(),
+                 },
+             })
+         );
+diff --git a/rust/lance-linalg/src/distance.rs b/rust/lance-linalg/src/distance.rs
+index 188df62..f261d89 100644
+--- a/rust/lance-linalg/src/distance.rs
++++ b/rust/lance-linalg/src/distance.rs
+@@ -174,6 +174,25 @@ pub(crate) type PairKernel = unsafe fn(&[f32], &[f32]) -> f32;
+ /// into the matching element of `output`.
+ pub(crate) type BatchKernel = unsafe fn(&[f32], &[f32], usize, &mut [f32]);
+ 
++/// Benchmark control: `LANCE_F32_SVE=1` routes the f32 L2 and dot pair and
++/// batch kernels to SVE on hosts that support it. Default dispatch keeps the
++/// 16-lane scalar kernels on aarch64, which other code (e.g. the blocked flat
++/// search kernels) reproduces bit for bit. The SVE kernels fuse multiply-add
++/// and reduce in a vector-length-dependent order, so they agree with the
++/// default only to rounding. `candidate` is returned when opted in and the
++/// host supports it.
++#[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++pub(crate) fn f32_sve_opt_in<F: Copy>(
++    candidate: &lance_core::utils::cpu::Candidate<F>,
++) -> Option<lance_core::utils::cpu::Kernel<F>> {
++    static ENABLED: std::sync::LazyLock<bool> =
++        std::sync::LazyLock::new(|| std::env::var_os("LANCE_F32_SVE").is_some_and(|v| v == "1"));
++    if !*ENABLED {
++        return None;
++    }
++    candidate.kernel()
++}
++
+ pub use cosine::*;
+ pub use dot::*;
+ #[allow(deprecated)]
+diff --git a/rust/lance-linalg/src/distance/dot.rs b/rust/lance-linalg/src/distance/dot.rs
+index 11ea368..26a2bfa 100644
+--- a/rust/lance-linalg/src/distance/dot.rs
++++ b/rust/lance-linalg/src/distance/dot.rs
+@@ -344,11 +344,19 @@ impl Dot for f32 {
+     #[inline]
+     fn dot(x: &[Self], y: &[Self]) -> f32 {
+         assert_equal_lengths(x.len(), y.len());
++        #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++        if let Some(kernel) = *DOT_F32_SVE_OPT_IN {
++            return kernel.call(x, y);
++        }
+         DOT_F32.get().call(x, y)
+     }
+ 
+     fn dot_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
+         assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
++        #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++        if let Some(kernel) = *DOT_F32_BATCH_SVE_OPT_IN {
++            return kernel.call(x, batch, dimension, output);
++        }
+         DOT_F32_BATCH.get().call(x, batch, dimension, output);
+     }
+ }
+@@ -364,11 +372,7 @@ lance_core::dispatch! {
+                 DOT_F32_SCALAR,
+             ]
+         }
+-        #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
+-        {
+-            &[DOT_F32_SVE, DOT_F32_SCALAR]
+-        }
+-        #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", kernel_support = "sve"))))]
++        #[cfg(not(target_arch = "x86_64"))]
+         {
+             &[DOT_F32_SCALAR]
+         }
+@@ -386,17 +390,23 @@ lance_core::dispatch! {
+                 DOT_F32_BATCH_SCALAR,
+             ]
+         }
+-        #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
+-        {
+-            &[DOT_F32_BATCH_SVE, DOT_F32_BATCH_SCALAR]
+-        }
+-        #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", kernel_support = "sve"))))]
++        #[cfg(not(target_arch = "x86_64"))]
+         {
+             &[DOT_F32_BATCH_SCALAR]
+         }
+     };
+ }
+ 
++// Opt-in SVE kernels; see `f32_sve_opt_in`.
++#[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++static DOT_F32_SVE_OPT_IN: std::sync::LazyLock<
++    Option<lance_core::utils::cpu::Kernel<PairKernel>>,
++> = std::sync::LazyLock::new(|| super::f32_sve_opt_in(&DOT_F32_SVE));
++#[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++static DOT_F32_BATCH_SVE_OPT_IN: std::sync::LazyLock<
++    Option<lance_core::utils::cpu::Kernel<BatchKernel>>,
++> = std::sync::LazyLock::new(|| super::f32_sve_opt_in(&DOT_F32_BATCH_SVE));
++
+ #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
+ lance_core::target_kernel! {
+     #[target_features("sve")]
+@@ -844,13 +854,19 @@ pub fn dot_distance_arrow_batch(
+ mod tests {
+     #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
+     #[test]
+-    fn sve_candidate_is_selected_when_supported() {
+-        if lance_core::utils::cpu::CpuFeatures::host().contains(
+-            lance_core::utils::cpu::CpuFeatures::from_target_features(&["sve"]),
+-        ) {
+-            assert_eq!(DOT_F32.selected().name(), DOT_F32_SVE.name());
+-            assert_eq!(DOT_F32_BATCH.selected().name(), DOT_F32_BATCH_SVE.name());
+-        }
++    fn sve_is_opt_in() {
++        // Default dispatch must stay on the kernels the rest of Lance reproduces.
++        assert_eq!(DOT_F32.selected().name(), DOT_F32_SCALAR.name());
++        assert_eq!(DOT_F32_BATCH.selected().name(), DOT_F32_BATCH_SCALAR.name());
++        let opted_in = std::env::var_os("LANCE_F32_SVE").is_some_and(|v| v == "1");
++        assert_eq!(
++            DOT_F32_SVE_OPT_IN.is_some(),
++            opted_in && DOT_F32_SVE.kernel().is_some()
++        );
++        assert_eq!(
++            DOT_F32_BATCH_SVE_OPT_IN.is_some(),
++            opted_in && DOT_F32_BATCH_SVE.kernel().is_some()
++        );
+     }
+ 
+     use super::*;
+@@ -861,6 +877,16 @@ mod tests {
+     use num_traits::{Float, FromPrimitive};
+     use proptest::prelude::*;
+ 
++    /// Opt-in candidates outside default dispatch, checked like the others.
++    #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++    const SVE_PAIR: &[lance_core::utils::cpu::Candidate<PairKernel>] = &[DOT_F32_SVE];
++    #[cfg(not(all(target_arch = "aarch64", kernel_support = "sve")))]
++    const SVE_PAIR: &[lance_core::utils::cpu::Candidate<PairKernel>] = &[];
++    #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++    const SVE_BATCH: &[lance_core::utils::cpu::Candidate<BatchKernel>] = &[DOT_F32_BATCH_SVE];
++    #[cfg(not(all(target_arch = "aarch64", kernel_support = "sve")))]
++    const SVE_BATCH: &[lance_core::utils::cpu::Candidate<BatchKernel>] = &[];
++
+     /// PQ distance tables call this per sub-vector, so Haswell-baseline
+     /// builds must reach the kernel without a runtime dispatch.
+     #[cfg(target_arch = "x86_64")]
+@@ -1085,7 +1111,7 @@ mod tests {
+                 let want = dot_scalar_ref(&x_f64, &y_f64);
+                 let max_error = max_error::<f32>(&x_f64, &y_f64);
+ 
+-                for candidate in DOT_F32.candidates() {
++                for candidate in DOT_F32.candidates().iter().chain(SVE_PAIR) {
+                     let Some(kernel) = candidate.kernel() else {
+                         continue;
+                     };
+@@ -1130,7 +1156,7 @@ mod tests {
+ 
+                 // The zero vector pins the second output to exactly 0.
+                 let batch = [y, &vec![0.0; dimension]].concat();
+-                for candidate in DOT_F32_BATCH.candidates() {
++                for candidate in DOT_F32_BATCH.candidates().iter().chain(SVE_BATCH) {
+                     let Some(kernel) = candidate.kernel() else {
+                         continue;
+                     };
+diff --git a/rust/lance-linalg/src/distance/l2.rs b/rust/lance-linalg/src/distance/l2.rs
+index 5d9e3d3..d7b3b54 100644
+--- a/rust/lance-linalg/src/distance/l2.rs
++++ b/rust/lance-linalg/src/distance/l2.rs
+@@ -353,6 +353,10 @@ impl L2 for f32 {
+     #[inline]
+     fn l2(x: &[Self], y: &[Self]) -> f32 {
+         assert_equal_lengths(x.len(), y.len());
++        #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++        if let Some(kernel) = *L2_F32_SVE_OPT_IN {
++            return kernel.call(x, y);
++        }
+         L2_F32.get().call(x, y)
+     }
+ 
+@@ -362,6 +366,10 @@ impl L2 for f32 {
+         if let Some(kernel) = *L2_F32_BATCH_AVX512_OPT_IN {
+             return kernel.call(x, batch, dimension, output);
+         }
++        #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++        if let Some(kernel) = *L2_F32_BATCH_SVE_OPT_IN {
++            return kernel.call(x, batch, dimension, output);
++        }
+         L2_F32_BATCH.get().call(x, batch, dimension, output);
+     }
+ }
+@@ -386,11 +394,19 @@ pub fn l2_f32_batch_kernel_name() -> &'static str {
+     if L2_F32_BATCH_AVX512_OPT_IN.is_some() {
+         return x86::L2_F32_BATCH_AVX512.name();
+     }
++    #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++    if L2_F32_BATCH_SVE_OPT_IN.is_some() {
++        return L2_F32_BATCH_SVE.name();
++    }
+     L2_F32_BATCH.selected().name()
+ }
+ 
+ /// Name of the f32 pairwise L2 kernel on this host, for benchmark records.
+ pub fn l2_f32_kernel_name() -> &'static str {
++    #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++    if L2_F32_SVE_OPT_IN.is_some() {
++        return L2_F32_SVE.name();
++    }
+     L2_F32.selected().name()
+ }
+ 
+@@ -405,11 +421,7 @@ lance_core::dispatch! {
+                 L2_F32_SCALAR,
+             ]
+         }
+-        #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
+-        {
+-            &[L2_F32_SVE, L2_F32_SCALAR]
+-        }
+-        #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", kernel_support = "sve"))))]
++        #[cfg(not(target_arch = "x86_64"))]
+         {
+             &[L2_F32_SCALAR]
+         }
+@@ -430,17 +442,23 @@ lance_core::dispatch! {
+                 L2_F32_BATCH_SCALAR,
+             ]
+         }
+-        #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
+-        {
+-            &[L2_F32_BATCH_SVE, L2_F32_BATCH_SCALAR]
+-        }
+-        #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", kernel_support = "sve"))))]
++        #[cfg(not(target_arch = "x86_64"))]
+         {
+             &[L2_F32_BATCH_SCALAR]
+         }
+     };
+ }
+ 
++// Opt-in SVE kernels; see `f32_sve_opt_in`.
++#[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++static L2_F32_SVE_OPT_IN: std::sync::LazyLock<
++    Option<lance_core::utils::cpu::Kernel<PairKernel>>,
++> = std::sync::LazyLock::new(|| super::f32_sve_opt_in(&L2_F32_SVE));
++#[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++static L2_F32_BATCH_SVE_OPT_IN: std::sync::LazyLock<
++    Option<lance_core::utils::cpu::Kernel<BatchKernel>>,
++> = std::sync::LazyLock::new(|| super::f32_sve_opt_in(&L2_F32_BATCH_SVE));
++
+ #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
+ lance_core::target_kernel! {
+     #[target_features("sve")]
+@@ -1215,13 +1233,19 @@ mod tests {
+ 
+     #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
+     #[test]
+-    fn sve_candidate_is_selected_when_supported() {
+-        if lance_core::utils::cpu::CpuFeatures::host().contains(
+-            lance_core::utils::cpu::CpuFeatures::from_target_features(&["sve"]),
+-        ) {
+-            assert_eq!(L2_F32.selected().name(), L2_F32_SVE.name());
+-            assert_eq!(L2_F32_BATCH.selected().name(), L2_F32_BATCH_SVE.name());
+-        }
++    fn sve_is_opt_in() {
++        // Default dispatch must stay on the kernels the rest of Lance reproduces.
++        assert_eq!(L2_F32.selected().name(), L2_F32_SCALAR.name());
++        assert_eq!(L2_F32_BATCH.selected().name(), L2_F32_BATCH_SCALAR.name());
++        let opted_in = std::env::var_os("LANCE_F32_SVE").is_some_and(|v| v == "1");
++        assert_eq!(
++            L2_F32_SVE_OPT_IN.is_some(),
++            opted_in && L2_F32_SVE.kernel().is_some()
++        );
++        assert_eq!(
++            L2_F32_BATCH_SVE_OPT_IN.is_some(),
++            opted_in && L2_F32_BATCH_SVE.kernel().is_some()
++        );
+     }
+ 
+     /// Tree routing and k-means mix batch and pair distances, so the SVE batch
+@@ -1258,6 +1282,16 @@ mod tests {
+     use num_traits::ToPrimitive;
+     use proptest::prelude::*;
+ 
++    /// Opt-in candidates outside default dispatch, checked like the others.
++    #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++    const SVE_PAIR: &[lance_core::utils::cpu::Candidate<PairKernel>] = &[L2_F32_SVE];
++    #[cfg(not(all(target_arch = "aarch64", kernel_support = "sve")))]
++    const SVE_PAIR: &[lance_core::utils::cpu::Candidate<PairKernel>] = &[];
++    #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++    const SVE_BATCH: &[lance_core::utils::cpu::Candidate<BatchKernel>] = &[L2_F32_BATCH_SVE];
++    #[cfg(not(all(target_arch = "aarch64", kernel_support = "sve")))]
++    const SVE_BATCH: &[lance_core::utils::cpu::Candidate<BatchKernel>] = &[];
++
+     #[test]
+     fn test_l2_rejects_mismatched_lengths() {
+         let short = [1.0_f32];
+@@ -1467,7 +1501,7 @@ mod tests {
+                 let y_f64 = y.iter().map(|&v| v as f64).collect::<Vec<_>>();
+                 let want = l2_distance_reference(&x_f64, &y_f64) as f32;
+ 
+-                for candidate in L2_F32.candidates() {
++                for candidate in L2_F32.candidates().iter().chain(SVE_PAIR) {
+                     let Some(kernel) = candidate.kernel() else {
+                         continue;
+                     };
+@@ -1508,7 +1542,7 @@ mod tests {
+ 
+                 // The second vector equals the key, so its distance is exactly 0.
+                 let batch = [y, x].concat();
+-                for candidate in L2_F32_BATCH.candidates() {
++                for candidate in L2_F32_BATCH.candidates().iter().chain(SVE_BATCH) {
+                     let Some(kernel) = candidate.kernel() else {
+                         continue;
+                     };
+-- 
+2.53.0
+
