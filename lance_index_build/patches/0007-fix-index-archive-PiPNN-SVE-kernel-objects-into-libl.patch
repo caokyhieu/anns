@@ -1,0 +1,54 @@
+From 940212355089e39cf4bf83e2adc54cc557147015 Mon Sep 17 00:00:00 2001
+From: lance-index-build <lance-index-build@localhost>
+Date: Tue, 10 Nov 2026 09:51:11 +0000
+Subject: [PATCH] fix(index): archive PiPNN SVE kernel objects into
+ liblance_pipnn.a
+
+The SVE kernel was built as a separate liblance_pipnn_sve.a, which rustc
+links before liblance_pipnn.a. GNU ld resolves static archives left to
+right, so bridge.o's reference to lance_pipnn_sqdist_sve was left
+undefined on aarch64 hosts with an SVE-capable compiler.
+---
+ rust/lance-pipnn/build.rs | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/rust/lance-pipnn/build.rs b/rust/lance-pipnn/build.rs
+index fba3ef8..50415e3 100644
+--- a/rust/lance-pipnn/build.rs
++++ b/rust/lance-pipnn/build.rs
+@@ -24,7 +24,11 @@ fn main() {
+     // Optional SVE object, selected at runtime from HWCAP; the baseline stays portable.
+     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+-    let mut has_sve = false;
++    // The SVE kernel needs different -march flags, so it is compiled separately, but
++    // its objects go into liblance_pipnn.a rather than a second archive: bridge.o
++    // references lance_pipnn_sqdist_sve, and GNU ld resolves static archives left to
++    // right, so a separate liblance_pipnn_sve.a linked first leaves it undefined.
++    let mut sve_objects = Vec::new();
+     if target_arch == "aarch64"
+         && target_os == "linux"
+         && std::env::var_os("LANCE_DISABLE_SVE_BUILD").is_none()
+@@ -37,15 +41,17 @@ fn main() {
+             .flag("-fno-fast-math")
+             .flag("-ffp-contract=off")
+             .opt_level(3)
+-            .try_compile("lance_pipnn_sve")
++            .try_compile_intermediates()
+         {
+-            Ok(()) => has_sve = true,
++            Ok(objects) => sve_objects = objects,
+             Err(err) => println!("cargo:warning=Skipping PiPNN SVE kernels: {err}"),
+         }
+     }
++    let has_sve = !sve_objects.is_empty();
+     let mut build = cc::Build::new();
+     if has_sve {
+         build.define("LANCE_PIPNN_HAVE_SVE", None);
++        build.objects(&sve_objects);
+     }
+     build
+         .cpp(true)
+-- 
+2.53.0
+
