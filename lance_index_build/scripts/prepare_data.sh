@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Download, convert and verify the benchmark datasets against datasets.lock.json.
-# Usage: scripts/prepare_data.sh [bigann|gist|all|verify]
+# Usage: scripts/prepare_data.sh [bigann|gist|msmarco|all|verify]
+# `all` is bigann + gist; msmarco (232 GB download) only on request.
 # Files go to $ANNS_DATA (default <repo>/data). Existing verified files are kept.
 # TLS verification stays on; pass a managed-network CA with BIGANN_CA_FILE / CURL_CA_BUNDLE.
 set -euo pipefail
@@ -53,10 +54,19 @@ gist() {
   verify gist1m
 }
 
+# MS MARCO v2.1 (Cohere Embed English v3, 113.5M x 1024, published top-1000 ground
+# truth): 232 GB download, converted to base.fbin / query.fbin / gt.ibin (465 GB).
+msmarco() {
+  local d="$ANNS_DATA/msmarco-v2.1"
+  echo "== MS MARCO v2.1 -> $d"
+  uv run --no-project --with numpy --with pyarrow python "$HERE/scripts/prepare_msmarco.py" --output "$d"
+}
+
 case "${1:-all}" in
   bigann) bigann ;;
   gist) gist ;;
+  msmarco) msmarco ;;
   all) bigann; gist ;;
   verify) verify bigann10m; verify gist1m ;;
-  *) echo "usage: $0 [bigann|gist|all|verify]" >&2; exit 1 ;;
+  *) echo "usage: $0 [bigann|gist|msmarco|all|verify]" >&2; exit 1 ;;
 esac

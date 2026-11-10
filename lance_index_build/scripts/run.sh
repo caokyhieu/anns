@@ -63,4 +63,37 @@ printf '%s\n' "${OVERRIDES[@]}" > "$RUN_DIR/overrides.env"
 BIN="$TARGET/release-with-debug/lance-index-bench"
 { lscpu; echo; free -b; echo; uname -a; echo; numactl -H 2>/dev/null || true; \
   echo; (cd "$WT" && rustc --version); cc --version | head -1; } > "$RUN_DIR/logs/machine.txt"
-"$BIN" 2>&1 | tee -a "$RUN_DIR/logs/run.log"
+# Reference-node profile (scale configs): HW_CPUS pins the runner to that many of
+# this host's CPUs and sizes Lance's, rayon's and PiPNN's thread pools to match;
+# HW_MEM_GB is a hard cgroup memory limit without swap (systemd-run). Both cover
+# untimed ingestion and ground truth too. What was enforced goes to logs/hardware.txt.
+LIMIT=()
+HW_ENFORCED="none"
+if [ -n "${HW_CPUS:-}" ]; then
+  CPUSET="$(python3 -c 'import os,sys; c=sorted(os.sched_getaffinity(0)); n=int(sys.argv[1])
+if n > len(c): sys.exit(f"HW_CPUS={n} but only {len(c)} CPUs are available")
+print(",".join(map(str, c[:n])))' "$HW_CPUS")"
+  export LANCE_CPU_THREADS="${LANCE_CPU_THREADS:-$HW_CPUS}"
+  export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-$HW_CPUS}"
+  export PIPNN_THREADS="${PIPNN_THREADS:-$HW_CPUS}"
+  LIMIT=(taskset -c "$CPUSET")
+  HW_ENFORCED="cpus=$CPUSET"
+fi
+if [ -n "${HW_MEM_GB:-}" ]; then
+  if command -v systemd-run >/dev/null &&
+     systemd-run --scope --quiet -p MemoryMax=1G -p MemorySwapMax=0 true 2>/dev/null; then
+    LIMIT=(systemd-run --scope --quiet -p "MemoryMax=${HW_MEM_GB}G" -p MemorySwapMax=0 -- \
+      ${LIMIT[@]+"${LIMIT[@]}"})
+    HW_ENFORCED="$HW_ENFORCED memory=${HW_MEM_GB}G(cgroup,no swap)"
+  elif [ "${HW_MEM_STRICT:-1}" = 1 ]; then
+    echo "HW_MEM_GB=$HW_MEM_GB needs systemd-run with cgroup v2 scopes on this host;" >&2
+    echo "set HW_MEM_STRICT=0 to run anyway with the limit only recorded (peak RSS is still measured)" >&2
+    exit 1
+  else
+    HW_ENFORCED="$HW_ENFORCED memory=${HW_MEM_GB}G(NOT enforced)"
+  fi
+fi
+export HW_ENFORCED
+{ echo "HW_CPUS=${HW_CPUS:-} HW_MEM_GB=${HW_MEM_GB:-}"; echo "enforced: $HW_ENFORCED"; \
+  echo "command prefix: ${LIMIT[*]:-}"; } > "$RUN_DIR/logs/hardware.txt"
+${LIMIT[@]+"${LIMIT[@]}"} "$BIN" 2>&1 | tee -a "$RUN_DIR/logs/run.log"

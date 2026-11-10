@@ -6,7 +6,7 @@
 #   ./lance_index_build/bench.sh data [bigann|gist|all]   download + convert + verify (default: selected)
 #   ./lance_index_build/bench.sh test              kernel / tree / PiPNN correctness tests
 #   ./lance_index_build/bench.sh kernels           criterion kernel microbenchmarks (+ no-SVE on ARM)
-#   ./lance_index_build/bench.sh suite <name>...   run suites/<name>.txt (smoke, A, B, C, ablation)
+#   ./lance_index_build/bench.sh suite <name>...   run suites/<name>.txt (smoke, A, B, C, ablation, scale)
 #   ./lance_index_build/bench.sh native            standalone reference PiPNN vs hnswlib (BIGANN10M)
 #   ./lance_index_build/bench.sh python            mutable PiPNN Python demo
 #   ./lance_index_build/bench.sh report [dir...]   summary.md + plots per run (default: this host)
@@ -38,7 +38,7 @@ log() { printf '\n==> %s\n' "$*"; }
 need() { command -v "$1" >/dev/null || { echo "missing required tool: $1" >&2; exit 1; }; }
 
 # Datasets: names match DATASET= in configs/*.env and the prepare_data.sh targets.
-ALL_DATA=(bigann gist)
+ALL_DATA=(bigann gist msmarco)
 for d in ${BENCH_DATA//,/ }; do
   [[ " ${ALL_DATA[*]} " == *" $d "* ]] || { echo "unknown dataset in BENCH_DATA: $d (known: ${ALL_DATA[*]})" >&2; exit 1; }
 done
@@ -46,6 +46,7 @@ data_files() {
   case "$1" in
     bigann) echo bigann10m/base.10M.u8bin bigann10m/query.u8bin bigann10m/gt.10M.ibin ;;
     gist) echo base.f32 query.f32 gt.i32 meta.txt ;;
+    msmarco) echo msmarco-v2.1/base.fbin msmarco-v2.1/query.fbin msmarco-v2.1/gt.ibin ;;
   esac
 }
 data_selected() { [[ ",$BENCH_DATA," == *",$1,"* ]]; }

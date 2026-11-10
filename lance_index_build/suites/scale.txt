@@ -1,0 +1,14 @@
+# Scale: MS MARCO v2.1, 113.5M x 1024, on the reference-node profile (64 CPUs, 6 GB
+# hard memory limit; see configs/scale-msmarco.env). Data: bench.sh --data msmarco data.
+# Disk: base.fbin 465 GB + ingested Lance copy ~465 GB + index and shuffle spill.
+configs/scale-msmarco2m-smoke.env  scale-msmarco2m-smoke
+configs/scale-msmarco.env          scale-msmarco-tree4       ASSIGN=tree:4
+configs/scale-msmarco.env          scale-msmarco-tree16      ASSIGN=tree:16
+# 6-bit codes (~90 GB, still under 120 GB) if 4-bit misses the recall target.
+configs/scale-msmarco.env          scale-msmarco-tree4-rq6   ASSIGN=tree:4 NUM_BITS=6
+# Diagnostic: same build with 32 GB, to measure time and peak memory if 6 GB is killed
+# (the 6 GB target is still checked against the measured peak).
+configs/scale-msmarco.env          scale-msmarco-tree4-mem32 ASSIGN=tree:4 HW_MEM_GB=32
+# Optional, estimated slower: graph-based centroid assignment.
+# configs/scale-msmarco.env        scale-msmarco-pipnn       ASSIGN=pipnn:15:64:256
+# configs/scale-msmarco.env        scale-msmarco-hnsw        ASSIGN=hnsw:12:15:32

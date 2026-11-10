@@ -121,6 +121,44 @@ lance_index::vector::ivf::PreparedAssignment::{prepare, assign}  // measurement 
 Explicit backends never silently fall back; `Auto` preserves Lance's existing behaviour
 (including its environment switches).
 
+## Scale benchmark: MS MARCO v2.1 (113.5M x 1024) on a reference node
+
+Goal: an IVF_RQ build on the reference node within the customer table's single-node
+200M limits (64 cores, 6 GB memory, index < 120 GB, build < 2 h, top-24 < 80 ms,
+recall > 90%), on a public 1024-d dataset with published ground truth:
+[CohereLabs/msmarco-v2.1-embed-english-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3)
+(TREC-RAG 2024 corpus, Cohere Embed English v3; 113,520,750 passages, 1677 TREC-DL
+2021-2023 queries with their brute-force top-1000).
+
+```bash
+./lance_index_build/bench.sh --data msmarco data          # 232 GB download -> 465 GB, resumable
+./lance_index_build/bench.sh --data msmarco suite scale   # 2M smoke, then the full corpus
+```
+
+- **Data.** `scripts/prepare_msmarco.py` downloads the 60 float16 `.npy` files and the
+  queries at the revision pinned in `datasets.lock.json`, checks each file's SHA-256,
+  and writes `base.fbin` / `query.fbin` (float32, unit-normalized) and `gt.ibin` (the
+  published top-1000; distances 2 - 2 cos). Each `.npy` is deleted once converted
+  (`--keep-npy` keeps them), so peak disk is ~470 GB; a re-run resumes. It ends with a
+  spot check that recomputes published cosines from `base.fbin` (catches a wrong row
+  order) and records the original vector norms in `meta.json`.
+- **Ground truth.** The published neighbours are by cosine; on unit vectors L2 ranks
+  identically, so they are exact for the L2 runner. Full-corpus runs use them as
+  published; the 2M smoke recomputes exact ground truth for its prefix.
+- **Hardware profile.** `HW_CPUS` pins the runner to that many CPUs (`taskset`) and sets
+  `LANCE_CPU_THREADS`, `RAYON_NUM_THREADS`, `PIPNN_THREADS`. `HW_MEM_GB` is a hard cgroup
+  limit without swap through `systemd-run --scope`; if the host cannot create one, the
+  run stops unless `HW_MEM_STRICT=0` (the limit is then only recorded). Both cover
+  ingestion as well as the build; `logs/hardware.txt` records what was enforced.
+  Exceeding the limit kills the run (OOM), a failed target; the `-mem32` suite line
+  repeats the build with 32 GB to measure time and peak memory anyway.
+- **Targets.** `TARGET_*` limits are checked per build and written to `builds.jsonl`
+  under `targets`: build time, index size, peak RSS, and the best recall@24 among
+  settings whose p99 latency meets the limit.
+- **Disk.** `base.fbin` 465 GB, the ingested Lance dataset another ~465 GB, plus the
+  index (~61 GB at 4 bits) and shuffle spill: plan ~1.1 TB under `ANNS_DATA` /
+  `DATASETS_DIR`.
+
 ## Running single configs
 
 ```bash

@@ -1,0 +1,603 @@
+From 0debeab375cb45e2af9c35ee116b5c7eb6d60391 Mon Sep 17 00:00:00 2001
+From: lance-index-build <lance-index-build@localhost>
+Date: Tue, 10 Nov 2026 11:48:12 +0000
+Subject: [PATCH] bench(index): stream the base from disk; MS MARCO v2.1
+ dataset; targets
+
+Scale runs (MS MARCO v2.1, 113.5M x 1024 float32, 465 GB) cannot hold the
+base in memory. The runner now reads base vectors by row range for
+ingestion, sampling and ground truth. New DATASET=msmarco reads the
+base.fbin / query.fbin / gt.ibin written by prepare_msmarco.py, with the
+published top-1000 as ground truth. With N_LIMIT, exact ground truth for
+the first GT_QUERIES queries is computed by a streaming scan of the base
+and cached next to the dataset. TARGET_* limits record pass/fail per
+build (build time, index size, peak RSS, best recall at TARGET_K within
+the latency limit). The assignment-quality sample is drawn with a sparse
+Fisher-Yates that picks the same rows as before without materializing
+every row id.
+---
+ rust/lance-index-bench/src/main.rs | 446 +++++++++++++++++++++++------
+ 1 file changed, 363 insertions(+), 83 deletions(-)
+
+diff --git a/rust/lance-index-bench/src/main.rs b/rust/lance-index-bench/src/main.rs
+index 42ab124..b385f97 100644
+--- a/rust/lance-index-bench/src/main.rs
++++ b/rust/lance-index-bench/src/main.rs
+@@ -7,11 +7,21 @@
+ //!
+ //! Configuration is read from environment variables (see `lance_index_build/README.md`):
+ //!
+-//! - `DATASET` = `gist` (base.f32, query.f32, gt.i32, meta.txt) or `bigann`
+-//!   (base.10M.u8bin, query.u8bin, gt.10M.ibin); `DATA_DIR` holds the files.
+-//! - `DS_PATH`: Lance dataset path, ingested once outside all timings.
+-//! - `N_LIMIT`: optional prefix subset for smoke tests; exact ground truth is then
+-//!   recomputed over the subset (the published ground truth is not valid for it).
++//! - `DATASET` = `gist` (base.f32, query.f32, gt.i32, meta.txt), `bigann`
++//!   (base.10M.u8bin, query.u8bin, gt.10M.ibin) or `msmarco` (base.fbin, query.fbin,
++//!   gt.ibin from `scripts/prepare_msmarco.py`: float32 big-ann files and the
++//!   published top-1000); `DATA_DIR` holds the files. The base is read from disk in
++//!   blocks and never held in memory as a whole.
++//! - `DS_PATH`: Lance dataset path, ingested once outside all timings
++//!   (`INGEST_ROWS_PER_FILE` rows per data file, default 2^30).
++//! - `N_LIMIT`: optional prefix subset; exact ground truth is then recomputed over
++//!   the subset (the published ground truth is not valid for it).
++//! - `GT_QUERIES` (default: all) limits the evaluated queries. With `N_LIMIT` the
++//!   first `GT_QUERIES` queries get an exact top-`GT_K` (default 100) by a streaming
++//!   scan of the base, cached next to `DS_PATH`.
++//! - `TARGET_BUILD_SECS`, `TARGET_INDEX_GB`, `TARGET_MEM_GB` (peak RSS), `TARGET_K`,
++//!   `TARGET_RECALL`, `TARGET_LATENCY_MS`, `TARGET_LATENCY_STAT` (`p50`|`p95`|`p99`,
++//!   default p99): optional limits; each build row then records pass/fail per limit.
+ //! - `INDEX` = `ivf_rq` | `ivf_flat` | `ivf_hnsw_flat` | `ivf_pipnn_flat`.
+ //! - `ASSIGN`: comma list of `auto`, `exact`, `tree:<beam>`, `hnsw` (Lance default
+ //!   12/15/15), `hnsw:<m>:<ef_construction>:<ef>`, `pipnn:<beam>[:<degree>:<leaf>]`.
+@@ -32,9 +42,11 @@
+ //! row once all settings are done. A run killed during queries keeps its build stats
+ //! and every finished setting.
+ 
+-use std::collections::HashSet;
++use std::cmp::Ordering;
++use std::collections::{BinaryHeap, HashMap, HashSet};
+ use std::fs::{File, OpenOptions};
+ use std::io::{BufReader, BufWriter, Read, Write};
++use std::os::unix::fs::FileExt;
+ use std::path::{Path, PathBuf};
+ use std::sync::{Arc, Mutex};
+ use std::time::Instant;
+@@ -59,7 +71,7 @@ use lance_index::vector::hnsw::builder::HnswBuildParams;
+ use lance_index::vector::ivf::IvfBuildParams;
+ use lance_index::vector::ivf::PreparedAssignment;
+ use lance_index::vector::ivf::builder::CentroidAssignment;
+-use lance_linalg::distance::MetricType;
++use lance_linalg::distance::{L2, MetricType};
+ use rayon::prelude::*;
+ use serde_json::{Value, json};
+ 
+@@ -127,29 +139,111 @@ fn read_f32_matrix(path: &Path, dim: usize) -> Matrix {
+     Matrix { values, rows, dim }
+ }
+ 
+-/// `.u8bin`: u32 rows, u32 dim, then row-major uint8 values (converted exactly to f32).
+-fn read_u8bin(path: &Path, limit: Option<usize>) -> Matrix {
+-    let mut file = BufReader::new(File::open(path).unwrap());
+-    let mut header = [0u8; 8];
+-    file.read_exact(&mut header).unwrap();
+-    let total = le_u32(&header[..4]) as usize;
+-    let dim = le_u32(&header[4..]) as usize;
+-    let rows = limit.map_or(total, |l| l.min(total));
+-    let mut raw = vec![0u8; rows * dim];
+-    file.read_exact(&mut raw).unwrap();
+-    Matrix {
+-        values: raw.into_iter().map(f32::from).collect(),
+-        rows,
+-        dim,
++/// Element type of a vector file; values are read as f32 (uint8 converts exactly).
++#[derive(Clone, Copy, Debug)]
++enum Elem {
++    U8,
++    F32,
++}
++
++impl Elem {
++    fn bytes(self) -> usize {
++        match self {
++            Self::U8 => 1,
++            Self::F32 => 4,
++        }
++    }
++}
++
++/// Row-major vectors on disk, read by row range. The scale configs (MS MARCO v2.1,
++/// 113.5M x 1024 float32, 465 GB) do not fit in memory, so nothing loads a whole base.
++struct BaseFile {
++    file: File,
++    path: PathBuf,
++    /// Bytes before the first row.
++    header: u64,
++    elem: Elem,
++    rows: usize,
++    dim: usize,
++}
++
++impl BaseFile {
++    fn new(path: &Path, header: u64, elem: Elem, rows: usize, dim: usize) -> Self {
++        let file = File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
++        let need = header + (rows * dim * elem.bytes()) as u64;
++        let have = file.metadata().unwrap().len();
++        assert!(
++            have >= need,
++            "{}: {have} bytes, but {rows} x {dim} {elem:?} rows need {need}",
++            path.display()
++        );
++        Self {
++            file,
++            path: path.to_path_buf(),
++            header,
++            elem,
++            rows,
++            dim,
++        }
++    }
++
++    /// A big-ann `.u8bin` / `.fbin` file: u32 rows, u32 dim, then row-major values.
++    fn open_bin(path: &Path, elem: Elem) -> Self {
++        let mut header = [0u8; 8];
++        File::open(path)
++            .and_then(|mut f| f.read_exact(&mut header))
++            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
++        let rows = le_u32(&header[..4]) as usize;
++        let dim = le_u32(&header[4..]) as usize;
++        Self::new(path, 8, elem, rows, dim)
++    }
++
++    /// Keeps the first `limit` rows.
++    fn with_limit(mut self, limit: Option<usize>) -> Self {
++        if let Some(limit) = limit {
++            self.rows = self.rows.min(limit);
++        }
++        self
++    }
++
++    /// An independent handle, for readers that must own their source.
++    fn reopen(&self) -> Self {
++        Self::new(&self.path, self.header, self.elem, self.rows, self.dim)
++    }
++
++    /// Rows `start..start + count` as row-major f32.
++    fn read_rows(&self, start: usize, count: usize) -> Vec<f32> {
++        assert!(start + count <= self.rows, "rows {start}+{count} of {}", self.rows);
++        let row_bytes = self.dim * self.elem.bytes();
++        let mut raw = vec![0u8; count * row_bytes];
++        self.file
++            .read_exact_at(&mut raw, self.header + (start * row_bytes) as u64)
++            .unwrap_or_else(|e| panic!("{}: {e}", self.path.display()));
++        match self.elem {
++            Elem::U8 => raw.into_iter().map(f32::from).collect(),
++            Elem::F32 => raw
++                .as_chunks::<4>()
++                .0
++                .iter()
++                .map(|b| f32::from_le_bytes(*b))
++                .collect(),
++        }
++    }
++
++    fn to_matrix(&self) -> Matrix {
++        Matrix {
++            values: self.read_rows(0, self.rows),
++            rows: self.rows,
++            dim: self.dim,
++        }
+     }
+ }
+ 
+ /// `.ibin` ground truth: u32 queries, u32 k, u32 ids[q*k], then f32 distances[q*k].
+-fn read_ibin_truth(path: &Path, queries: usize) -> Truth {
++fn read_ibin_truth(path: &Path) -> Truth {
+     let bytes = read_bytes(path);
+     let nq = le_u32(&bytes[..4]) as usize;
+     let k = le_u32(&bytes[4..8]) as usize;
+-    assert_eq!(nq, queries, "ground truth query count");
+     assert_eq!(
+         bytes.len(),
+         8 + nq * k * 8,
+@@ -164,33 +258,140 @@ fn read_ibin_truth(path: &Path, queries: usize) -> Truth {
+     Truth { ids, k }
+ }
+ 
+-/// Exact squared-L2 top-k over a base subset; only used for N_LIMIT smoke runs.
+-fn exact_truth(base: &Matrix, queries: &Matrix, k: usize) -> Truth {
++fn write_ibin_truth(path: &Path, truth: &Truth, distances: &[f32]) {
++    let nq = truth.ids.len() / truth.k;
++    let mut out = BufWriter::new(File::create(path).unwrap());
++    out.write_all(&(nq as u32).to_le_bytes()).unwrap();
++    out.write_all(&(truth.k as u32).to_le_bytes()).unwrap();
++    for id in &truth.ids {
++        out.write_all(&id.to_le_bytes()).unwrap();
++    }
++    for d in distances {
++        out.write_all(&d.to_le_bytes()).unwrap();
++    }
++    out.flush().unwrap();
++}
++
++/// A distance with a total order, for the top-k heaps.
++#[derive(Clone, Copy, Debug)]
++struct OrdDist(f32);
++
++impl PartialEq for OrdDist {
++    fn eq(&self, other: &Self) -> bool {
++        self.cmp(other) == Ordering::Equal
++    }
++}
++impl Eq for OrdDist {}
++impl PartialOrd for OrdDist {
++    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
++        Some(self.cmp(other))
++    }
++}
++impl Ord for OrdDist {
++    fn cmp(&self, other: &Self) -> Ordering {
++        self.0.total_cmp(&other.0)
++    }
++}
++
++/// Exact squared-L2 top-`k` (ties to the lower id) of the first `nq` queries. The
++/// base streams through in ~256 MiB blocks, the next block read while the current
++/// one is scored, so memory stays bounded at any base size.
++fn exact_truth(base: &BaseFile, queries: &Matrix, nq: usize, k: usize) -> (Truth, Vec<f32>) {
+     let k = k.min(base.rows);
+-    let ids = (0..queries.rows)
+-        .into_par_iter()
+-        .flat_map_iter(|q| {
+-            let query = queries.row(q);
+-            let mut scored: Vec<(f32, u32)> = (0..base.rows)
+-                .map(|i| (lance_linalg::distance::l2::l2(query, base.row(i)), i as u32))
+-                .collect();
+-            scored.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+-            scored.truncate(k);
+-            scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+-            scored.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
+-        })
+-        .collect();
+-    Truth { ids, k }
++    let dim = base.dim;
++    let block_rows = ((256usize << 20) / (dim * 4)).max(1);
++    let mut heaps: Vec<BinaryHeap<(OrdDist, u32)>> =
++        (0..nq).map(|_| BinaryHeap::with_capacity(k + 1)).collect();
++    let t = Instant::now();
++    let mut reported = 0;
++    std::thread::scope(|s| {
++        let read = |start: usize| {
++            let count = block_rows.min(base.rows - start);
++            s.spawn(move || (start, base.read_rows(start, count)))
++        };
++        let mut pending = (base.rows > 0).then(|| read(0));
++        while let Some(handle) = pending.take() {
++            let (start, block) = handle.join().unwrap();
++            let count = block.len() / dim;
++            if start + count < base.rows {
++                pending = Some(read(start + count));
++            }
++            heaps.par_iter_mut().enumerate().for_each(|(q, heap)| {
++                let mut distances = vec![0.0f32; count];
++                f32::l2_batch_into(queries.row(q), &block, dim, &mut distances);
++                for (i, &d) in distances.iter().enumerate() {
++                    let item = (OrdDist(d), (start + i) as u32);
++                    if heap.len() < k {
++                        heap.push(item);
++                    } else if item < *heap.peek().unwrap() {
++                        heap.pop();
++                        heap.push(item);
++                    }
++                }
++            });
++            let percent = (start + count) * 100 / base.rows;
++            if percent >= reported + 5 {
++                reported = percent;
++                println!(
++                    "  ground truth: {percent}% of {} rows, {:.0}s",
++                    base.rows,
++                    t.elapsed().as_secs_f64()
++                );
++            }
++        }
++    });
++    let mut ids = Vec::with_capacity(nq * k);
++    let mut distances = Vec::with_capacity(nq * k);
++    for heap in heaps {
++        for (d, id) in heap.into_sorted_vec() {
++            ids.push(id);
++            distances.push(d.0);
++        }
++    }
++    (Truth { ids, k }, distances)
++}
++
++/// [`exact_truth`], cached as `.ibin` next to the Lance dataset so it runs once.
++fn cached_exact_truth(
++    base: &BaseFile,
++    queries: &Matrix,
++    nq: usize,
++    k: usize,
++    uri: &str,
++) -> Truth {
++    let cache = PathBuf::from(format!(
++        "{uri}.gt-{}x{}-q{nq}-k{}.ibin",
++        base.rows,
++        base.dim,
++        k.min(base.rows)
++    ));
++    if cache.is_file() {
++        println!("ground truth from cache {}", cache.display());
++        return read_ibin_truth(&cache);
++    }
++    let t = Instant::now();
++    let (truth, distances) = exact_truth(base, queries, nq, k);
++    println!(
++        "computed exact top-{} ground truth for {nq} queries over {} rows in {:.1}s (untimed)",
++        truth.k,
++        base.rows,
++        t.elapsed().as_secs_f64()
++    );
++    if let Some(parent) = cache.parent() {
++        std::fs::create_dir_all(parent).unwrap();
++    }
++    write_ibin_truth(&cache, &truth, &distances);
++    truth
+ }
+ 
+ struct Data {
+-    base: Matrix,
++    base: BaseFile,
+     queries: Matrix,
+     truth: Truth,
+ }
+ 
+-fn load_data(kind: &str, dir: &Path, limit: Option<usize>) -> Data {
+-    let (base, queries, truth) = match kind {
++fn load_data(kind: &str, dir: &Path, limit: Option<usize>, uri: &str) -> Data {
++    let (base, mut queries, published) = match kind {
+         "gist" => {
+             let meta = std::fs::read_to_string(dir.join("meta.txt")).unwrap();
+             let meta: Vec<usize> = meta
+@@ -198,12 +399,7 @@ fn load_data(kind: &str, dir: &Path, limit: Option<usize>) -> Data {
+                 .map(|v| v.parse().unwrap())
+                 .collect();
+             let (n, dim, nq, gt_k) = (meta[0], meta[1], meta[2], meta[3]);
+-            let mut base = read_f32_matrix(&dir.join("base.f32"), dim);
+-            assert_eq!(base.rows, n, "GIST base rows");
+-            if let Some(l) = limit {
+-                base.rows = base.rows.min(l);
+-                base.values.truncate(base.rows * dim);
+-            }
++            let base = BaseFile::new(&dir.join("base.f32"), 0, Elem::F32, n, dim);
+             let queries = read_f32_matrix(&dir.join("query.f32"), dim);
+             assert_eq!(queries.rows, nq, "GIST query rows");
+             let gt = read_bytes(&dir.join("gt.i32"));
+@@ -214,29 +410,43 @@ fn load_data(kind: &str, dir: &Path, limit: Option<usize>) -> Data {
+                 .map(|b| u32::from_le_bytes(*b))
+                 .collect();
+             assert_eq!(ids.len(), nq * gt_k, "GIST ground truth size");
+-            (base, queries, Truth { ids, k: gt_k })
+-        }
+-        "bigann" => {
+-            let base = read_u8bin(&dir.join("base.10M.u8bin"), limit);
+-            let queries = read_u8bin(&dir.join("query.u8bin"), None);
+-            let truth = read_ibin_truth(&dir.join("gt.10M.ibin"), queries.rows);
+-            (base, queries, truth)
++            (base, queries, Some(Truth { ids, k: gt_k }))
+         }
++        "bigann" => (
++            BaseFile::open_bin(&dir.join("base.10M.u8bin"), Elem::U8),
++            BaseFile::open_bin(&dir.join("query.u8bin"), Elem::U8).to_matrix(),
++            Some(read_ibin_truth(&dir.join("gt.10M.ibin"))),
++        ),
++        "msmarco" => (
++            BaseFile::open_bin(&dir.join("base.fbin"), Elem::F32),
++            BaseFile::open_bin(&dir.join("query.fbin"), Elem::F32).to_matrix(),
++            Some(read_ibin_truth(&dir.join("gt.ibin"))),
++        ),
+         other => panic!("unknown DATASET {other}"),
+     };
+-    let truth = if limit.is_some() {
+-        let t = Instant::now();
+-        let truth = exact_truth(&base, &queries, truth.k);
+-        println!(
+-            "recomputed exact top-{} ground truth over {} rows in {:.1}s",
+-            truth.k,
+-            base.rows,
+-            t.elapsed().as_secs_f64()
+-        );
+-        truth
+-    } else {
+-        truth
++    let base = base.with_limit(limit);
++    assert_eq!(queries.dim, base.dim, "query and base dimensions differ");
++    assert!(
++        base.rows <= i32::MAX as usize,
++        "{} rows overflow the Int32 id column",
++        base.rows
++    );
++    let nq = env_or("GT_QUERIES", queries.rows).min(queries.rows);
++    // Published ground truth covers the full base only.
++    let mut truth = match published.filter(|_| limit.is_none()) {
++        Some(truth) => truth,
++        None => cached_exact_truth(&base, &queries, nq, env_or("GT_K", 100), uri),
+     };
++    truth.ids.truncate(nq * truth.k);
++    let truth_queries = truth.ids.len() / truth.k;
++    assert!(
++        truth_queries <= queries.rows,
++        "ground truth has {truth_queries} queries, the query file {}",
++        queries.rows
++    );
++    // Evaluate only the queries that have ground truth.
++    queries.rows = truth_queries;
++    queries.values.truncate(truth_queries * queries.dim);
+     assert!(
+         truth.ids.iter().all(|&id| (id as usize) < base.rows),
+         "ground-truth id outside base"
+@@ -262,21 +472,22 @@ fn vector_schema(dim: usize) -> Arc<ArrowSchema> {
+     ]))
+ }
+ 
+-async fn write_dataset(base: &Matrix, uri: &str) {
++/// Ingests `base` batch by batch, read lazily from disk so memory stays bounded.
++async fn write_dataset(base: &BaseFile, uri: &str) {
+     let schema = vector_schema(base.dim);
+     let rows_per_batch = 50_000;
+     let s = schema.clone();
++    let source = base.reopen();
+     let batches = (0..base.rows).step_by(rows_per_batch).map(move |start| {
+-        let end = (start + rows_per_batch).min(base.rows);
++        let end = (start + rows_per_batch).min(source.rows);
+         let ids = Int32Array::from_iter_values(start as i32..end as i32);
+-        let values = Float32Array::from(base.values[start * base.dim..end * base.dim].to_vec());
+-        let fsl = FixedSizeListArray::try_new_from_values(values, base.dim as i32)?;
++        let values = Float32Array::from(source.read_rows(start, end - start));
++        let fsl = FixedSizeListArray::try_new_from_values(values, source.dim as i32)?;
+         RecordBatch::try_new(s.clone(), vec![Arc::new(ids), Arc::new(fsl)])
+     });
+-    let batches: Vec<_> = batches.collect();
+     let reader = RecordBatchIterator::new(batches, schema);
+     let params = WriteParams {
+-        max_rows_per_file: 1 << 30,
++        max_rows_per_file: env_or("INGEST_ROWS_PER_FILE", 1 << 30),
+         max_rows_per_group: 8192,
+         mode: WriteMode::Create,
+         ..Default::default()
+@@ -425,6 +636,63 @@ fn index_params(kind: &str, ivf: IvfBuildParams) -> VectorIndexParams {
+     }
+ }
+ 
++/// Pass/fail of a finished build row against the `TARGET_*` limits, when any is
++/// set. The search check takes, among settings at `TARGET_K` whose latency
++/// statistic meets `TARGET_LATENCY_MS`, the one with the highest recall.
++fn check_targets(row: &Value) -> Option<Value> {
++    let limit = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<f64>().ok());
++    let build_secs = limit("TARGET_BUILD_SECS");
++    let index_gb = limit("TARGET_INDEX_GB");
++    let mem_gb = limit("TARGET_MEM_GB");
++    let recall = limit("TARGET_RECALL");
++    let latency_ms = limit("TARGET_LATENCY_MS");
++    if [build_secs, index_gb, mem_gb, recall, latency_ms]
++        .iter()
++        .all(Option::is_none)
++    {
++        return None;
++    }
++    let mut checks = serde_json::Map::new();
++    for (name, max, actual) in [
++        ("build_secs", build_secs, row["build_secs"].as_f64()),
++        ("index_gb", index_gb, row["index_bytes"].as_f64().map(|b| b / 1e9)),
++        ("peak_rss_gb", mem_gb, row["peak_rss_bytes"].as_f64().map(|b| b / 1e9)),
++    ] {
++        if let Some(max) = max {
++            let ok = actual.is_some_and(|a| a <= max);
++            checks.insert(name.into(), json!({"max": max, "actual": actual, "ok": ok}));
++        }
++    }
++    if recall.is_some() || latency_ms.is_some() {
++        let k = limit("TARGET_K").map(|k| k as u64);
++        let stat = std::env::var("TARGET_LATENCY_STAT").unwrap_or_else(|_| "p99".into());
++        let stat_key = format!("{stat}_us");
++        let recall_of = |s: &Value| s["recall"].as_f64().unwrap_or(0.0);
++        let best = row["search"]
++            .as_array()
++            .into_iter()
++            .flatten()
++            .filter(|s| k.is_none_or(|k| s["k"].as_u64() == Some(k)))
++            .filter(|s| {
++                latency_ms.is_none_or(|ms| {
++                    s[stat_key.as_str()]
++                        .as_f64()
++                        .is_some_and(|us| us <= ms * 1000.0)
++                })
++            })
++            .max_by(|a, b| recall_of(a).total_cmp(&recall_of(b)));
++        let ok = best.is_some_and(|s| recall.is_none_or(|r| recall_of(s) >= r));
++        checks.insert(
++            "search".into(),
++            json!({"k": k, "min_recall": recall, "max_latency_ms": latency_ms,
++                   "latency_stat": stat, "best": best, "ok": ok}),
++        );
++    }
++    let all_ok = checks.values().all(|c| c["ok"].as_bool() == Some(true));
++    checks.insert("all_ok".into(), json!(all_ok));
++    Some(Value::Object(checks))
++}
++
+ fn is_graph_index(kind: &str) -> bool {
+     matches!(kind, "ivf_hnsw_flat" | "ivf_pipnn_flat")
+ }
+@@ -577,11 +845,14 @@ fn manifest(data: &Data, kind: &str, run_dir: &Path) -> Value {
+                     "QUERY_SET",
+                     "WARMUP",
+                     "ASSIGN_SAMPLE",
++                    "INGEST_ROWS_PER_FILE",
+                     "GIT_REV",
+                     "PATCH_SHA256",
+                 ]
+                 .contains(&k.as_str())
+-                || k.starts_with("PIPNN_")
++                || ["PIPNN_", "GT_", "HW_", "TARGET_"]
++                    .iter()
++                    .any(|prefix| k.starts_with(prefix))
+         })
+         .map(|(k, v)| (k, Value::String(v)))
+         .collect();
+@@ -619,18 +890,23 @@ async fn assignment_quality(
+     seed: u64,
+     out: &Output,
+ ) {
+-    let sample = sample.min(data.base.rows);
+-    let mut ids: Vec<usize> = (0..data.base.rows).collect();
+-    // Deterministic partial Fisher-Yates.
++    let rows = data.base.rows;
++    let sample = sample.min(rows);
++    // Deterministic partial Fisher-Yates over 0..rows. Only displaced slots are
++    // stored, so memory is O(sample) at any base size; the picks are the same as
++    // swapping in a materialized 0..rows array.
++    let mut displaced = HashMap::with_capacity(2 * sample);
++    let slot = |m: &HashMap<usize, usize>, i: usize| *m.get(&i).unwrap_or(&i);
+     for i in 0..sample {
+-        let j = i + (splitmix(seed ^ i as u64) as usize) % (ids.len() - i);
+-        ids.swap(i, j);
++        let j = i + (splitmix(seed ^ i as u64) as usize) % (rows - i);
++        let (at_i, at_j) = (slot(&displaced, i), slot(&displaced, j));
++        displaced.insert(i, at_j);
++        displaced.insert(j, at_i);
+     }
+-    ids.truncate(sample);
++    let ids: Vec<usize> = (0..sample).map(|i| slot(&displaced, i)).collect();
+     let values: Vec<f32> = ids
+         .iter()
+-        .flat_map(|&i| data.base.row(i))
+-        .copied()
++        .flat_map(|&i| data.base.read_rows(i, 1))
+         .collect();
+     let vectors =
+         FixedSizeListArray::try_new_from_values(Float32Array::from(values), data.base.dim as i32)
+@@ -917,7 +1193,7 @@ async fn main() {
+     );
+ 
+     let t = Instant::now();
+-    let data = load_data(&kind, &dir, limit);
++    let data = load_data(&kind, &dir, limit, &uri);
+     println!(
+         "loaded {kind}: {}x{} base, {} queries, truth k={} in {:.1}s",
+         data.base.rows,
+@@ -1111,6 +1387,10 @@ async fn main() {
+                     .await,
+                 );
+             }
++            if let Some(targets) = check_targets(&row) {
++                println!("  targets: {targets}");
++                row["targets"] = targets;
++            }
+             Output::line(&out.builds, &row);
+             out.queries.lock().unwrap().flush().unwrap();
+         }
+-- 
+2.53.0
+
