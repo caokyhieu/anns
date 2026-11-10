@@ -21,6 +21,13 @@ Each .npy is converted as soon as it is verified and then deleted (--keep-npy
 keeps them), so peak disk is base.fbin (465 GB) plus one .npy (~4 GB).
 A re-run continues where it stopped.
 
+Faster sources (the SHA-256 check makes any mirror safe):
+  HF_ENDPOINT=https://hf-mirror.com   download through a mirror instead of huggingface.co
+  DOWNLOAD_JOBS=8                     .npy files fetched in parallel (default 4; each
+                                      in-flight file adds ~4 GB of peak disk)
+  .npy files copied into DIR/passages_npy/ by other means (rsync, aria2c) are
+  verified and used instead of downloading them.
+
 Run with: uv run --no-project --with numpy --with pyarrow python prepare_msmarco.py --output DIR
 """
 
@@ -31,6 +38,7 @@ import os
 import struct
 import sys
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -130,33 +138,51 @@ def convert_base(spec: dict, out_dir: Path, base_url: str, token: str | None, ke
     progress = json.loads(progress_path.read_text()) if progress_path.is_file() else {"files": 0, "rows": 0, "norms": {}}
     npy_dir = out_dir / "passages_npy"
     npy_dir.mkdir(parents=True, exist_ok=True)
+    todo = [(index, source) for index, source in enumerate(sources) if index >= progress["files"]]
+    jobs = max(1, int(os.environ.get("DOWNLOAD_JOBS", "4")))
+
+    def fetch(source: str) -> None:
+        want = spec["sources"][source]
+        download(f"{base_url}/{source}", out_dir / source, want["bytes"], want["sha256"], token)
+
+    # Downloads run up to `jobs` files ahead; conversion stays in file order.
+    pool = ThreadPoolExecutor(max_workers=jobs)
+    pending = {}
+    def top_up(position: int) -> None:
+        for _, source in todo[position : position + jobs]:
+            if source not in pending:
+                pending[source] = pool.submit(fetch, source)
     with partial.open("r+b" if partial.exists() else "w+b") as out:
         # Drop anything written after the last completed file.
         out.truncate(8 + progress["rows"] * dim * 4)
         write_header(out, progress["rows"], dim)
         out.seek(0, os.SEEK_END)
-        for index, source in enumerate(sources):
-            if index < progress["files"]:
-                continue
-            want = spec["sources"][source]
-            local = out_dir / source
-            log(f"[{index + 1}/{len(sources)}] {source} ({want['bytes'] / 1e9:.1f} GB)")
-            download(f"{base_url}/{source}", local, want["bytes"], want["sha256"], token)
-            matrix = np.load(local, mmap_mode="r")
-            if matrix.ndim != 2 or matrix.shape[1] != dim:
-                raise SystemExit(f"{source}: shape {matrix.shape}, expected (*, {dim})")
-            for lo in range(0, matrix.shape[0], CHUNK_ROWS):
-                chunk = matrix[lo : lo + CHUNK_ROWS]
-                out.write(normalized(chunk, progress["norms"], f"{source} rows {lo}..").tobytes())
-            out.flush()
-            os.fsync(out.fileno())
-            progress["files"] = index + 1
-            progress["rows"] += matrix.shape[0]
-            del matrix
-            progress_path.write_text(json.dumps(progress))
-            if not keep_npy:
-                local.unlink()
-                local.with_name(local.name + ".verified").unlink()
+        try:
+            for position, (index, source) in enumerate(todo):
+                want = spec["sources"][source]
+                local = out_dir / source
+                top_up(position)
+                log(f"[{index + 1}/{len(sources)}] {source} ({want['bytes'] / 1e9:.1f} GB)")
+                pending.pop(source).result()
+                matrix = np.load(local, mmap_mode="r")
+                if matrix.ndim != 2 or matrix.shape[1] != dim:
+                    raise SystemExit(f"{source}: shape {matrix.shape}, expected (*, {dim})")
+                for lo in range(0, matrix.shape[0], CHUNK_ROWS):
+                    chunk = matrix[lo : lo + CHUNK_ROWS]
+                    out.write(normalized(chunk, progress["norms"], f"{source} rows {lo}..").tobytes())
+                out.flush()
+                os.fsync(out.fileno())
+                progress["files"] = index + 1
+                progress["rows"] += matrix.shape[0]
+                del matrix
+                progress_path.write_text(json.dumps(progress))
+                if not keep_npy:
+                    local.unlink()
+                    local.with_name(local.name + ".verified").unlink()
+        finally:
+            # On failure, stop queued downloads; in-flight ones finish into their
+            # .partial and a re-run resumes them.
+            pool.shutdown(wait=True, cancel_futures=True)
         if progress["rows"] != rows_expected:
             raise SystemExit(f"passages: {progress['rows']} rows, expected {rows_expected}")
         write_header(out, progress["rows"], dim)
@@ -237,7 +263,9 @@ def main() -> None:
     parser.add_argument("--keep-npy", action="store_true", help="keep the downloaded .npy files (+232 GB)")
     args = parser.parse_args()
     spec = json.loads((HERE / "datasets.lock.json").read_text())[LOCK_KEY]
-    base_url = f"https://huggingface.co/datasets/{spec['repo']}/resolve/{spec['revision']}"
+    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+    base_url = f"{endpoint}/datasets/{spec['repo']}/resolve/{spec['revision']}"
+    log(f"source: {endpoint} ({os.environ.get('DOWNLOAD_JOBS', '4')} parallel downloads)")
     token = os.environ.get("HF_TOKEN")
     out_dir = args.output
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -141,7 +141,11 @@ recall > 90%), on a public 1024-d dataset with published ground truth:
   published top-1000; distances 2 - 2 cos). Each `.npy` is deleted once converted
   (`--keep-npy` keeps them), so peak disk is ~470 GB; a re-run resumes. It ends with a
   spot check that recomputes published cosines from `base.fbin` (catches a wrong row
-  order) and records the original vector norms in `meta.json`.
+  order) and records the original vector norms in `meta.json`. Slow link:
+  `HF_ENDPOINT=https://hf-mirror.com` downloads through a mirror (the SHA-256 checks
+  still apply), `DOWNLOAD_JOBS=8` fetches that many files in parallel (default 4, ~4 GB
+  of extra disk each), and `.npy` files copied into `msmarco-v2.1/passages_npy/` by
+  other means are verified and used as they are.
 - **Ground truth.** The published neighbours are by cosine; on unit vectors L2 ranks
   identically, so they are exact for the L2 runner. Full-corpus runs use them as
   published; the 2M smoke recomputes exact ground truth for its prefix.
