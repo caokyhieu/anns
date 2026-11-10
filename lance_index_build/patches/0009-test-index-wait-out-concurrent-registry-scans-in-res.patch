@@ -1,0 +1,90 @@
+From c246dcd8cfc96a516979ae96a2da5188e4cf2c77 Mon Sep 17 00:00:00 2001
+From: lance-index-build <lance-index-build@localhost>
+Date: Tue, 10 Nov 2026 10:51:14 +0000
+Subject: [PATCH] test(index): wait out concurrent registry scans in resident
+ store tests
+
+live_slots() upgrades every store in the process-wide registry while it
+scans, and debug-build cache inserts call it, so a test on another
+thread can briefly hold a store these tests just dropped. Retry the
+freed check for up to a second instead of failing on that window.
+---
+ rust/lance-index/src/vector/bq/resident.rs | 27 +++++++++++++++-------
+ 1 file changed, 19 insertions(+), 8 deletions(-)
+
+diff --git a/rust/lance-index/src/vector/bq/resident.rs b/rust/lance-index/src/vector/bq/resident.rs
+index a5f8b3d..d51ffb3 100644
+--- a/rust/lance-index/src/vector/bq/resident.rs
++++ b/rust/lance-index/src/vector/bq/resident.rs
+@@ -1030,6 +1030,20 @@ mod tests {
+         assert_eq!(resident_columns_bytes(&Schema::new(other), 10), 280);
+     }
+ 
++    /// Whether the store behind `held` has been freed. Another test thread
++    /// can briefly hold any registered store: `live_slots` upgrades every
++    /// entry of the process-wide registry while it scans (the debug-build
++    /// cache checks call it), so retry for up to a second before deciding.
++    fn freed(held: &std::sync::Weak<ResidentSlot>) -> bool {
++        for _ in 0..1000 {
++            if held.upgrade().is_none() {
++                return true;
++            }
++            std::thread::sleep(std::time::Duration::from_millis(1));
++        }
++        false
++    }
++
+     /// A file key unique to one test, so tests that share the process-wide
+     /// registry do not share stores.
+     fn test_file(test: &str) -> IndexFileKey {
+@@ -1082,7 +1096,7 @@ mod tests {
+         assert!(resident_store_is_live(&file));
+         let held = Arc::downgrade(&store.slot);
+         drop((store, shared));
+-        assert!(held.upgrade().is_none());
++        assert!(freed(&held));
+         assert!(!resident_store_is_live(&file));
+         let reopened = ResidentColumns::shared(&file);
+         assert_eq!(reopened.loaded_bytes(), None);
+@@ -1126,10 +1140,7 @@ mod tests {
+             "the idle cache entry owns the store"
+         );
+         cache.clear().await;
+-        assert!(
+-            held.upgrade().is_none(),
+-            "the weak registry must not retain data"
+-        );
++        assert!(freed(&held), "the weak registry must not retain data");
+     }
+ 
+     #[tokio::test]
+@@ -1168,7 +1179,7 @@ mod tests {
+         assert!(values.values().iter().all(|value| *value == 1.0));
+         drop((handle, reopened));
+         cache.clear().await;
+-        assert!(held.upgrade().is_none());
++        assert!(freed(&held));
+     }
+ 
+     /// A store of `rows` rows of `columns`, each a name and a value width
+@@ -1245,7 +1256,7 @@ mod tests {
+         assert!(cache.peek_resident_with_key(&key).await);
+         drop(handle);
+         cache.clear().await;
+-        assert!(held.upgrade().is_none());
++        assert!(freed(&held));
+     }
+ 
+     #[tokio::test]
+@@ -1267,7 +1278,7 @@ mod tests {
+         PROCESS_STORES.lock().unwrap().remove(&file);
+         drop((slot, reopened));
+         cache.clear().await;
+-        assert!(held.upgrade().is_none());
++        assert!(freed(&held));
+     }
+ 
+     /// A 100-row column in pages ending at rows 40, 40 (an empty page) and 100.
+-- 
+2.53.0
+
