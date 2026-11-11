@@ -178,7 +178,10 @@ def convert_base(spec: dict, out_dir: Path, base_url: str, token: str | None, ke
     if final.is_file():
         log(f"{final} exists; skipping passages")
         meta = out_dir / "meta.json"
-        return json.loads(meta.read_text()).get("base_norms") if meta.is_file() else None
+        if meta.is_file():
+            return json.loads(meta.read_text()).get("base_norms")
+        # Finished, but meta.json was not written yet: the progress file still has the norms.
+        return summary(json.loads(progress_path.read_text())["norms"]) if progress_path.is_file() else None
     progress = json.loads(progress_path.read_text()) if progress_path.is_file() else {"files": 0, "rows": 0, "norms": {}}
     npy_dir = out_dir / "passages_npy"
     npy_dir.mkdir(parents=True, exist_ok=True)
@@ -231,7 +234,7 @@ def convert_base(spec: dict, out_dir: Path, base_url: str, token: str | None, ke
             raise SystemExit(f"passages: {progress['rows']} rows, expected {rows_expected}")
         write_header(out, progress["rows"], dim)
     partial.rename(final)
-    progress_path.unlink()
+    # base.progress.json stays until main() has written meta.json (it holds the norms).
     log(f"wrote {final}: {progress['rows']} x {dim} float32")
     return summary(progress["norms"])
 
@@ -290,7 +293,7 @@ def spot_check(out_dir: Path, dim: int, samples: int = 50) -> float:
     for q in np.linspace(0, nq - 1, min(samples, nq)).astype(int):
         for j in (0, k - 1):
             cos = float(queries[q] @ base[ids[q, j]])
-            worst = max(worst, abs(cos - (1.0 - dists[q, j] / 2.0)))
+            worst = max(worst, abs(cos - (1.0 - float(dists[q, j]) / 2.0)))
     if worst > SPOT_CHECK_TOLERANCE:
         raise SystemExit(f"spot check failed: recomputed cosine differs by {worst:.4f} from the published one")
     log(f"spot check ok: published vs recomputed cosine within {worst:.2e}")
@@ -336,6 +339,7 @@ def main() -> None:
         "spot_check_max_cosine_error": worst,
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+    (out_dir / "base.progress.json").unlink(missing_ok=True)
     log(f"done: {out_dir} (norms before normalization: base {meta['base_norms']}, queries {meta['query_norms']})")
 
 

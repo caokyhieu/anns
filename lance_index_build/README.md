@@ -133,7 +133,15 @@ recall > 90%), on a public 1024-d dataset with published ground truth:
 ```bash
 ./lance_index_build/bench.sh --data msmarco data          # 232 GB download -> 465 GB, resumable
 ./lance_index_build/bench.sh --data msmarco suite scale   # 2M smoke, then the full corpus
+./lance_index_build/msmarco_all.sh   # everything: tests, kernels, smoke, tree/PiPNN/HNSW
+                                     # assignment, kernel ablations, reports; skips failures
 ```
+
+`msmarco_all.sh` records each step in `results/<arch>-<host>/msmarco-all-<TAG>/`
+(`status.tsv`, a log per step, `summary.md`). A step that fails is logged and the next one
+starts. `TAG=<tag> ./lance_index_build/msmarco_all.sh` resumes a session and runs only the
+steps that did not pass. Name steps to run a subset, `DRY_RUN=1` prints the plan, and
+`STEP_TIMEOUT=6h` stops a step that runs too long.
 
 - **Data.** `scripts/prepare_msmarco.py` downloads the 60 float16 `.npy` files and the
   queries at the revision pinned in `datasets.lock.json`, checks each file's SHA-256,
