@@ -25,6 +25,8 @@ Faster sources (the SHA-256 check makes any mirror safe):
   HF_ENDPOINT=https://hf-mirror.com   download through a mirror instead of huggingface.co
   DOWNLOAD_JOBS=8                     .npy files fetched in parallel (default 4; each
                                       in-flight file adds ~4 GB of peak disk)
+  DOWNLOAD_RETRIES=20                 stalls/resets in a row before giving up; each retry
+                                      resumes from the last byte received
   .npy files copied into DIR/passages_npy/ by other means (rsync, aria2c) are
   verified and used instead of downloading them.
 
@@ -33,10 +35,13 @@ Run with: uv run --no-project --with numpy --with pyarrow python prepare_msmarco
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import struct
 import sys
+import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -49,6 +54,8 @@ CHUNK_ROWS = 1 << 16
 # Published cosines are computed from float16 embeddings; recomputed ones agree to
 # about 1e-3. A misaligned row order gives unrelated vectors (cosine error ~0.5).
 SPOT_CHECK_TOLERANCE = 1e-2
+READ_TIMEOUT = 120
+RETRIES = int(os.environ.get("DOWNLOAD_RETRIES", "20"))
 
 
 def log(message: str) -> None:
@@ -63,6 +70,38 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
+def fetch_range(url: str, partial: Path, have: int, size: int, token: str | None) -> None:
+    """Append bytes `have..size` of `url` to `partial` (one request)."""
+    headers = {"Range": f"bytes={have}-{size - 1}"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=READ_TIMEOUT) as response, partial.open("ab") as out:
+        if response.status != 206 or not response.headers.get("Content-Range", "").startswith(
+            f"bytes {have}-{size - 1}/"
+        ):
+            raise SystemExit(f"{url}: server did not honour the byte range (status {response.status})")
+        done, step = have, size // 20 or 1
+        # read1 returns what has arrived, so a stall loses nothing already received.
+        while block := response.read1(1 << 20):
+            out.write(block)
+            if (done + len(block)) // step > done // step:
+                log(f"  {partial.name.removesuffix('.partial')}: {(done + len(block)) / size:.0%}")
+            done += len(block)
+
+
+def retry_or_fail(name: str, attempt: int, why: str) -> int:
+    """Back off before the next attempt; give up after DOWNLOAD_RETRIES in a row
+    without progress (progress resets the count)."""
+    attempt += 1
+    if attempt > RETRIES:
+        raise SystemExit(f"{name}: {why}; gave up after {RETRIES} retries (re-run to resume)")
+    delay = min(60, 2 ** attempt)
+    log(f"  {name}: {why}; retry {attempt}/{RETRIES} in {delay}s")
+    time.sleep(delay)
+    return attempt
+
+
 def download(url: str, path: Path, size: int, sha256: str, token: str | None) -> None:
     """Fetch `url` to `path`, resuming a `.partial`; a `.verified` marker skips re-hashing."""
     marker = path.with_name(path.name + ".verified")
@@ -75,24 +114,29 @@ def download(url: str, path: Path, size: int, sha256: str, token: str | None) ->
     if have > size:
         partial.unlink()
         have = 0
-    if have < size:
-        headers = {"Range": f"bytes={have}-{size - 1}"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        request = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(request, timeout=120) as response, partial.open("ab") as out:
-            if response.status != 206 or not response.headers.get("Content-Range", "").startswith(
-                f"bytes {have}-{size - 1}/"
-            ):
-                raise SystemExit(f"{url}: server did not honour the byte range (status {response.status})")
-            done, step = have, size // 20 or 1
-            while block := response.read(1 << 23):
-                out.write(block)
-                if (done + len(block)) // step > done // step:
-                    log(f"  {path.name}: {(done + len(block)) / size:.0%}")
-                done += len(block)
-        if partial.stat().st_size != size:
-            raise SystemExit(f"{path.name}: download truncated at {partial.stat().st_size} of {size} bytes")
+    attempt = 0
+    while have < size:
+        why = None
+        try:
+            fetch_range(url, partial, have, size, token)
+        except urllib.error.HTTPError as e:
+            if e.code < 500 and e.code != 429:
+                raise SystemExit(f"{url}: HTTP {e.code} {e.reason}")
+            why = f"HTTP {e.code}"
+        except (OSError, http.client.HTTPException) as e:
+            # Timeouts, resets and truncated bodies: resume from what arrived.
+            why = f"{type(e).__name__}: {e}"
+        got = partial.stat().st_size if partial.exists() else 0
+        if got >= size:
+            break
+        if got > have:
+            attempt = 0  # progress: the retry budget counts consecutive stalls
+        attempt = retry_or_fail(path.name, attempt, why or "connection closed early")
+        have = got
+    have = partial.stat().st_size if partial.exists() else 0
+    if have != size:
+        partial.unlink()
+        raise SystemExit(f"{path.name}: got {have} bytes, expected {size}; removed, re-run to fetch again")
     got = sha256_of(partial)
     if got != sha256:
         partial.unlink()
