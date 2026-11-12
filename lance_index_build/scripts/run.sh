@@ -100,6 +100,20 @@ if [ -n "${HW_MEM_GB:-}" ]; then
   fi
 fi
 export HW_ENFORCED
+# Index builds spill their IVF shuffle (tens of GB at scale) under TMPDIR. On a tmpfs
+# /tmp those pages are RAM charged to the memory cgroup, which OOM-kills a 6 GB build,
+# so the spill goes to SCRATCH_DIR on disk (default lance_index_build/scratch), one
+# directory per run, removed afterwards.
+: "${SCRATCH_DIR:=$HERE/scratch}"
+export TMPDIR="$SCRATCH_DIR/$RUN_ID"
+mkdir -p "$TMPDIR"
+trap 'rm -rf "$TMPDIR"' EXIT
+SCRATCH_FS="$(stat -f -c %T "$TMPDIR")"
+if [ "$SCRATCH_FS" = tmpfs ] && [ -n "${HW_MEM_GB:-}" ]; then
+  echo "SCRATCH_DIR=$SCRATCH_DIR is on tmpfs: shuffle spill would count against HW_MEM_GB;" >&2
+  echo "point SCRATCH_DIR at a disk directory" >&2
+  exit 1
+fi
 { echo "HW_CPUS=${HW_CPUS:-} HW_MEM_GB=${HW_MEM_GB:-}"; echo "enforced: $HW_ENFORCED"; \
-  echo "command prefix: ${LIMIT[*]:-}"; } > "$RUN_DIR/logs/hardware.txt"
+  echo "command prefix: ${LIMIT[*]:-}"; echo "scratch: $TMPDIR ($SCRATCH_FS)"; } > "$RUN_DIR/logs/hardware.txt"
 ${LIMIT[@]+"${LIMIT[@]}"} "$BIN" 2>&1 | tee -a "$RUN_DIR/logs/run.log"

@@ -141,7 +141,13 @@ recall > 90%), on a public 1024-d dataset with published ground truth:
 (`status.tsv`, a log per step, `summary.md`). A step that fails is logged and the next one
 starts. `TAG=<tag> ./lance_index_build/msmarco_all.sh` resumes a session and runs only the
 steps that did not pass. Name steps to run a subset, `DRY_RUN=1` prints the plan, and
-`STEP_TIMEOUT=6h` stops a step that runs too long.
+`STEP_TIMEOUT=6h` stops a step that runs too long. A step counts as failed when the
+process fails or when `builds.jsonl` holds no build or an `"error"` row.
+
+Index builds spill the IVF shuffle (tens of GB at this scale) under `TMPDIR`. `run.sh`
+points it at `SCRATCH_DIR/<run>` (default `lance_index_build/scratch`, on disk) and
+removes it afterwards. On a tmpfs `/tmp` the spill would be RAM charged to the
+`HW_MEM_GB` cgroup, so `run.sh` refuses a tmpfs `SCRATCH_DIR` when a limit is set.
 
 - **Data.** `scripts/prepare_msmarco.py` downloads the 60 float16 `.npy` files and the
   queries at the revision pinned in `datasets.lock.json`, checks each file's SHA-256,

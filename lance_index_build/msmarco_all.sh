@@ -49,8 +49,8 @@ noblocked       | run   | $SCALE ASSIGN=tree:4 LANCE_DISABLE_BLOCKED_L2=1
 nosve           | arm   | $SCALE ASSIGN=tree:4 LANCE_DISABLE_SVE_BUILD=1
 f32scalar       | arm   | $SCALE ASSIGN=tree:4 LANCE_F32_SVE=0
 tree4-mem32     | run   | $SCALE ASSIGN=tree:4 HW_MEM_GB=32
-pipnn-assign    | run   | $SCALE ASSIGN=pipnn:15:64:256
-pipnn-assign-scalar | run | $SCALE ASSIGN=pipnn:15:64:256 LANCE_PIPNN_SCALAR=1
+pipnn-assign    | run   | $SCALE ASSIGN=pipnn:15:64:256 PIPNN_LOCAL_K=4
+pipnn-assign-scalar | run | $SCALE ASSIGN=pipnn:15:64:256 PIPNN_LOCAL_K=4 LANCE_PIPNN_SCALAR=1
 hnsw-assign     | run   | $SCALE ASSIGN=hnsw:12:15:32
 EOF
 )
@@ -111,6 +111,16 @@ for line in "${ALL[@]}"; do
   (cd "$HERE" && "${cmd[@]}") > >(tee "$STATE/$name.log") 2>&1
   rc=$?
   secs=$((SECONDS - start))
+  # The benchmark records a failed build in builds.jsonl and still exits 0.
+  why=""
+  if [ $rc -eq 0 ] && [ "$kind" != bench ]; then
+    builds="$RESULTS_DIR/$run_id/builds.jsonl"
+    if [ ! -s "$builds" ]; then
+      rc=1; why="no build recorded"
+    elif grep -q '"status": *"error"' "$builds"; then
+      rc=1; why="build error: $(grep -m1 -o '"error": *"[^"]*' "$builds" | sed 's/"error": *"//' | cut -c1-160)"
+    fi
+  fi
   if [ $rc -eq 0 ]; then
     record "$name" ok "$(date -u +%FT%TZ)" "${secs}s"
     log "$name: ok in $((secs / 60)) min"
@@ -119,7 +129,13 @@ for line in "${ALL[@]}"; do
         >> "$STATE/$name.log" 2>&1 || log "$name: report failed (see $STATE/$name.log)"
     fi
   else
-    [ $rc -eq 124 ] && why="timeout after $STEP_TIMEOUT" || why="exit $rc"
+    if [ -z "$why" ]; then
+      case $rc in
+        124) why="timeout after $STEP_TIMEOUT" ;;
+        137) why="killed, likely out of memory (exit 137)" ;;
+        *) why="exit $rc" ;;
+      esac
+    fi
     record "$name" "failed ($why)" "$(date -u +%FT%TZ)" "${secs}s"
     log "$name: FAILED ($why) after $((secs / 60)) min; continuing. Log: $STATE/$name.log"
   fi
