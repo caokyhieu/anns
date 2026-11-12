@@ -1,0 +1,428 @@
+[
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "st0",
+  "box": [
+   0.8,
+   1.78,
+   1.5,
+   0.62
+  ],
+  "label": "Sample + train",
+  "sub": "hierarchical k-means",
+  "variant": "neutral"
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "e0",
+  "points": [
+   [
+    2.3,
+    2.09
+   ],
+   [
+    2.55,
+    2.09
+   ]
+  ],
+  "color": "muted",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "st1",
+  "box": [
+   2.55,
+   1.78,
+   1.5,
+   0.62
+  ],
+  "label": "Assign rows",
+  "sub": "10M rows → K partitions",
+  "variant": "neutral"
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "e1",
+  "points": [
+   [
+    4.05,
+    2.09
+   ],
+   [
+    4.3,
+    2.09
+   ]
+  ],
+  "color": "muted",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "st2",
+  "box": [
+   4.3,
+   1.78,
+   1.5,
+   0.62
+  ],
+  "label": "Shuffle + encode",
+  "sub": "RaBitQ codes, write",
+  "variant": "neutral"
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "e2",
+  "points": [
+   [
+    5.8,
+    2.09
+   ],
+   [
+    6.05,
+    2.09
+   ]
+  ],
+  "color": "muted",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "st3",
+  "box": [
+   6.05,
+   1.78,
+   1.5,
+   0.62
+  ],
+  "label": "Partition subindex",
+  "sub": "flat / HNSW graph",
+  "variant": "neutral"
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "e3",
+  "points": [
+   [
+    7.55,
+    2.09
+   ],
+   [
+    7.8,
+    2.09
+   ]
+  ],
+  "color": "muted",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "st4",
+  "box": [
+   7.8,
+   1.78,
+   1.5,
+   0.62
+  ],
+  "label": "Commit",
+  "sub": "index files",
+  "variant": "neutral"
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "asg_tree",
+  "box": [
+   0.95,
+   2.98,
+   1.43,
+   0.7
+  ],
+  "label": "A · Tree routing",
+  "sub": "keep k-means tree, beam 4–16",
+  "variant": "white"
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "asg_pipnn",
+  "box": [
+   2.48,
+   2.98,
+   1.43,
+   0.7
+  ],
+  "label": "B · PiPNN graph",
+  "sub": "over the K centroids",
+  "variant": "purple"
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "kt1a",
+  "points": [
+   [
+    1.66,
+    2.62
+   ],
+   [
+    1.66,
+    2.4
+   ]
+  ],
+  "color": "blue",
+  "dashed": true,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "kt1b",
+  "points": [
+   [
+    3.3,
+    2.62
+   ],
+   [
+    3.3,
+    2.4
+   ]
+  ],
+  "color": "blue",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "grn",
+  "points": [
+   [
+    5.05,
+    2.62
+   ],
+   [
+    5.05,
+    2.4
+   ]
+  ],
+  "color": "green",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "kt2",
+  "points": [
+   [
+    6.8,
+    2.62
+   ],
+   [
+    6.8,
+    2.4
+   ]
+  ],
+  "color": "purple",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "up0",
+  "points": [
+   [
+    1.66,
+    4.32
+   ],
+   [
+    1.66,
+    3.82
+   ]
+  ],
+  "color": "red",
+  "dashed": true,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "up1",
+  "points": [
+   [
+    3.2,
+    4.32
+   ],
+   [
+    3.2,
+    3.82
+   ]
+  ],
+  "color": "red",
+  "dashed": true,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "up2",
+  "points": [
+   [
+    5.05,
+    4.32
+   ],
+   [
+    5.05,
+    3.82
+   ]
+  ],
+  "color": "red",
+  "dashed": true,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "up3",
+  "points": [
+   [
+    6.8,
+    4.32
+   ],
+   [
+    6.8,
+    3.82
+   ]
+  ],
+  "color": "red",
+  "dashed": true,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "k_neon",
+  "box": [
+   0.98,
+   4.720000000000001,
+   2.55,
+   0.85
+  ],
+  "label": "ARM NEON · baseline",
+  "sub": "all ARMv8 · existing Lance kernels + gaps",
+  "variant": "white"
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "k_sve",
+  "box": [
+   3.68,
+   4.720000000000001,
+   2.75,
+   0.85
+  ],
+  "label": "SVE / SVE2 · Kunpeng (main)",
+  "sub": "6 kernels done · blocked L2 next",
+  "variant": "accent"
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "k_sme",
+  "box": [
+   6.58,
+   4.720000000000001,
+   2.55,
+   0.85
+  ],
+  "label": "SME / SME2 · exploratory",
+  "sub": "outer-product tiles for batch L2",
+  "variant": "dashed"
+ },
+ {
+  "slide": 5,
+  "type": "node",
+  "id": "a_root",
+  "box": [
+   2.4,
+   1.93,
+   0.55,
+   0.26
+  ],
+  "label": "root",
+  "sub": null,
+  "variant": "dark"
+ },
+ {
+  "slide": 6,
+  "type": "node",
+  "id": "ivf",
+  "box": [
+   0.95,
+   2.01,
+   3.1,
+   0.4
+  ],
+  "label": "IVF centroids (unchanged)",
+  "sub": null,
+  "variant": "neutral"
+ },
+ {
+  "slide": 7,
+  "type": "node",
+  "id": "k3_neon",
+  "box": [
+   0.95,
+   5.06,
+   1.6,
+   0.65
+  ],
+  "label": "NEON",
+  "sub": "baseline",
+  "variant": "white"
+ },
+ {
+  "slide": 7,
+  "type": "node",
+  "id": "k3_sve",
+  "box": [
+   2.65,
+   5.06,
+   1.75,
+   0.65
+  ],
+  "label": "SVE / SVE2",
+  "sub": "Kunpeng · main",
+  "variant": "accent"
+ },
+ {
+  "slide": 7,
+  "type": "node",
+  "id": "k3_sme",
+  "box": [
+   4.5,
+   5.06,
+   1.6,
+   0.65
+  ],
+  "label": "SME / SME2",
+  "sub": "exploratory",
+  "variant": "dashed"
+ }
+]

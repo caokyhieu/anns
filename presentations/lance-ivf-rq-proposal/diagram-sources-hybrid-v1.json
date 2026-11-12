@@ -1,0 +1,578 @@
+[
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "st0",
+  "box": [
+   0.8,
+   1.78,
+   1.5,
+   0.62
+  ],
+  "label": "Parse filter",
+  "sub": "night ∧ rain",
+  "variant": "neutral"
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "e0",
+  "points": [
+   [
+    2.3,
+    2.09
+   ],
+   [
+    2.55,
+    2.09
+   ]
+  ],
+  "color": "muted",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "st1",
+  "box": [
+   2.55,
+   1.78,
+   1.5,
+   0.62
+  ],
+  "label": "Build allow-list",
+  "sub": "bitmap index → mask",
+  "variant": "neutral"
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "e1",
+  "points": [
+   [
+    4.05,
+    2.09
+   ],
+   [
+    4.3,
+    2.09
+   ]
+  ],
+  "color": "muted",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "st2",
+  "box": [
+   4.3,
+   1.78,
+   1.5,
+   0.62
+  ],
+  "label": "Route + probe",
+  "sub": "nearest nprobes",
+  "variant": "neutral"
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "e2",
+  "points": [
+   [
+    5.8,
+    2.09
+   ],
+   [
+    6.05,
+    2.09
+   ]
+  ],
+  "color": "muted",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "st3",
+  "box": [
+   6.05,
+   1.78,
+   1.5,
+   0.62
+  ],
+  "label": "Load partition",
+  "sub": "RQ codes → cache",
+  "variant": "neutral"
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "e3",
+  "points": [
+   [
+    7.55,
+    2.09
+   ],
+   [
+    7.8,
+    2.09
+   ]
+  ],
+  "color": "muted",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "st4",
+  "box": [
+   7.8,
+   1.78,
+   1.5,
+   0.62
+  ],
+  "label": "Scan + top-k",
+  "sub": "mask per row",
+  "variant": "neutral"
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "kt1",
+  "points": [
+   [
+    3.3,
+    2.62
+   ],
+   [
+    3.3,
+    2.4
+   ]
+  ],
+  "color": "blue",
+  "dashed": true,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "kt2a",
+  "points": [
+   [
+    5.05,
+    2.62
+   ],
+   [
+    5.05,
+    2.4
+   ]
+  ],
+  "color": "purple",
+  "dashed": true,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "kt2b",
+  "points": [
+   [
+    6.8,
+    2.62
+   ],
+   [
+    6.8,
+    2.4
+   ]
+  ],
+  "color": "purple",
+  "dashed": true,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "kt3",
+  "points": [
+   [
+    8.55,
+    2.62
+   ],
+   [
+    8.55,
+    2.4
+   ]
+  ],
+  "color": "green",
+  "dashed": true,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "gap0",
+  "box": [
+   0.98,
+   4.5,
+   2.6,
+   0.78
+  ],
+  "label": "1 · Allow-list rebuilt per query",
+  "sub": "only scalar-index pages are cached",
+  "variant": "white"
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "up0",
+  "points": [
+   [
+    2.4,
+    4.5
+   ],
+   [
+    2.4,
+    3.82
+   ]
+  ],
+  "color": "red",
+  "dashed": true,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "gap1",
+  "box": [
+   3.73,
+   4.5,
+   2.6,
+   0.78
+  ],
+  "label": "2 · Partition loaded before mask",
+  "sub": "load ∥ prefilter wait (try_join)",
+  "variant": "white"
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "up1",
+  "points": [
+   [
+    5.05,
+    4.5
+   ],
+   [
+    5.05,
+    3.82
+   ]
+  ],
+  "color": "red",
+  "dashed": true,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "gap2",
+  "box": [
+   6.48,
+   4.5,
+   2.6,
+   0.78
+  ],
+  "label": "3 · Empty test is global only",
+  "sub": "selects_nothing() = whole mask",
+  "variant": "white"
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "up2",
+  "points": [
+   [
+    6.8,
+    4.5
+   ],
+   [
+    6.8,
+    3.82
+   ]
+  ],
+  "color": "red",
+  "dashed": true,
+  "label": null
+ },
+ {
+  "slide": 5,
+  "type": "node",
+  "id": "k1_pred",
+  "box": [
+   1.0,
+   2.01,
+   2.4,
+   0.55
+  ],
+  "label": "Tag predicate",
+  "sub": "night ∧ rain ∧ ¬highway",
+  "variant": "white"
+ },
+ {
+  "slide": 5,
+  "type": "edge",
+  "id": "k1_e1",
+  "points": [
+   [
+    2.2,
+    2.56
+   ],
+   [
+    2.2,
+    2.73
+   ]
+  ],
+  "color": "muted",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 5,
+  "type": "node",
+  "id": "k1_norm",
+  "box": [
+   1.0,
+   2.73,
+   2.4,
+   0.55
+  ],
+  "label": "Normalize + hash",
+  "sub": "sorted terms, canonical form",
+  "variant": "white"
+ },
+ {
+  "slide": 5,
+  "type": "edge",
+  "id": "k1_e2",
+  "points": [
+   [
+    2.2,
+    3.2800000000000002
+   ],
+   [
+    2.2,
+    3.45
+   ]
+  ],
+  "color": "muted",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 5,
+  "type": "node",
+  "id": "k1_look",
+  "box": [
+   1.0,
+   3.45,
+   2.4,
+   0.6
+  ],
+  "label": "Lookup, metadata cache",
+  "sub": "version · e-tag · predicate · fragments",
+  "variant": "blue"
+ },
+ {
+  "slide": 5,
+  "type": "edge",
+  "id": "k1_hit",
+  "points": [
+   [
+    1.6,
+    4.05
+   ],
+   [
+    1.6,
+    4.36
+   ]
+  ],
+  "color": "red",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 5,
+  "type": "node",
+  "id": "k1_reuse",
+  "box": [
+   0.98,
+   4.36,
+   1.95,
+   0.6
+  ],
+  "label": "Reuse mask",
+  "sub": "no bitmap work",
+  "variant": "accent"
+ },
+ {
+  "slide": 5,
+  "type": "edge",
+  "id": "k1_miss",
+  "points": [
+   [
+    3.4,
+    3.75
+   ],
+   [
+    4.25,
+    3.75
+   ],
+   [
+    4.25,
+    4.36
+   ]
+  ],
+  "color": "muted",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 5,
+  "type": "node",
+  "id": "k1_eval",
+  "box": [
+   3.2,
+   4.36,
+   2.0,
+   0.6
+  ],
+  "label": "Bitmap → mask",
+  "sub": "then admit",
+  "variant": "white"
+ },
+ {
+  "slide": 6,
+  "type": "node",
+  "id": "k2_today",
+  "box": [
+   6.6,
+   1.8,
+   1.25,
+   0.5
+  ],
+  "label": "Today",
+  "sub": null,
+  "variant": "neutral"
+ },
+ {
+  "slide": 6,
+  "type": "node",
+  "id": "k2_t1",
+  "box": [
+   8.0,
+   1.8,
+   2.15,
+   0.5
+  ],
+  "label": "load ∥ wait mask",
+  "sub": "read + admit always",
+  "variant": "white"
+ },
+ {
+  "slide": 6,
+  "type": "edge",
+  "id": "k2_te",
+  "points": [
+   [
+    10.15,
+    2.05
+   ],
+   [
+    10.4,
+    2.05
+   ]
+  ],
+  "color": "muted",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 6,
+  "type": "node",
+  "id": "k2_t2",
+  "box": [
+   10.4,
+   1.8,
+   2.15,
+   0.5
+  ],
+  "label": "scan with mask",
+  "sub": "0-row: scored, dropped",
+  "variant": "white"
+ },
+ {
+  "slide": 6,
+  "type": "node",
+  "id": "k2_new",
+  "box": [
+   6.6,
+   2.42,
+   1.25,
+   0.5
+  ],
+  "label": "KT2",
+  "sub": null,
+  "variant": "purple"
+ },
+ {
+  "slide": 6,
+  "type": "node",
+  "id": "k2_n1",
+  "box": [
+   8.0,
+   2.42,
+   2.15,
+   0.5
+  ],
+  "label": "summary check",
+  "sub": "skip: no read, no admit",
+  "variant": "accent"
+ },
+ {
+  "slide": 6,
+  "type": "edge",
+  "id": "k2_ne",
+  "points": [
+   [
+    10.15,
+    2.67
+   ],
+   [
+    10.4,
+    2.67
+   ]
+  ],
+  "color": "red",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 6,
+  "type": "node",
+  "id": "k2_n2",
+  "box": [
+   10.4,
+   2.42,
+   2.15,
+   0.5
+  ],
+  "label": "load → scan",
+  "sub": "useful partitions only",
+  "variant": "white"
+ }
+]

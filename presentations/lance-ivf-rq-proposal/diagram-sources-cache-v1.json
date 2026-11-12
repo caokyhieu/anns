@@ -1,0 +1,600 @@
+[
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "c0",
+  "box": [
+   0.8,
+   1.78,
+   2.7,
+   0.55
+  ],
+  "label": "(6)→(7) Training loader",
+  "sub": "clips, frames, labels",
+  "variant": "neutral"
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "ce0",
+  "points": [
+   [
+    2.15,
+    2.33
+   ],
+   [
+    2.15,
+    2.5
+   ]
+  ],
+  "color": "muted",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "c1",
+  "box": [
+   3.7,
+   1.78,
+   2.7,
+   0.55
+  ],
+  "label": "(4) Mining",
+  "sub": "vectors + tags",
+  "variant": "neutral"
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "ce1",
+  "points": [
+   [
+    5.05,
+    2.33
+   ],
+   [
+    5.05,
+    2.5
+   ]
+  ],
+  "color": "muted",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "c2",
+  "box": [
+   6.6,
+   1.78,
+   2.7,
+   0.55
+  ],
+  "label": "(5) GT / OCC",
+  "sub": "clips, 3D",
+  "variant": "neutral"
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "ce2",
+  "points": [
+   [
+    7.949999999999999,
+    2.33
+   ],
+   [
+    7.949999999999999,
+    2.5
+   ]
+  ],
+  "color": "muted",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "reader",
+  "box": [
+   0.8,
+   2.5,
+   8.5,
+   0.42
+  ],
+  "label": "Lance reader · take / take_blobs / read_range / vector search",
+  "sub": null,
+  "variant": "white"
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "r_down",
+  "points": [
+   [
+    5.05,
+    2.92
+   ],
+   [
+    5.05,
+    3.12
+   ]
+  ],
+  "color": "muted",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "kt2",
+  "points": [
+   [
+    2.15,
+    4.0
+   ],
+   [
+    2.4,
+    4.0
+   ]
+  ],
+  "color": "purple",
+  "dashed": true,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "t0",
+  "box": [
+   2.55,
+   3.45,
+   4.3,
+   0.46
+  ],
+  "label": "L1 · process RAM",
+  "sub": "LanceCache: index + metadata [Source]",
+  "variant": "white"
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "t1",
+  "box": [
+   2.55,
+   3.9800000000000004,
+   4.3,
+   0.46
+  ],
+  "label": "L2 · UB / Lingqu pooled memory",
+  "sub": "shared by all jobs and stages [Proposal]",
+  "variant": "accent"
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "t2",
+  "box": [
+   2.55,
+   4.51,
+   4.3,
+   0.46
+  ],
+  "label": "L3 · local NVMe",
+  "sub": "node-local, disposable [Proposal]",
+  "variant": "dashed"
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "kt3",
+  "points": [
+   [
+    7.25,
+    4.0
+   ],
+   [
+    7.0,
+    4.0
+   ]
+  ],
+  "color": "green",
+  "dashed": true,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "edge",
+  "id": "origin",
+  "points": [
+   [
+    4.7,
+    5.07
+   ],
+   [
+    4.7,
+    5.27
+   ]
+  ],
+  "color": "muted",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 3,
+  "type": "node",
+  "id": "obs",
+  "box": [
+   2.4,
+   5.27,
+   4.6,
+   0.5
+  ],
+  "label": "OBS · Lance files (origin, source of truth)",
+  "sub": null,
+  "variant": "dark"
+ },
+ {
+  "slide": 4,
+  "type": "node",
+  "id": "lev1",
+  "box": [
+   0.95,
+   4.56,
+   2.55,
+   0.95
+  ],
+  "label": "Read less",
+  "sub": "the range a step needs: 64× fewer bytes than the clip",
+  "variant": "white"
+ },
+ {
+  "slide": 4,
+  "type": "node",
+  "id": "lev2",
+  "box": [
+   3.6,
+   4.56,
+   2.55,
+   0.95
+  ],
+  "label": "Read closer",
+  "sub": "from L2 UB pool, not OBS: first-byte latency TBD",
+  "variant": "accent"
+ },
+ {
+  "slide": 5,
+  "type": "node",
+  "id": "k1_req",
+  "box": [
+   1.0,
+   2.01,
+   3.2,
+   0.5
+  ],
+  "label": "read_range(clip.lance, 37–41 MiB)",
+  "sub": null,
+  "variant": "white"
+ },
+ {
+  "slide": 5,
+  "type": "edge",
+  "id": "k1_e0",
+  "points": [
+   [
+    2.6,
+    2.51
+   ],
+   [
+    2.6,
+    2.65
+   ]
+  ],
+  "color": "muted",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 5,
+  "type": "node",
+  "id": "k1_t0",
+  "box": [
+   1.0,
+   3.26,
+   2.9,
+   0.5
+  ],
+  "label": "L1 · process RAM",
+  "sub": "ns–µs · per process",
+  "variant": "white"
+ },
+ {
+  "slide": 5,
+  "type": "node",
+  "id": "k1_t1",
+  "box": [
+   1.0,
+   3.92,
+   2.9,
+   0.5
+  ],
+  "label": "L2 · UB / Lingqu pool",
+  "sub": "shared · latency TBD",
+  "variant": "accent"
+ },
+ {
+  "slide": 5,
+  "type": "node",
+  "id": "k1_t2",
+  "box": [
+   1.0,
+   4.58,
+   2.9,
+   0.5
+  ],
+  "label": "L3 · local NVMe",
+  "sub": "node-local · latency TBD",
+  "variant": "dashed"
+ },
+ {
+  "slide": 5,
+  "type": "node",
+  "id": "k1_t3",
+  "box": [
+   1.0,
+   5.24,
+   2.9,
+   0.5
+  ],
+  "label": "OBS origin",
+  "sub": "source of truth",
+  "variant": "dark"
+ },
+ {
+  "slide": 6,
+  "type": "node",
+  "id": "k2_f0",
+  "box": [
+   1.0,
+   3.51,
+   2.6,
+   0.5
+  ],
+  "label": "Sampler",
+  "sub": "seeded epoch order",
+  "variant": "white"
+ },
+ {
+  "slide": 6,
+  "type": "edge",
+  "id": "k2_fe0",
+  "points": [
+   [
+    2.3,
+    4.01
+   ],
+   [
+    2.3,
+    4.13
+   ]
+  ],
+  "color": "muted",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 6,
+  "type": "node",
+  "id": "k2_f1",
+  "box": [
+   1.0,
+   4.13,
+   2.6,
+   0.5
+  ],
+  "label": "Next W clips",
+  "sub": "lookahead window",
+  "variant": "white"
+ },
+ {
+  "slide": 6,
+  "type": "edge",
+  "id": "k2_fe1",
+  "points": [
+   [
+    2.3,
+    4.63
+   ],
+   [
+    2.3,
+    4.75
+   ]
+  ],
+  "color": "muted",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 6,
+  "type": "node",
+  "id": "k2_f2",
+  "box": [
+   1.0,
+   4.75,
+   2.6,
+   0.5
+  ],
+  "label": "Lance take plan",
+  "sub": "rows → byte ranges",
+  "variant": "white"
+ },
+ {
+  "slide": 6,
+  "type": "edge",
+  "id": "k2_fe2",
+  "points": [
+   [
+    2.3,
+    5.25
+   ],
+   [
+    2.3,
+    5.37
+   ]
+  ],
+  "color": "muted",
+  "dashed": false,
+  "label": null
+ },
+ {
+  "slide": 6,
+  "type": "node",
+  "id": "k2_f3",
+  "box": [
+   1.0,
+   5.369999999999999,
+   2.6,
+   0.5
+  ],
+  "label": "L2 prefetch queue",
+  "sub": "first chunk first",
+  "variant": "accent"
+ },
+ {
+  "slide": 6,
+  "type": "node",
+  "id": "k2_hint",
+  "box": [
+   3.85,
+   4.76,
+   2.3,
+   0.55
+  ],
+  "label": "(4) mining results",
+  "sub": "clips chosen for training",
+  "variant": "purple"
+ },
+ {
+  "slide": 6,
+  "type": "edge",
+  "id": "k2_he",
+  "points": [
+   [
+    5.0,
+    5.31
+   ],
+   [
+    5.0,
+    5.64
+   ],
+   [
+    3.6,
+    5.64
+   ]
+  ],
+  "color": "purple",
+  "dashed": true,
+  "label": null
+ },
+ {
+  "slide": 7,
+  "type": "node",
+  "id": "k3_n0",
+  "box": [
+   6.65,
+   1.82,
+   1.35,
+   0.5
+  ],
+  "label": "pool node 1",
+  "sub": null,
+  "variant": "white"
+ },
+ {
+  "slide": 7,
+  "type": "node",
+  "id": "k3_n1",
+  "box": [
+   8.120000000000001,
+   1.82,
+   1.35,
+   0.5
+  ],
+  "label": "pool node 2",
+  "sub": null,
+  "variant": "accent"
+ },
+ {
+  "slide": 7,
+  "type": "node",
+  "id": "k3_n2",
+  "box": [
+   9.59,
+   1.82,
+   1.35,
+   0.5
+  ],
+  "label": "pool node 3",
+  "sub": null,
+  "variant": "white"
+ },
+ {
+  "slide": 7,
+  "type": "node",
+  "id": "k3_n3",
+  "box": [
+   11.06,
+   1.82,
+   1.35,
+   0.5
+  ],
+  "label": "pool node 4",
+  "sub": null,
+  "variant": "white"
+ },
+ {
+  "slide": 7,
+  "type": "node",
+  "id": "k3_g0",
+  "box": [
+   6.95,
+   2.75,
+   1.6,
+   0.45
+  ],
+  "label": "GPU node A",
+  "sub": null,
+  "variant": "neutral"
+ },
+ {
+  "slide": 7,
+  "type": "node",
+  "id": "k3_g1",
+  "box": [
+   8.9,
+   2.75,
+   1.6,
+   0.45
+  ],
+  "label": "GPU node B",
+  "sub": null,
+  "variant": "neutral"
+ },
+ {
+  "slide": 7,
+  "type": "node",
+  "id": "k3_g2",
+  "box": [
+   10.85,
+   2.75,
+   1.6,
+   0.45
+  ],
+  "label": "GPU node C",
+  "sub": null,
+  "variant": "neutral"
+ }
+]

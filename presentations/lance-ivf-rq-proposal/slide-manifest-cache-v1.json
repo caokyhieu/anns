@@ -1,0 +1,42 @@
+[
+ {
+  "slide": 1,
+  "title": "— Huawei Confidential —",
+  "notes_chars": 1138
+ },
+ {
+  "slide": 2,
+  "title": "We speed up ADS stage (6): serving the data lake",
+  "notes_chars": 537
+ },
+ {
+  "slide": 3,
+  "title": "Three key technologies in the Lance read path",
+  "notes_chars": 2473
+ },
+ {
+  "slide": 4,
+  "title": "\"ms\" needs a close hit and a partial read",
+  "notes_chars": 2904
+ },
+ {
+  "slide": 5,
+  "title": "KT1 · A tiered byte cache: RAM, UB pool, NVMe",
+  "notes_chars": 2622
+ },
+ {
+  "slide": 6,
+  "title": "KT2 · Prefetch from the known training order",
+  "notes_chars": 1995
+ },
+ {
+  "slide": 7,
+  "title": "KT3 · One policy keeps valuable bytes close",
+  "notes_chars": 2592
+ },
+ {
+  "slide": 8,
+  "title": "Summary · hooks exist in Lance, UB budget next",
+  "notes_chars": 2080
+ }
+]

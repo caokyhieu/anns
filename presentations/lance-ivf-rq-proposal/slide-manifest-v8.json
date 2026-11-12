@@ -1,0 +1,42 @@
+[
+ {
+  "slide": 1,
+  "title": "— Huawei Confidential —",
+  "notes_chars": 793
+ },
+ {
+  "slide": 2,
+  "title": "We speed up ADS stage (3): building vector indexes",
+  "notes_chars": 566
+ },
+ {
+  "slide": 3,
+  "title": "Three key technologies in the Lance build",
+  "notes_chars": 1991
+ },
+ {
+  "slide": 4,
+  "title": "PiPNN · Build the graph with matrix math, not search",
+  "notes_chars": 1574
+ },
+ {
+  "slide": 5,
+  "title": "KT1 · Tree or PiPNN assignment: ~2× faster build",
+  "notes_chars": 1615
+ },
+ {
+  "slide": 6,
+  "title": "KT2 · PiPNN partition graphs build 4.9× faster",
+  "notes_chars": 1699
+ },
+ {
+  "slide": 7,
+  "title": "KT3 · One blocked ARM kernel under KT1 and KT2",
+  "notes_chars": 1379
+ },
+ {
+  "slide": 8,
+  "title": "Summary · measured on x86, Kunpeng next",
+  "notes_chars": 1570
+ }
+]

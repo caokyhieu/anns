@@ -1,0 +1,42 @@
+[
+ {
+  "slide": 1,
+  "title": "— Huawei Confidential —",
+  "notes_chars": 991
+ },
+ {
+  "slide": 2,
+  "title": "We speed up ADS stage (4): vector + tag retrieval",
+  "notes_chars": 504
+ },
+ {
+  "slide": 3,
+  "title": "Three key technologies in Lance filtered search",
+  "notes_chars": 2689
+ },
+ {
+  "slide": 4,
+  "title": "Filtered IVF loads partitions where no row passes",
+  "notes_chars": 2260
+ },
+ {
+  "slide": 5,
+  "title": "KT1 · Cache the tag allow-list, not only pages",
+  "notes_chars": 2240
+ },
+ {
+  "slide": 6,
+  "title": "KT2 · Skip partitions where no row can pass",
+  "notes_chars": 2604
+ },
+ {
+  "slide": 7,
+  "title": "KT3 · Batch mining queries that share partitions",
+  "notes_chars": 1820
+ },
+ {
+  "slide": 8,
+  "title": "Summary · recall-safe by design, ADS trace next",
+  "notes_chars": 2013
+ }
+]
