@@ -1,0 +1,769 @@
+From 899c781d88a929d882133ab189aefaf6884a3db6 Mon Sep 17 00:00:00 2001
+From: lance-index-build <lance-index-build@localhost>
+Date: Thu, 12 Nov 2026 11:13:10 +0000
+Subject: [PATCH] bench(index): standalone IVF_RQ stage benchmark for kernel
+ arms
+
+The stages binary runs each IVF_RQ build stage through the Lance function
+the builder calls for it (train_kmeans, RabitQuantizer::build,
+PreparedAssignment, ResidualTransform + RQTransformer) plus the query
+probe (kmeans_find_partitions_arrow_array), on an in-memory GIST or BIGANN
+base with no dataset or index writes. One process per kernel arm;
+CENTROIDS_FROM / REF_DIR reuse a reference arm's centroids and compare
+assignments row by row.
+---
+ rust/lance-index-bench/src/bin/stages.rs | 742 +++++++++++++++++++++++
+ 1 file changed, 742 insertions(+)
+ create mode 100644 rust/lance-index-bench/src/bin/stages.rs
+
+diff --git a/rust/lance-index-bench/src/bin/stages.rs b/rust/lance-index-bench/src/bin/stages.rs
+new file mode 100644
+index 0000000..351a5c7
+--- /dev/null
++++ b/rust/lance-index-bench/src/bin/stages.rs
+@@ -0,0 +1,742 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright The Lance Authors
++#![allow(clippy::print_stdout)]
++
++//! IVF_RQ build pipeline, one stage at a time, on an in-memory base.
++//!
++//! Each stage calls the Lance function the index builder runs for it, without
++//! a dataset, shuffle files or index writing, so a stage's time is its compute
++//! alone:
++//!
++//! | stage       | Lance code                                              |
++//! |-------------|---------------------------------------------------------|
++//! | `train`     | `kmeans::train_kmeans` on `SAMPLE_RATE x K` sampled rows |
++//! | `quantizer` | `RabitQuantizer::build` (the rotation) on the sample    |
++//! | `assign`    | `ivf::PreparedAssignment` (the shuffle's partition step) |
++//! | `encode`    | `ResidualTransform`, then `RQTransformer` (shuffle)     |
++//! | `probe`     | `kmeans_find_partitions_arrow_array` per query (search) |
++//!
++//! Kernel dispatch is fixed per process, so a kernel arm is a separate run:
++//! the build (with or without SVE objects, `LANCE_DISABLE_SVE_BUILD`) and the
++//! environment (`LANCE_F32_SVE`, `LANCE_DISABLE_BLOCKED_L2`) choose it, and
++//! `ARM` labels it. `CENTROIDS_FROM` and `REF_DIR` point at an earlier run
++//! (normally the legacy arm): the downstream stages then use its centroids, so
++//! assignments are comparable row by row, and the assign rows record agreement
++//! with its exact assignment. `train` always trains (that is what it times).
++//!
++//! Environment:
++//! - `DATASET` = `gist` (base.f32, query.f32, gt.i32, meta.txt) | `bigann`
++//!   (base.10M.u8bin, query.u8bin, gt.10M.ibin); `DATA_DIR`; `N_LIMIT` (prefix;
++//!   probe recall then needs no ground truth and is skipped).
++//! - `OUT_DIR` (required): manifest.json, stages.jsonl, centroids.f32,
++//!   assign-exact.{u32,f32}.
++//! - `STAGES` (default all, in order): comma list of the stages above.
++//! - `NUM_PARTITIONS` (1000), `SAMPLE_RATE` (256), `MAX_ITERS` (50), `HIER_K` (16),
++//!   `REFINE_ITERS` (0), `SEED` (42), `NUM_BITS` (4), `BATCH_ROWS` (16384).
++//! - `ASSIGN` (default `auto,exact`): `auto`, `exact`, `tree:<beam>`, `hnsw[:m:efc:ef]`,
++//!   `pipnn:<beam>[:<degree>:<leaf>]`. Tree specs use this run's own centroids and
++//!   hierarchy; every other spec uses the evaluation centroids.
++//! - `NPROBES` (default 1,4,16,64), `PROBE_RECALL_K` (10), `WARMUP` (1).
++//! - `ARM` (label), `REPEAT` (repeat number); rows are appended, so repeated
++//!   runs into one `OUT_DIR` accumulate.
++
++use std::collections::HashMap;
++use std::fs::File;
++use std::io::{BufWriter, Read, Write};
++use std::path::{Path, PathBuf};
++use std::sync::Arc;
++use std::time::Instant;
++
++use arrow_array::cast::AsArray;
++use arrow_array::types::Float32Type;
++use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array};
++use arrow_schema::{Field, Schema};
++use lance_arrow::FixedSizeListArrayExt;
++use lance_index::vector::assignment_tree::AssignmentTree;
++use lance_index::vector::bq::RQBuildParams;
++use lance_index::vector::bq::builder::RabitQuantizer;
++use lance_index::vector::bq::transform::RQTransformer;
++use lance_index::vector::ivf::PreparedAssignment;
++use lance_index::vector::ivf::builder::CentroidAssignment;
++use lance_index::vector::kmeans::{KMeansParams, kmeans_find_partitions_arrow_array, train_kmeans};
++use lance_index::vector::quantizer::Quantization;
++use lance_index::vector::residual::ResidualTransform;
++use lance_index::vector::transform::Transformer;
++use lance_index::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
++use lance_linalg::distance::DistanceType;
++use rayon::prelude::*;
++use serde_json::{Value, json};
++
++fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
++    std::env::var(name)
++        .ok()
++        .map(|v| {
++            v.parse()
++                .unwrap_or_else(|_| panic!("{name}={v} is not valid"))
++        })
++        .unwrap_or(default)
++}
++
++fn env_list(name: &str, default: &str) -> Vec<String> {
++    std::env::var(name)
++        .unwrap_or_else(|_| default.into())
++        .split(',')
++        .map(|s| s.trim().to_string())
++        .filter(|s| !s.is_empty())
++        .collect()
++}
++
++fn read_file(path: &Path) -> Vec<u8> {
++    let mut v = Vec::new();
++    File::open(path)
++        .and_then(|mut f| f.read_to_end(&mut v))
++        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
++    v
++}
++
++fn u32s(b: &[u8]) -> Vec<u32> {
++    b.as_chunks::<4>()
++        .0
++        .iter()
++        .map(|c| u32::from_le_bytes(*c))
++        .collect()
++}
++
++fn f32s(b: &[u8]) -> Vec<f32> {
++    b.as_chunks::<4>()
++        .0
++        .iter()
++        .map(|c| f32::from_le_bytes(*c))
++        .collect()
++}
++
++fn write_raw<T: Copy>(path: &Path, values: &[T]) {
++    // SAFETY: plain-old-data slices (u32 / f32), written in native (little) endian.
++    let bytes = unsafe {
++        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
++    };
++    File::create(path)
++        .and_then(|mut f| f.write_all(bytes))
++        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
++}
++
++struct Data {
++    base: Vec<f32>,
++    rows: usize,
++    dim: usize,
++    queries: Vec<f32>,
++    /// Ground-truth neighbour ids, `truth_k` per query (empty with `N_LIMIT`).
++    truth: Vec<u32>,
++    truth_k: usize,
++}
++
++/// Loads the whole base as f32, the element type Lance indexes for both sets.
++fn load(kind: &str, dir: &Path, limit: Option<usize>) -> Data {
++    let (base, rows, dim, queries, truth, truth_k) = match kind {
++        "gist" => {
++            let meta: Vec<usize> = std::fs::read_to_string(dir.join("meta.txt"))
++                .unwrap()
++                .split_whitespace()
++                .map(|v| v.parse().unwrap())
++                .collect();
++            let (n, dim, _nq, gt_k) = (meta[0], meta[1], meta[2], meta[3]);
++            let rows = limit.map_or(n, |l| l.min(n));
++            let mut raw = vec![0u8; rows * dim * 4];
++            File::open(dir.join("base.f32"))
++                .and_then(|mut f| f.read_exact(&mut raw))
++                .unwrap();
++            let base = f32s(&raw);
++            drop(raw);
++            let queries = f32s(&read_file(&dir.join("query.f32")));
++            let truth = u32s(&read_file(&dir.join("gt.i32")));
++            (base, rows, dim, queries, truth, gt_k)
++        }
++        "bigann" => {
++            let mut f = File::open(dir.join("base.10M.u8bin")).unwrap();
++            let mut h = [0u8; 8];
++            f.read_exact(&mut h).unwrap();
++            let h = u32s(&h);
++            let (n, dim) = (h[0] as usize, h[1] as usize);
++            let rows = limit.map_or(n, |l| l.min(n));
++            let mut raw = vec![0u8; rows * dim];
++            f.read_exact(&mut raw).unwrap();
++            let base: Vec<f32> = raw.par_iter().map(|&v| f32::from(v)).collect();
++            drop(raw);
++            let q = read_file(&dir.join("query.u8bin"));
++            let queries = q[8..].iter().map(|&v| f32::from(v)).collect();
++            let gt = read_file(&dir.join("gt.10M.ibin"));
++            let h = u32s(&gt[..8]);
++            let (nq, k) = (h[0] as usize, h[1] as usize);
++            let truth = u32s(&gt[8..8 + nq * k * 4]);
++            (base, rows, dim, queries, truth, k)
++        }
++        other => panic!("DATASET must be gist or bigann, got {other}"),
++    };
++    // Published ground truth covers the full base only.
++    let (truth, truth_k) = if rows < truth.iter().copied().max().unwrap_or(0) as usize + 1 {
++        (Vec::new(), 0)
++    } else {
++        (truth, truth_k)
++    };
++    Data {
++        base,
++        rows,
++        dim,
++        queries,
++        truth,
++        truth_k,
++    }
++}
++
++fn fsl(values: Vec<f32>, dim: usize) -> FixedSizeListArray {
++    FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim as i32).unwrap()
++}
++
++fn splitmix(mut x: u64) -> u64 {
++    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
++    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
++    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
++    x ^ (x >> 31)
++}
++
++/// `count` distinct row ids, a deterministic partial Fisher-Yates over 0..rows.
++fn sample_ids(rows: usize, count: usize, seed: u64) -> Vec<usize> {
++    let mut displaced: HashMap<usize, usize> = HashMap::with_capacity(2 * count);
++    let slot = |m: &HashMap<usize, usize>, i: usize| *m.get(&i).unwrap_or(&i);
++    for i in 0..count {
++        let j = i + (splitmix(seed ^ i as u64) as usize) % (rows - i);
++        let (a, b) = (slot(&displaced, i), slot(&displaced, j));
++        displaced.insert(i, b);
++        displaced.insert(j, a);
++    }
++    (0..count).map(|i| slot(&displaced, i)).collect()
++}
++
++fn cpu_seconds() -> f64 {
++    // SAFETY: getrusage writes into the zeroed struct we own.
++    let mut u: libc::rusage = unsafe { std::mem::zeroed() };
++    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
++    let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 * 1e-6;
++    tv(u.ru_utime) + tv(u.ru_stime)
++}
++
++fn percentile(sorted: &[f64], p: f64) -> f64 {
++    if sorted.is_empty() {
++        return f64::NAN;
++    }
++    sorted[((sorted.len() - 1) as f64 * p).round() as usize]
++}
++
++/// Wall and CPU seconds of `f`.
++fn timed<R>(f: impl FnOnce() -> R) -> (R, f64, f64) {
++    let (c, t) = (cpu_seconds(), Instant::now());
++    let r = f();
++    (r, t.elapsed().as_secs_f64(), cpu_seconds() - c)
++}
++
++fn parse_assignment(spec: &str) -> CentroidAssignment {
++    let parts: Vec<&str> = spec.split(':').collect();
++    let num = |i: usize| -> usize {
++        parts
++            .get(i)
++            .and_then(|v| v.parse().ok())
++            .unwrap_or_else(|| panic!("assignment {spec}: bad or missing field {i}"))
++    };
++    match parts[0] {
++        "auto" => CentroidAssignment::Auto,
++        "exact" => CentroidAssignment::Exact,
++        "tree" => CentroidAssignment::Tree { beam: num(1) },
++        "hnsw" if parts.len() == 1 => CentroidAssignment::Hnsw {
++            m: 12,
++            ef_construction: 15,
++            ef: 15,
++        },
++        "hnsw" => CentroidAssignment::Hnsw {
++            m: num(1),
++            ef_construction: num(2),
++            ef: num(3),
++        },
++        #[cfg(feature = "pipnn")]
++        "pipnn" => {
++            let d = lance_index::vector::pipnn::PipnnBuildParams::default();
++            let mut params = lance_index::vector::pipnn::PipnnBuildParams {
++                degree: env_or("PIPNN_DEGREE", d.degree),
++                leaf_size: env_or("PIPNN_LEAF", d.leaf_size),
++                local_k: env_or("PIPNN_LOCAL_K", d.local_k),
++                reservoir: env_or("PIPNN_RESERVOIR", d.reservoir),
++                threads: env_or("PIPNN_THREADS", rayon::current_num_threads()),
++                ..d
++            };
++            if parts.len() > 2 {
++                params.degree = num(2);
++                params.leaf_size = num(3);
++            }
++            CentroidAssignment::Pipnn {
++                params,
++                beam: num(1),
++            }
++        }
++        other => panic!(
++            "unknown or unavailable assignment backend {other} (pipnn needs --features pipnn)"
++        ),
++    }
++}
++
++struct Out {
++    lines: BufWriter<File>,
++    common: Value,
++}
++
++impl Out {
++    fn emit(&mut self, stage: &str, variant: &str, metrics: Value) {
++        let mut row = self.common.clone();
++        row["stage"] = json!(stage);
++        row["variant"] = json!(variant);
++        for (k, v) in metrics.as_object().unwrap() {
++            row[k] = v.clone();
++        }
++        println!("{row}");
++        writeln!(self.lines, "{row}").unwrap();
++        self.lines.flush().unwrap();
++    }
++}
++
++/// One full assignment pass: partition id (`u32::MAX` = unassigned) and squared distance.
++struct Assignment {
++    ids: Vec<u32>,
++    dists: Vec<f32>,
++}
++
++fn run_assignment(
++    chunks: &[FixedSizeListArray],
++    centroids: &FixedSizeListArray,
++    spec: &str,
++    tree: Option<Arc<AssignmentTree>>,
++) -> Result<(Assignment, Value), String> {
++    let assignment = parse_assignment(spec);
++    let (prepared, prepare_secs, _) = timed(|| {
++        PreparedAssignment::prepare(centroids.clone(), DistanceType::L2, &assignment, tree)
++    });
++    let prepared = prepared.map_err(|e| e.to_string())?;
++    let (parts, secs, cpu) = timed(|| {
++        chunks
++            .par_iter()
++            .map(|c| prepared.assign(c.clone()))
++            .collect::<lance_core::Result<Vec<_>>>()
++    });
++    let parts = parts.map_err(|e| e.to_string())?;
++    let rows: usize = chunks.iter().map(|c| c.len()).sum();
++    let mut out = Assignment {
++        ids: Vec::with_capacity(rows),
++        dists: Vec::with_capacity(rows),
++    };
++    for (ids, dists) in &parts {
++        for i in 0..ids.len() {
++            let ok = ids.is_valid(i);
++            out.ids.push(if ok { ids.value(i) } else { u32::MAX });
++            out.dists.push(if ok { dists.value(i) } else { f32::NAN });
++        }
++    }
++    #[cfg(feature = "pipnn")]
++    let graph = prepared.pipnn_stats().map(|g| {
++        json!({"vertices": g.vertices, "mean_degree": g.mean_degree,
++               "max_degree": g.max_degree, "reachable_fraction": g.reachable_fraction})
++    });
++    #[cfg(not(feature = "pipnn"))]
++    let graph: Option<Value> = None;
++    let k = centroids.len();
++    let mut sizes = vec![0usize; k];
++    let mut unassigned = 0usize;
++    let mut sum = 0f64;
++    for (&id, &d) in out.ids.iter().zip(&out.dists) {
++        if id == u32::MAX {
++            unassigned += 1;
++        } else {
++            sizes[id as usize] += 1;
++            sum += d as f64;
++        }
++    }
++    let mean_size = rows as f64 / k as f64;
++    let metrics = json!({
++        "prepare_secs": prepare_secs, "secs": secs, "cpu_secs": cpu,
++        "rows_per_sec": rows as f64 / secs,
++        "objective": sum / (rows - unassigned).max(1) as f64,
++        "unassigned": unassigned,
++        "partition_max_over_mean": *sizes.iter().max().unwrap() as f64 / mean_size,
++        "empty_partitions": sizes.iter().filter(|&&s| s == 0).count(),
++        "centroid_graph": graph,
++    });
++    Ok((out, metrics))
++}
++
++/// Agreement of `got` with `reference`, row by row.
++fn compare(got: &Assignment, reference: &Assignment) -> Value {
++    let n = got.ids.len().min(reference.ids.len());
++    let mut agree = 0usize;
++    let mut rel = Vec::with_capacity(n);
++    for i in 0..n {
++        let (g, r) = (got.ids[i], reference.ids[i]);
++        if g == u32::MAX || r == u32::MAX {
++            continue;
++        }
++        agree += usize::from(g == r);
++        let (dg, dr) = (got.dists[i] as f64, reference.dists[i] as f64);
++        rel.push((dg - dr) / dr.max(1e-12));
++    }
++    let mut abs: Vec<f64> = rel.iter().map(|v| v.abs()).collect();
++    abs.sort_by(f64::total_cmp);
++    json!({
++        "rows": n,
++        "id_agreement": agree as f64 / n.max(1) as f64,
++        // Signed: > 0 means farther centroids than the reference picked.
++        "rel_dist_diff_mean": rel.iter().sum::<f64>() / rel.len().max(1) as f64,
++        "rel_dist_abs_p99": percentile(&abs, 0.99),
++        "rel_dist_abs_max": abs.last().copied().unwrap_or(0.0),
++    })
++}
++
++fn load_assignment(dir: &Path, rows: usize) -> Option<Assignment> {
++    let ids = std::fs::read(dir.join("assign-exact.u32")).ok()?;
++    let dists = std::fs::read(dir.join("assign-exact.f32")).ok()?;
++    let a = Assignment {
++        ids: u32s(&ids),
++        dists: f32s(&dists),
++    };
++    (a.ids.len() == rows && a.dists.len() == rows).then_some(a)
++}
++
++fn main() {
++    let kind = std::env::var("DATASET").unwrap_or_else(|_| "gist".into());
++    let dir = PathBuf::from(std::env::var("DATA_DIR").expect("DATA_DIR"));
++    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
++    std::fs::create_dir_all(&out_dir).unwrap();
++    let limit: Option<usize> = std::env::var("N_LIMIT").ok().map(|v| v.parse().unwrap());
++    let stages = env_list("STAGES", "train,quantizer,assign,encode,probe");
++    let want = |s: &str| stages.iter().any(|x| x == s);
++    let k: usize = env_or("NUM_PARTITIONS", 1000);
++    let sample_rate: usize = env_or("SAMPLE_RATE", 256);
++    let seed: u64 = env_or("SEED", 42);
++    let num_bits: u8 = env_or("NUM_BITS", 4);
++    let batch_rows: usize = env_or("BATCH_ROWS", 16384);
++    let specs = env_list("ASSIGN", "auto,exact");
++    let ref_dir = std::env::var("REF_DIR").ok().map(PathBuf::from);
++
++    let (data, load_secs, _) = timed(|| load(&kind, &dir, limit));
++    let (n, dim) = (data.rows, data.dim);
++    println!("loaded {kind}: {n} x {dim} in {load_secs:.1}s");
++
++    let kernels = json!({
++        "dot_tile": lance_linalg::distance::tile::dot_tile_kernel_name(),
++        "blocked_l2": lance_index::vector::blocked_l2_kernel_name(),
++        "l2_f32_batch": lance_linalg::distance::l2::l2_f32_batch_kernel_name(),
++        "l2_f32_pair": lance_linalg::distance::l2::l2_f32_kernel_name(),
++    });
++    let env: serde_json::Map<String, Value> = std::env::vars()
++        .filter(|(k, _)| {
++            k.starts_with("LANCE_")
++                || k.starts_with("RAYON")
++                || k.starts_with("PIPNN_")
++                || [
++                    "ARM",
++                    "DATASET",
++                    "N_LIMIT",
++                    "STAGES",
++                    "NUM_PARTITIONS",
++                    "SAMPLE_RATE",
++                    "MAX_ITERS",
++                    "HIER_K",
++                    "REFINE_ITERS",
++                    "SEED",
++                    "NUM_BITS",
++                    "BATCH_ROWS",
++                    "ASSIGN",
++                    "NPROBES",
++                    "CENTROIDS_FROM",
++                    "REF_DIR",
++                    "GIT_REV",
++                    "PATCH_SHA256",
++                ]
++                .contains(&k.as_str())
++        })
++        .map(|(k, v)| (k, Value::String(v)))
++        .collect();
++    let arm = std::env::var("ARM").unwrap_or_else(|_| "unlabeled".into());
++    std::fs::write(
++        out_dir.join("manifest.json"),
++        serde_json::to_string_pretty(&json!({
++            "arch": std::env::consts::ARCH,
++            "cpu_features": lance_core::utils::cpu::CpuFeatures::host().names().collect::<Vec<_>>(),
++            "threads": rayon::current_num_threads(),
++            "pipnn_feature": cfg!(feature = "pipnn"),
++            "kernels": kernels, "dataset": kind, "rows": n, "dim": dim,
++            "queries": data.queries.len() / dim, "truth_k": data.truth_k, "env": env,
++        }))
++        .unwrap(),
++    )
++    .unwrap();
++    let mut out = Out {
++        lines: BufWriter::new(
++            std::fs::OpenOptions::new()
++                .create(true)
++                .append(true)
++                .open(out_dir.join("stages.jsonl"))
++                .unwrap(),
++        ),
++        common: json!({"arm": arm, "repeat": env_or("REPEAT", 0usize),
++                        "dataset": kind, "rows": n, "dim": dim,
++                        "num_partitions": k, "threads": rayon::current_num_threads(),
++                        "kernels": kernels}),
++    };
++
++    // Training sample: SAMPLE_RATE x K distinct random rows, as Lance samples.
++    let sample_rows = (sample_rate * k).min(n);
++    let sample: Vec<f32> = sample_ids(n, sample_rows, seed ^ 0x5a)
++        .into_iter()
++        .flat_map(|i| data.base[i * dim..(i + 1) * dim].iter().copied())
++        .collect();
++
++    // --- train: k-means (the build's train_ivf stage) ---
++    let mut own: Option<(FixedSizeListArray, Option<Arc<AssignmentTree>>)> = None;
++    if want("train") {
++        let mut params = KMeansParams::new(None, env_or("MAX_ITERS", 50), 1, DistanceType::L2)
++            .with_balance_factor(1.0)
++            .with_hierarchical_k(env_or("HIER_K", 16))
++            .with_refine_iters(env_or("REFINE_ITERS", 0));
++        params.seed = Some(seed);
++        params.retain_assignment_tree = specs.iter().any(|s| s.starts_with("tree"));
++        let arr = Float32Array::from(sample.clone());
++        let (km, secs, cpu) =
++            timed(|| train_kmeans::<Float32Type>(&arr, params, dim, k, sample_rate));
++        let km = km.expect("k-means training failed");
++        let centroids = km.centroids.as_primitive::<Float32Type>().values().to_vec();
++        write_raw(&out_dir.join("centroids.f32"), &centroids);
++        out.emit(
++            "train",
++            "kmeans",
++            json!({"secs": secs, "cpu_secs": cpu, "sample_rows": sample_rows,
++                   "loss": km.loss, "mean_loss": km.loss / sample_rows as f64,
++                   "retained_tree": km.assignment_tree.is_some()}),
++        );
++        own = Some((fsl(centroids, dim), km.assignment_tree));
++    }
++    // Evaluation centroids for every downstream stage.
++    let eval = match std::env::var("CENTROIDS_FROM") {
++        Ok(path) => {
++            let c = f32s(&read_file(Path::new(&path)));
++            assert_eq!(c.len(), k * dim, "{path}: expected {k} x {dim} centroids");
++            fsl(c, dim)
++        }
++        Err(_) => own
++            .as_ref()
++            .map(|o| o.0.clone())
++            .expect("STAGES without train needs CENTROIDS_FROM"),
++    };
++
++    // --- quantizer: RQ rotation (the build's train_quantizer stage) ---
++    let rq_params = RQBuildParams::new(num_bits);
++    let sample_fsl = fsl(sample, dim);
++    let mut rq: Option<RabitQuantizer> = None;
++    if want("quantizer") {
++        let (q, secs, cpu) =
++            timed(|| RabitQuantizer::build(&sample_fsl, DistanceType::L2, &rq_params));
++        rq = Some(q.expect("RQ build failed"));
++        out.emit(
++            "quantizer",
++            &format!("rq{num_bits}"),
++            json!({"secs": secs, "cpu_secs": cpu}),
++        );
++    }
++    drop(sample_fsl);
++
++    // The base in BATCH_ROWS batches (zero-copy slices), processed in parallel
++    // like the shuffle's concurrent batches.
++    let base = fsl(data.base, dim);
++    let chunks: Vec<FixedSizeListArray> = (0..n)
++        .step_by(batch_rows)
++        .map(|s| base.slice(s, batch_rows.min(n - s)))
++        .collect();
++
++    // --- assign: partition every row (the shuffle's assignment step) ---
++    let mut exact: Option<Assignment> = None;
++    if want("assign") || want("encode") || want("probe") {
++        let reference = ref_dir.as_ref().and_then(|d| load_assignment(d, n));
++        let mut own_exact: Option<Assignment> = None;
++        // Exact always runs, first: it is the reference for the other specs and
++        // the input of encode and probe.
++        let order = std::iter::once("exact")
++            .chain(specs.iter().map(String::as_str).filter(|s| *s != "exact"));
++        for spec in order {
++            let is_tree = spec.starts_with("tree");
++            let (centroids, tree, source) = if is_tree {
++                match &own {
++                    Some((c, t)) => (c, t.clone(), "own"),
++                    None => {
++                        out.emit(
++                            "assign",
++                            spec,
++                            json!({"status": "error",
++                            "error": "tree assignment needs the train stage (its hierarchy)"}),
++                        );
++                        continue;
++                    }
++                }
++            } else {
++                (&eval, None, "eval")
++            };
++            let (got, mut metrics) = match run_assignment(&chunks, centroids, spec, tree) {
++                Ok(r) => r,
++                Err(e) => {
++                    out.emit("assign", spec, json!({"status": "error", "error": e}));
++                    continue;
++                }
++            };
++            metrics["status"] = json!("ok");
++            metrics["centroids"] = json!(source);
++            if spec == "exact" {
++                if let Some(r) = &reference {
++                    metrics["vs_ref_exact"] = compare(&got, r);
++                }
++            } else {
++                let base_exact = if is_tree && std::env::var("CENTROIDS_FROM").is_ok() {
++                    if own_exact.is_none() {
++                        let (c, _) = own.as_ref().unwrap();
++                        own_exact = run_assignment(&chunks, c, "exact", None).ok().map(|r| r.0);
++                    }
++                    own_exact.as_ref()
++                } else {
++                    exact.as_ref()
++                };
++                if let Some(e) = base_exact {
++                    metrics["vs_exact"] = compare(&got, e);
++                }
++            }
++            out.emit("assign", spec, metrics);
++            if spec == "exact" {
++                write_raw(&out_dir.join("assign-exact.u32"), &got.ids);
++                write_raw(&out_dir.join("assign-exact.f32"), &got.dists);
++                exact = Some(got);
++            }
++        }
++    }
++
++    // --- encode: residual, then RQ codes (the shuffle's transform chain) ---
++    if want("encode") {
++        let a = exact.as_ref().expect("encode needs the exact assignment");
++        let rq = match rq.take() {
++            Some(q) => q,
++            None => RabitQuantizer::build(&fsl(vec![0.0; dim], dim), DistanceType::L2, &rq_params)
++                .expect("RQ build failed"),
++        };
++        let schema = Arc::new(Schema::new(vec![
++            Field::new("vector", base.data_type().clone(), true),
++            Field::new(PART_ID_COLUMN, arrow_schema::DataType::UInt32, true),
++            Field::new(CENTROID_DIST_COLUMN, arrow_schema::DataType::Float32, true),
++        ]));
++        let batches: Vec<RecordBatch> = chunks
++            .iter()
++            .enumerate()
++            .map(|(i, c)| {
++                let s = i * batch_rows;
++                let r = s..s + c.len();
++                RecordBatch::try_new(
++                    schema.clone(),
++                    vec![
++                        Arc::new(c.clone()),
++                        Arc::new(UInt32Array::from(a.ids[r.clone()].to_vec())),
++                        Arc::new(Float32Array::from(a.dists[r].to_vec())),
++                    ],
++                )
++                .unwrap()
++            })
++            .collect();
++        let residual = ResidualTransform::new(eval.clone(), PART_ID_COLUMN, "vector");
++        let (res, secs, cpu) = timed(|| {
++            batches
++                .par_iter()
++                .map(|b| residual.transform(b))
++                .collect::<lance_core::Result<Vec<_>>>()
++        });
++        let res = res.expect("residual transform failed");
++        drop(batches);
++        out.emit(
++            "encode",
++            "residual",
++            json!({"secs": secs, "cpu_secs": cpu,
++                                               "rows_per_sec": n as f64 / secs}),
++        );
++        let rqt = RQTransformer::new(rq, DistanceType::L2, eval.clone(), "vector")
++            .expect("RQ transformer");
++        let (codes, secs, cpu) = timed(|| {
++            res.par_iter()
++                .map(|b| rqt.transform(b))
++                .collect::<lance_core::Result<Vec<_>>>()
++        });
++        let codes = codes.expect("RQ transform failed");
++        let bytes: usize = codes
++            .iter()
++            .flat_map(|b| b.columns().iter().map(|c| c.get_buffer_memory_size()))
++            .sum();
++        out.emit(
++            "encode",
++            &format!("rq{num_bits}"),
++            json!({"secs": secs, "cpu_secs": cpu,
++            "rows_per_sec": n as f64 / secs, "bytes_per_row": bytes as f64 / n as f64}),
++        );
++    }
++
++    // --- probe: per-query centroid search (the search's first step) ---
++    if want("probe") {
++        let nq = data.queries.len() / dim;
++        let queries = Float32Array::from(data.queries.clone());
++        let recall_k = env_or("PROBE_RECALL_K", 10usize).min(data.truth_k);
++        let mut sizes = vec![0usize; k];
++        if let Some(a) = &exact {
++            for &id in &a.ids {
++                if id != u32::MAX {
++                    sizes[id as usize] += 1;
++                }
++            }
++        }
++        for nprobes in env_list("NPROBES", "1,4,16,64") {
++            let nprobes: usize = nprobes.parse().unwrap();
++            let probe = |q: usize| {
++                let qv = queries.slice(q * dim, dim);
++                kmeans_find_partitions_arrow_array(&eval, &qv, nprobes, DistanceType::L2)
++                    .expect("probe")
++                    .0
++            };
++            for _ in 0..env_or("WARMUP", 1usize) {
++                (0..nq).for_each(|q| {
++                    std::hint::black_box(probe(q));
++                });
++            }
++            let mut lat = Vec::with_capacity(nq);
++            let mut hit = 0usize;
++            let mut candidates = 0usize;
++            for q in 0..nq {
++                let t = Instant::now();
++                let parts = probe(q);
++                lat.push(t.elapsed().as_secs_f64() * 1e6);
++                let probed: Vec<u32> = parts.values().to_vec();
++                candidates += probed.iter().map(|&p| sizes[p as usize]).sum::<usize>();
++                if let (Some(a), true) = (&exact, recall_k > 0) {
++                    let gt = &data.truth[q * data.truth_k..q * data.truth_k + recall_k];
++                    hit += gt
++                        .iter()
++                        .filter(|&&id| probed.contains(&a.ids[id as usize]))
++                        .count();
++                }
++            }
++            lat.sort_by(f64::total_cmp);
++            out.emit("probe", &format!("nprobes={nprobes}"), json!({
++                "nprobes": nprobes, "queries": nq,
++                "latency_us_mean": lat.iter().sum::<f64>() / nq as f64,
++                "latency_us_p50": percentile(&lat, 0.5), "latency_us_p99": percentile(&lat, 0.99),
++                "probe_recall": (recall_k > 0 && exact.is_some())
++                    .then(|| hit as f64 / (nq * recall_k) as f64),
++                "probe_recall_k": recall_k,
++                "candidates_mean": exact.is_some().then(|| candidates as f64 / nq as f64),
++            }));
++        }
++    }
++}
+-- 
+2.53.0
+
