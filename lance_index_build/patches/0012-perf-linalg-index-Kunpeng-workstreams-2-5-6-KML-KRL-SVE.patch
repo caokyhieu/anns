@@ -1,4 +1,4 @@
-From 81240cec4364303494e3b0a3dc6634e4b5711e99 Mon Sep 17 00:00:00 2001
+From 196620a337e05d639fab8fd7ed09e32875dc792d Mon Sep 17 00:00:00 2001
 From: caokyhieu <caokyhieu253@gmail.com>
 Date: Tue, 17 Nov 2026 13:32:33 +0000
 Subject: [PATCH] perf(linalg,index): Kunpeng workstreams 2/5/6 - KML/KRL
@@ -34,7 +34,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  rust/lance-index/src/vector.rs                |   3 +
  rust/lance-index/src/vector/blocked_l2.rs     | 496 ++++++++++++++++--
  rust/lance-index/src/vector/bq/ex_dot.rs      | 169 ++++++
- rust/lance-linalg/build.rs                    |  94 +++-
+ rust/lance-linalg/build.rs                    |  97 +++-
  rust/lance-linalg/src/distance/dot.rs         |   5 +-
  rust/lance-linalg/src/distance/l2.rs          |  12 +-
  rust/lance-linalg/src/kunpeng.rs              | 444 ++++++++++++++++
@@ -46,7 +46,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  rust/lance-linalg/src/simd/sve_f32mm.c        |  76 +++
  rust/lance-linalg/src/simd/vendor_kml.c       |  16 +
  rust/lance-linalg/src/simd/vendor_krl.c       |  80 +++
- 21 files changed, 2754 insertions(+), 78 deletions(-)
+ 21 files changed, 2757 insertions(+), 78 deletions(-)
  create mode 100644 rust/lance-index-bench/src/bin/kunpeng_kernels.rs
  create mode 100644 rust/lance-linalg/src/kunpeng.rs
  create mode 100644 rust/lance-linalg/src/simd/sve_f32mm.c
@@ -1584,7 +1584,7 @@ index 7393804..90c46ae 100644
      fn test_pad_query_pads_with_zeros() {
          let query = vec![1.0f32; 100];
 diff --git a/rust/lance-linalg/build.rs b/rust/lance-linalg/build.rs
-index 1b7bf73..6b80e32 100644
+index 1b7bf73..bc11270 100644
 --- a/rust/lance-linalg/build.rs
 +++ b/rust/lance-linalg/build.rs
 @@ -20,10 +20,25 @@ fn main() -> Result<(), String> {
@@ -1614,7 +1614,7 @@ index 1b7bf73..6b80e32 100644
  
      println!("cargo:rerun-if-changed=src/simd/f16.c");
      println!("cargo:rerun-if-changed=src/simd/bf16.c");
-@@ -58,6 +73,38 @@ fn main() -> Result<(), String> {
+@@ -58,6 +73,41 @@ fn main() -> Result<(), String> {
                  Err(err) => println!("cargo:warning=Skipping {isa} kernels: {err}"),
              }
          }
@@ -1641,9 +1641,12 @@ index 1b7bf73..6b80e32 100644
 +            "kml",
 +            "LANCE_KML_DIR",
 +            "kblas.h",
++            // Single-threaded kblas called from many rayon workers at once: only the
++            // `locking` build is safe for that; `nolocking` shares unguarded buffers
++            // across callers ("BLAS : Bad memory unallocation!", wrong results).
 +            &[
-+                "lib/kblas/nolocking",
-+                "lib/neon/kblas/nolocking",
++                "lib/kblas/locking",
++                "lib/neon/kblas/locking",
 +                "lib/kblas",
 +                "lib",
 +            ],
@@ -1653,7 +1656,7 @@ index 1b7bf73..6b80e32 100644
      }
  
      // Architectures without SIMD kernels back the vector types with plain arrays.
-@@ -352,3 +399,48 @@ fn cc_supports_amx_fp16(cc: &str, flags: &[&str]) -> bool {
+@@ -352,3 +402,48 @@ fn cc_supports_amx_fp16(cc: &str, flags: &[&str]) -> bool {
      }
      child.wait().map(|s| s.success()).unwrap_or(false)
  }

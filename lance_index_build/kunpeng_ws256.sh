@@ -51,9 +51,12 @@ if [ -f "$KRL_DIR/include/krl.h" ]; then
   [ -n "${KRL_LIBDIR:-}" ] && VENDOR+=("LANCE_KRL_LIBDIR=$KRL_LIBDIR")
   [ -n "${KRL_LIBS:-}" ] && VENDOR+=("LANCE_KRL_LIBS=$KRL_LIBS")
 fi
-for d in "${KML_LIBDIR:-}" "$KML_DIR/lib/kblas/nolocking" "$KML_DIR/lib/neon/kblas/nolocking" "$KML_DIR/lib" "${KRL_LIBDIR:-}" "$KRL_DIR/lib"; do
-  [ -n "$d" ] && [ -d "$d" ] && export LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# Earlier entries win. Only the `locking` kblas is safe from concurrent rayon workers.
+VENDOR_LD=""
+for d in "${KML_LIBDIR:-}" "$KML_DIR/lib/kblas/locking" "$KML_DIR/lib/neon/kblas/locking" "$KML_DIR/lib" "${KRL_LIBDIR:-}" "$KRL_DIR/lib"; do
+  [ -n "$d" ] && [ -d "$d" ] && VENDOR_LD="${VENDOR_LD:+$VENDOR_LD:}$d"
 done
+[ -n "$VENDOR_LD" ] && export LD_LIBRARY_PATH="$VENDOR_LD${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 [ ${#VENDOR[@]} -gt 0 ] && export "${VENDOR[@]}"
 # KML runs inside rayon workers: one BLAS thread each (KML: overrides OMP_NUM_THREADS).
 export BLAS_NUM_THREADS="${BLAS_NUM_THREADS:-1}"
