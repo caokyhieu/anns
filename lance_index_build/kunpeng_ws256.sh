@@ -121,7 +121,8 @@ step_test() {
 
 step_micro() {
   "$HERE/scripts/setup_lance.sh" >/dev/null || return 1
-  (cd "$WT" && cargo build --release -p lance-index-bench --bin kunpeng_kernels) 2>&1 | tail -3
+  (cd "$WT" && cargo build --release -p lance-index-bench --bin kunpeng_kernels) > "$OUT/micro-build.log" 2>&1 ||
+    { tail -20 "$OUT/micro-build.log"; return 1; }
   local bin="$WT/target/release/kunpeng_kernels"
   # Scans and ex_dot are single-thread kernels; assignment uses every CPU (and once
   # pinned to one core, for per-core throughput).

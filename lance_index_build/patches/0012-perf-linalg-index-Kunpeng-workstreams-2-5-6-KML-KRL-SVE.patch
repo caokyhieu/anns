@@ -1,4 +1,4 @@
-From 93201678cfb03e66c8a298aafbb94be25883a552 Mon Sep 17 00:00:00 2001
+From 81240cec4364303494e3b0a3dc6634e4b5711e99 Mon Sep 17 00:00:00 2001
 From: caokyhieu <caokyhieu253@gmail.com>
 Date: Tue, 17 Nov 2026 13:32:33 +0000
 Subject: [PATCH] perf(linalg,index): Kunpeng workstreams 2/5/6 - KML/KRL
@@ -28,6 +28,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  rust/lance-core/src/utils/cpu.rs              |  14 +-
  rust/lance-core/src/utils/cpu/dispatch.rs     |  89 +++-
  .../lance-index-bench/src/bin/assign_micro.rs |  26 +-
+ .../src/bin/kunpeng_kernels.rs                | 423 +++++++++++++++
  rust/lance-index-bench/src/bin/stages.rs      |   5 +
  rust/lance-index-bench/src/main.rs            |  44 +-
  rust/lance-index/src/vector.rs                |   3 +
@@ -45,7 +46,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  rust/lance-linalg/src/simd/sve_f32mm.c        |  76 +++
  rust/lance-linalg/src/simd/vendor_kml.c       |  16 +
  rust/lance-linalg/src/simd/vendor_krl.c       |  80 +++
- 20 files changed, 2331 insertions(+), 78 deletions(-)
+ 21 files changed, 2754 insertions(+), 78 deletions(-)
+ create mode 100644 rust/lance-index-bench/src/bin/kunpeng_kernels.rs
  create mode 100644 rust/lance-linalg/src/kunpeng.rs
  create mode 100644 rust/lance-linalg/src/simd/sve_f32mm.c
  create mode 100644 rust/lance-linalg/src/simd/vendor_kml.c
@@ -278,6 +280,435 @@ index 264ebb4..6cf797f 100644
          f.write_all(&ids).unwrap();
          let pairs = (rows * k) as f64;
          println!(
+diff --git a/rust/lance-index-bench/src/bin/kunpeng_kernels.rs b/rust/lance-index-bench/src/bin/kunpeng_kernels.rs
+new file mode 100644
+index 0000000..67a2360
+--- /dev/null
++++ b/rust/lance-index-bench/src/bin/kunpeng_kernels.rs
+@@ -0,0 +1,423 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright The Lance Authors
++#![allow(clippy::print_stdout)]
++
++//! Side-by-side kernel arms for the Kunpeng porting workstreams, in one
++//! process and one build, on synthetic data at the IVF_RQ shapes:
++//!
++//! | section  | workstream | operation                                          |
++//! |----------|------------|----------------------------------------------------|
++//! | `hacc`   | 5          | `SUM_HACC`: accurate-mode u16-LUT scan, u32 sums  |
++//! | `scan`   | 6A         | `SUM_U16` chunks of the normal u8-LUT scan (u32)  |
++//! | `ex_dot` | 6B         | extra-bit dot products of survivor rows            |
++//! | `assign` | 2          | blocked nearest-centroid assignment, per backend   |
++//!
++//! Every arm is first checked against the reference (exact integer equality
++//! for the scans; same centroid and exact distance for assignment; rounding
++//! tolerance for ex_dot) and is reported as `mismatch` instead of timed if it
++//! disagrees. Times are medians over `REPS` runs after one warm-up.
++//!
++//! Environment: `OUT` (JSON lines; default `kunpeng_kernels.jsonl`),
++//! `SECTIONS` (default `hacc,scan,ex_dot,assign`), `REPS` (5), `DIMS`
++//! (960,1024,1536), `ROWS` (scan list lengths, 256,4096,65536),
++//! `SURVIVORS` (64,1024,16384), `EX_BITS` (1..8), `ASSIGN_ROWS` (65536),
++//! `ASSIGN_K` (16,256,1000,4096), `ASSIGN_ARMS` (tile,f32mm,kml,krl,krl_ny;
++//! the tile arm is whichever `dot_tile` kernel dispatch picks). Thread count follows `RAYON_NUM_THREADS`
++//! (only `assign` is parallel); KML additionally follows `BLAS_NUM_THREADS`.
++
++use std::fs::File;
++use std::io::{BufWriter, Write};
++use std::time::Instant;
++
++use lance_index::vector::bq::ex_dot::{
++    ex_dot_kernel_name, ex_dot_kernel_variants, pack_blocked_row, pad_query_into, padded_query_len,
++};
++use lance_index::vector::{AssignBackend, blocked_l2_argmin_with};
++use lance_linalg::distance::L2;
++use lance_linalg::simd::dist_table::{
++    BATCH_SIZE, SAFE_U16_CODE_LEN, sum_4bit_dist_table_scalar, sum_4bit_hacc_dist_table_scalar,
++    sum_hacc_kernel_name, sum_hacc_variants, sum_u16_kernel_name, sum_u16_variants,
++    transfer_4bit_dist_table_u16,
++};
++use serde_json::{Value, json};
++
++fn env_list<T: std::str::FromStr>(name: &str, default: &str) -> Vec<T> {
++    std::env::var(name)
++        .unwrap_or_else(|_| default.to_string())
++        .split(',')
++        .filter(|s| !s.is_empty())
++        .map(|s| {
++            s.trim()
++                .parse()
++                .unwrap_or_else(|_| panic!("{name}: bad entry {s}"))
++        })
++        .collect()
++}
++
++struct Rng(u64);
++impl Rng {
++    fn next(&mut self) -> u64 {
++        self.0 ^= self.0 << 13;
++        self.0 ^= self.0 >> 7;
++        self.0 ^= self.0 << 17;
++        self.0
++    }
++    fn f32(&mut self) -> f32 {
++        (self.next() >> 40) as f32 / (1u64 << 24) as f32
++    }
++}
++
++/// Median seconds of `reps` runs of `f` after one warm-up.
++fn time(reps: usize, mut f: impl FnMut()) -> f64 {
++    f();
++    let mut t: Vec<f64> = (0..reps.max(1))
++        .map(|_| {
++            let s = Instant::now();
++            f();
++            s.elapsed().as_secs_f64()
++        })
++        .collect();
++    t.sort_by(|a, b| a.partial_cmp(b).unwrap());
++    t[t.len() / 2]
++}
++
++struct Out {
++    file: BufWriter<File>,
++}
++impl Out {
++    fn row(&mut self, section: &str, mut v: Value) {
++        v["section"] = json!(section);
++        writeln!(self.file, "{v}").unwrap();
++    }
++}
++
++/// Prints one table row: arm, seconds, rate and speedup vs `base`.
++fn print_arm(
++    label: &str,
++    arm: &str,
++    secs: Option<f64>,
++    unit_count: f64,
++    unit: &str,
++    base: Option<f64>,
++) {
++    match secs {
++        Some(s) => {
++            let ratio = base.map_or(String::new(), |b| format!("{:6.2}x", b / s));
++            println!(
++                "  {label:<34} {arm:<18} {:>10.3} ms {:>10.2} ns/{unit} {ratio}",
++                s * 1e3,
++                s * 1e9 / unit_count
++            );
++        }
++        None => println!("  {label:<34} {arm:<18}   MISMATCH (not timed)"),
++    }
++}
++
++fn hacc(out: &mut Out, reps: usize, dims: &[usize], rows: &[usize]) {
++    println!(
++        "\n[hacc] SUM_HACC (accurate scan), selected = {}",
++        sum_hacc_kernel_name()
++    );
++    let mut rng = Rng(0x5eed);
++    for &dim in dims {
++        let code_len = dim / 8;
++        for &n in rows {
++            let n = n.next_multiple_of(BATCH_SIZE);
++            let codes: Vec<u8> = (0..n * code_len).map(|_| rng.next() as u8).collect();
++            let table: Vec<u16> = (0..32 * code_len).map(|_| rng.next() as u16).collect();
++            let mut prepared = Vec::new();
++            let prep = time(reps, || transfer_4bit_dist_table_u16(&table, &mut prepared));
++            let mut want = vec![0u32; n];
++            sum_4bit_hacc_dist_table_scalar(code_len, &codes, &prepared, &mut want);
++            let label = format!("D={dim} rows={n}");
++            let mut base = None;
++            let variants = sum_hacc_variants();
++            // NEON first, so speedups are vs the NEON arm.
++            let mut ordered: Vec<_> = variants
++                .iter()
++                .filter(|(n, _)| n.ends_with("neon"))
++                .collect();
++            ordered.extend(variants.iter().filter(|(n, _)| !n.ends_with("neon")));
++            for (name, kernel) in ordered {
++                let mut got = vec![0u32; n];
++                kernel(n, code_len, &codes, &prepared, &mut got);
++                let ok = got == want;
++                let secs =
++                    ok.then(|| time(reps, || kernel(n, code_len, &codes, &prepared, &mut got)));
++                if name.ends_with("neon") {
++                    base = secs;
++                }
++                print_arm(&label, name, secs, n as f64, "row", base);
++                out.row(
++                    "hacc",
++                    json!({"dim": dim, "rows": n, "arm": name, "ok": ok, "secs": secs,
++                    "table_prep_secs": prep, "selected": sum_hacc_kernel_name()}),
++                );
++            }
++        }
++    }
++}
++
++fn scan(out: &mut Out, reps: usize, dims: &[usize], rows: &[usize]) {
++    println!(
++        "\n[scan] SUM_U16 chunks of the u32 scan, selected = {}",
++        sum_u16_kernel_name()
++    );
++    let mut rng = Rng(0xfeed);
++    for &dim in dims {
++        let code_len = dim / 8;
++        for &n in rows {
++            let n = n.next_multiple_of(BATCH_SIZE);
++            let codes: Vec<u8> = (0..n * code_len).map(|_| rng.next() as u8).collect();
++            let table: Vec<u8> = (0..BATCH_SIZE * code_len)
++                .map(|_| rng.next() as u8)
++                .collect();
++            // Reference: the scalar kernel per <= 128-column chunk, widened.
++            let run = |kernel: &dyn Fn(&[u8], &[u8], usize, &mut [u16]), dists: &mut [u32]| {
++                let mut chunk = [0u16; BATCH_SIZE];
++                for i in (0..n).step_by(BATCH_SIZE) {
++                    let batch = &codes[i * code_len..(i + BATCH_SIZE) * code_len];
++                    let mut sums = [0u32; BATCH_SIZE];
++                    for start in (0..code_len).step_by(SAFE_U16_CODE_LEN) {
++                        let end = (start + SAFE_U16_CODE_LEN).min(code_len);
++                        let bytes = start * BATCH_SIZE..end * BATCH_SIZE;
++                        kernel(
++                            &batch[bytes.clone()],
++                            &table[bytes],
++                            end - start,
++                            &mut chunk,
++                        );
++                        sums.iter_mut().zip(chunk).for_each(|(s, c)| *s += c as u32);
++                    }
++                    dists[i..i + BATCH_SIZE].copy_from_slice(&sums);
++                }
++            };
++            let mut want = vec![0u32; n];
++            run(
++                &|c, t, l, d: &mut [u16]| sum_4bit_dist_table_scalar(l, c, t, d),
++                &mut want,
++            );
++            let label = format!("D={dim} rows={n}");
++            let variants = sum_u16_variants();
++            let mut ordered: Vec<_> = variants
++                .iter()
++                .filter(|(n, _)| n.ends_with("neon"))
++                .collect();
++            ordered.extend(variants.iter().filter(|(n, _)| !n.ends_with("neon")));
++            let mut base = None;
++            for (name, kernel) in ordered {
++                let mut got = vec![0u32; n];
++                run(kernel, &mut got);
++                let ok = got == want;
++                let secs = ok.then(|| time(reps, || run(kernel, &mut got)));
++                if name.ends_with("neon") {
++                    base = secs;
++                }
++                print_arm(&label, name, secs, n as f64, "row", base);
++                out.row(
++                    "scan",
++                    json!({"dim": dim, "rows": n, "arm": name, "ok": ok, "secs": secs,
++                    "selected": sum_u16_kernel_name()}),
++                );
++            }
++        }
++    }
++}
++
++fn ex_dot(out: &mut Out, reps: usize, dims: &[usize], survivors: &[usize], widths: &[u8]) {
++    println!(
++        "\n[ex_dot] extra-bit dot products (rows scored one at a time, as the RQ rerank does)"
++    );
++    let mut rng = Rng(0xd07);
++    for &ex_bits in widths {
++        let max_code = ((1u16 << ex_bits) - 1) as u64;
++        println!(
++            "  ex_bits={ex_bits} (num_bits={}), selected = {}",
++            ex_bits + 1,
++            ex_dot_kernel_name(ex_bits)
++        );
++        for &dim in dims {
++            let query: Vec<f32> = (0..dim).map(|_| rng.f32() * 2.0 - 1.0).collect();
++            let mut q = vec![0.0; padded_query_len(dim)];
++            pad_query_into(&query, &mut q);
++            for &rows in survivors {
++                let row_bytes =
++                    lance_index::vector::bq::ex_dot::blocked_ex_code_bytes(dim, ex_bits);
++                let mut codes = vec![0u8; rows * row_bytes];
++                let mut values = vec![0u8; dim];
++                let mut expected = Vec::with_capacity(rows);
++                for r in 0..rows {
++                    values
++                        .iter_mut()
++                        .for_each(|v| *v = (rng.next() % (max_code + 1)) as u8);
++                    pack_blocked_row(
++                        &values,
++                        ex_bits,
++                        &mut codes[r * row_bytes..(r + 1) * row_bytes],
++                    );
++                    expected.push(
++                        query
++                            .iter()
++                            .zip(&values)
++                            .map(|(q, &c)| *q as f64 * c as f64)
++                            .sum::<f64>(),
++                    );
++                }
++                let label = format!("u{ex_bits} D={dim} survivors={rows}");
++                let mut base = None;
++                let variants = ex_dot_kernel_variants(ex_bits);
++                let mut ordered: Vec<_> = variants.iter().filter(|(n, _)| *n == "neon").collect();
++                ordered.extend(variants.iter().filter(|(n, _)| *n != "neon"));
++                for (name, kernel) in ordered {
++                    let ok = codes.chunks_exact(row_bytes).zip(&expected).all(|(c, e)| {
++                        ((kernel(&q, c) as f64) - e).abs() <= 1e-3 * e.abs().max(1.0)
++                    });
++                    let mut sink = 0.0f32;
++                    let secs = ok.then(|| {
++                        time(reps, || {
++                            for c in codes.chunks_exact(row_bytes) {
++                                sink += kernel(std::hint::black_box(&q), std::hint::black_box(c));
++                            }
++                        })
++                    });
++                    std::hint::black_box(sink);
++                    if *name == "neon" {
++                        base = secs;
++                    }
++                    print_arm(&label, name, secs, rows as f64, "row", base);
++                    out.row(
++                        "ex_dot",
++                        json!({"ex_bits": ex_bits, "dim": dim, "rows": rows, "arm": name,
++                        "ok": ok, "secs": secs, "selected": ex_dot_kernel_name(ex_bits)}),
++                    );
++                }
++            }
++        }
++    }
++}
++
++fn assign(out: &mut Out, reps: usize, dims: &[usize], n: usize, ks: &[usize]) {
++    println!(
++        "\n[assign] blocked nearest-centroid assignment (complete operation: norms, packing, selection, exact re-score), {} threads",
++        rayon::current_num_threads()
++    );
++    let mut rng = Rng(0xa55);
++    for &dim in dims {
++        let data: Vec<f32> = (0..n * dim).map(|_| rng.f32()).collect();
++        for &k in ks {
++            // Centroids drawn from the data so assignments are not degenerate.
++            let centroids: Vec<f32> = (0..k)
++                .flat_map(|j| data[(j * 7919 % n) * dim..][..dim].iter().map(|v| v + 0.01))
++                .collect();
++            let bias: Vec<f32> = (0..k).map(|_| rng.f32() * 1e-3).collect();
++            let reference =
++                blocked_l2_argmin_with(AssignBackend::Tile, &centroids, &data, dim, Some(&bias));
++            let label = format!("D={dim} K={k} rows={n}");
++            let mut base = None;
++            let wanted: Vec<String> = env_list("ASSIGN_ARMS", "tile,f32mm,kml,krl,krl_ny");
++            for backend in AssignBackend::ALL {
++                if !wanted.iter().any(|w| w == backend.name()) {
++                    continue;
++                }
++                let Some(got) =
++                    blocked_l2_argmin_with(backend, &centroids, &data, dim, Some(&bias))
++                else {
++                    continue;
++                };
++                // Same winner as the tile path, and the exact unbiased distance.
++                let same = reference.as_ref().map_or(n, |r| {
++                    r.iter()
++                        .zip(&got)
++                        .filter(|(a, b)| a.map(|a| a.0) == b.map(|b| b.0))
++                        .count()
++                });
++                let exact = got.iter().enumerate().take(512).all(|(row, g)| {
++                    g.is_some_and(|(id, d)| {
++                        d == f32::l2(
++                            &data[row * dim..][..dim],
++                            &centroids[id as usize * dim..][..dim],
++                        )
++                    })
++                });
++                let ok = exact && same == n;
++                let secs = ok.then(|| {
++                    time(reps, || {
++                        std::hint::black_box(blocked_l2_argmin_with(
++                            backend,
++                            &centroids,
++                            &data,
++                            dim,
++                            Some(&bias),
++                        ));
++                    })
++                });
++                if backend == AssignBackend::Tile {
++                    base = secs;
++                }
++                let arm = match backend {
++                    AssignBackend::Tile => format!(
++                        "tile:{}",
++                        lance_linalg::distance::tile::dot_tile_kernel_name()
++                    ),
++                    b => b.name().to_string(),
++                };
++                print_arm(&label, &arm, secs, n as f64, "row", base);
++                if !ok {
++                    println!("      agreement {same}/{n}, exact distances: {exact}");
++                }
++                let gflops = secs.map(|s| 2.0 * n as f64 * k as f64 * dim as f64 / s / 1e9);
++                out.row(
++                    "assign",
++                    json!({"dim": dim, "k": k, "rows": n, "arm": arm, "ok": ok,
++                    "agree_with_tile": same, "secs": secs, "gflops": gflops,
++                    "threads": rayon::current_num_threads()}),
++                );
++            }
++        }
++    }
++}
++
++fn main() {
++    let out_path = std::env::var("OUT").unwrap_or_else(|_| "kunpeng_kernels.jsonl".into());
++    let mut out = Out {
++        file: BufWriter::new(File::create(&out_path).expect("create OUT")),
++    };
++    let sections: Vec<String> = env_list("SECTIONS", "hacc,scan,ex_dot,assign");
++    let reps: usize = env_list::<usize>("REPS", "5")[0];
++    let dims: Vec<usize> = env_list("DIMS", "960,1024,1536");
++    let host = json!({
++        "arch": std::env::consts::ARCH,
++        "features": format!("{:?}", lance_core::utils::cpu::CpuFeatures::host()),
++        "sve_vector_bytes": lance_linalg::kunpeng::sve_vector_bytes(),
++        "f32mm": lance_linalg::kunpeng::f32mm_available(),
++        "kml": lance_linalg::kunpeng::KML_AVAILABLE,
++        "krl": lance_linalg::kunpeng::KRL_AVAILABLE,
++        "threads": rayon::current_num_threads(),
++        "env": std::env::vars().filter(|(k, _)| k.starts_with("LANCE_") || k.starts_with("RAYON") || k == "BLAS_NUM_THREADS").collect::<std::collections::BTreeMap<_, _>>(),
++    });
++    println!("host: {host}");
++    out.row("host", host);
++    for section in &sections {
++        match section.as_str() {
++            "hacc" => hacc(&mut out, reps, &dims, &env_list("ROWS", "256,4096,65536")),
++            "scan" => scan(&mut out, reps, &dims, &env_list("ROWS", "256,4096,65536")),
++            "ex_dot" => ex_dot(
++                &mut out,
++                reps,
++                &dims,
++                &env_list("SURVIVORS", "64,1024,16384"),
++                &env_list("EX_BITS", "1,2,3,4,5,6,7,8"),
++            ),
++            "assign" => assign(
++                &mut out,
++                reps,
++                &dims,
++                env_list::<usize>("ASSIGN_ROWS", "65536")[0],
++                &env_list("ASSIGN_K", "16,256,1000,4096"),
++            ),
++            other => panic!("unknown section {other}"),
++        }
++        out.file.flush().unwrap();
++    }
++    println!("\nwrote {out_path}");
++}
 diff --git a/rust/lance-index-bench/src/bin/stages.rs b/rust/lance-index-bench/src/bin/stages.rs
 index 351a5c7..2f071a0 100644
 --- a/rust/lance-index-bench/src/bin/stages.rs
