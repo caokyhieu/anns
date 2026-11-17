@@ -1,0 +1,2898 @@
+From 93201678cfb03e66c8a298aafbb94be25883a552 Mon Sep 17 00:00:00 2001
+From: caokyhieu <caokyhieu253@gmail.com>
+Date: Tue, 17 Nov 2026 13:32:33 +0000
+Subject: [PATCH] perf(linalg,index): Kunpeng workstreams 2/5/6 - KML/KRL
+ adapters, SVE/FMMLA kernels
+
+Workstream 2 (shared FP32 centroid assignment): blocked_l2 backends selected by
+LANCE_ASSIGN_BACKEND: tile (existing 4x4), f32mm (SVE FMMLA 8x4 on pair-packed
+rows/centroids), kml (KML cblas_sgemm), krl / krl_ny (KRL fp32 L2 handle /
+one-vs-many). All share the shortlist, exact re-score, bias and tie rules, so
+ids and unbiased distances keep their contract. New F32MM CPU feature.
+
+Workstream 5 (SUM_HACC): NEON kernel (widening adds, uzp row restore) and an
+SVE1 kernel (one 32-byte TBL per plane, >= 256-bit vectors, NEON fallback);
+the 920 V200 has no SVE2, so ARM previously ran the scalar kernel.
+
+Workstream 6: SVE SUM_U16 (bit-identical to NEON); KRL FastScan bs32
+candidate gated by a runtime parity check against Lance's PERM0 layout; SVE
+ex_dot for 2/3/4/5/8 extra bits, bit-identical to NEON.
+
+LANCE_KERNELS=+name,-name prefers / disables dispatch candidates so one build
+benchmarks every arm. KML/KRL are compiled only with LANCE_KML_DIR /
+LANCE_KRL_DIR, against the installed headers. Bench: kunpeng_kernels binary;
+APPROX_MODE in the runner; new kernels recorded in manifests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ rust/lance-core/src/utils/cpu.rs              |  14 +-
+ rust/lance-core/src/utils/cpu/dispatch.rs     |  89 +++-
+ .../lance-index-bench/src/bin/assign_micro.rs |  26 +-
+ rust/lance-index-bench/src/bin/stages.rs      |   5 +
+ rust/lance-index-bench/src/main.rs            |  44 +-
+ rust/lance-index/src/vector.rs                |   3 +
+ rust/lance-index/src/vector/blocked_l2.rs     | 496 ++++++++++++++++--
+ rust/lance-index/src/vector/bq/ex_dot.rs      | 169 ++++++
+ rust/lance-linalg/build.rs                    |  94 +++-
+ rust/lance-linalg/src/distance/dot.rs         |   5 +-
+ rust/lance-linalg/src/distance/l2.rs          |  12 +-
+ rust/lance-linalg/src/kunpeng.rs              | 444 ++++++++++++++++
+ rust/lance-linalg/src/lib.rs                  |   1 +
+ rust/lance-linalg/src/simd.rs                 |   8 +-
+ rust/lance-linalg/src/simd/arm.rs             | 126 +++++
+ rust/lance-linalg/src/simd/dist_table.rs      | 432 ++++++++++++++-
+ rust/lance-linalg/src/simd/sve.c              | 269 ++++++++++
+ rust/lance-linalg/src/simd/sve_f32mm.c        |  76 +++
+ rust/lance-linalg/src/simd/vendor_kml.c       |  16 +
+ rust/lance-linalg/src/simd/vendor_krl.c       |  80 +++
+ 20 files changed, 2331 insertions(+), 78 deletions(-)
+ create mode 100644 rust/lance-linalg/src/kunpeng.rs
+ create mode 100644 rust/lance-linalg/src/simd/sve_f32mm.c
+ create mode 100644 rust/lance-linalg/src/simd/vendor_kml.c
+ create mode 100644 rust/lance-linalg/src/simd/vendor_krl.c
+
+diff --git a/rust/lance-core/src/utils/cpu.rs b/rust/lance-core/src/utils/cpu.rs
+index f665401..4d98119 100644
+--- a/rust/lance-core/src/utils/cpu.rs
++++ b/rust/lance-core/src/utils/cpu.rs
+@@ -12,7 +12,7 @@ use std::sync::LazyLock;
+ 
+ mod dispatch;
+ 
+-pub use dispatch::{Candidate, Dispatch, Kernel, Selection};
++pub use dispatch::{Candidate, Dispatch, Kernel, KernelOverrides, Selection, kernel_overrides};
+ 
+ /// A set of CPU features, named after rustc `target_feature`s.
+ ///
+@@ -64,6 +64,8 @@ impl CpuFeatures {
+     pub const AVX512BF16: Self = Self(1 << 25);
+     pub const SVE: Self = Self(1 << 26);
+     pub const SVE2: Self = Self(1 << 27);
++    /// SVE FP32 matrix multiply (`FMMLA`, Linux `svef32mm`).
++    pub const F32MM: Self = Self(1 << 28);
+ 
+     /// The set with no features, which every host supports.
+     pub const fn empty() -> Self {
+@@ -241,6 +243,7 @@ const FEATURE_TABLE: &[FeatureInfo] = {
+         other(F::FP16, "fp16", F::NEON),
+         other(F::SVE, "sve", F::NEON.union(F::FP16)),
+         other(F::SVE2, "sve2", F::SVE),
++        other(F::F32MM, "f32mm", F::SVE),
+         other(F::LSX, "lsx", F::empty()),
+         other(F::LASX, "lasx", F::LSX),
+     ]
+@@ -293,6 +296,7 @@ const BASELINE: CpuFeatures = {
+         (cfg!(target_feature = "fp16"), CpuFeatures::FP16),
+         (cfg!(target_feature = "sve"), CpuFeatures::SVE),
+         (cfg!(target_feature = "sve2"), CpuFeatures::SVE2),
++        (cfg!(target_feature = "f32mm"), CpuFeatures::F32MM),
+         (cfg!(target_feature = "lsx"), CpuFeatures::LSX),
+         (cfg!(target_feature = "lasx"), CpuFeatures::LASX),
+     ];
+@@ -334,7 +338,10 @@ const AVX512_ALL: CpuFeatures = CpuFeatures(
+ /// `is_x86_feature_detected!` itself is not affected. Any other value, or no
+ /// value, leaves detection unchanged.
+ fn cap_vector_width(features: CpuFeatures) -> CpuFeatures {
+-    cap_vector_width_to(features, std::env::var("LANCE_SIMD_MAX_WIDTH").ok().as_deref())
++    cap_vector_width_to(
++        features,
++        std::env::var("LANCE_SIMD_MAX_WIDTH").ok().as_deref(),
++    )
+ }
+ 
+ fn cap_vector_width_to(features: CpuFeatures, max_width: Option<&str>) -> CpuFeatures {
+@@ -433,6 +440,9 @@ fn detect_host_features() -> CpuFeatures {
+     if std::arch::is_aarch64_feature_detected!("sve2") {
+         features = features.union(CpuFeatures::SVE2);
+     }
++    if std::arch::is_aarch64_feature_detected!("f32mm") {
++        features = features.union(CpuFeatures::F32MM);
++    }
+     features
+ }
+ 
+diff --git a/rust/lance-core/src/utils/cpu/dispatch.rs b/rust/lance-core/src/utils/cpu/dispatch.rs
+index a670844..4c1632a 100644
+--- a/rust/lance-core/src/utils/cpu/dispatch.rs
++++ b/rust/lance-core/src/utils/cpu/dispatch.rs
+@@ -205,14 +205,79 @@ impl<F: Copy> Dispatch<F> {
+     }
+ }
+ 
+-/// Index of the first candidate `host` supports.
++/// Index of the first candidate `host` supports, after [`KernelOverrides`].
+ fn select<F>(candidates: &[Candidate<F>], host: CpuFeatures) -> usize {
++    select_with(candidates, host, kernel_overrides())
++}
++
++fn select_with<F>(
++    candidates: &[Candidate<F>],
++    host: CpuFeatures,
++    overrides: &KernelOverrides,
++) -> usize {
++    let last = candidates.len() - 1;
++    if let Some(i) = candidates
++        .iter()
++        .position(|c| overrides.prefers(c.name) && host.contains(c.features))
++    {
++        return i;
++    }
+     candidates
+         .iter()
+-        .position(|candidate| host.contains(candidate.features))
++        .enumerate()
++        .position(|(i, c)| host.contains(c.features) && (i == last || !overrides.disables(c.name)))
+         .expect("Dispatch::new requires a candidate without features")
+ }
+ 
++/// Benchmark control: `LANCE_KERNELS` is a comma list of candidate names,
++/// each prefixed `+` (prefer it when the host supports it) or `-` (skip it),
++/// e.g. `LANCE_KERNELS=-sum_hacc_sve,+sum_u16_krl`. It lets one build compare
++/// every kernel arm. The last (portable) candidate of a dispatch can never be
++/// disabled, and dispatches resolved at compile time (the best candidate is
++/// in the build baseline) ignore it.
++#[derive(Debug, Default, Clone, PartialEq, Eq)]
++pub struct KernelOverrides {
++    prefer: Vec<String>,
++    disable: Vec<String>,
++}
++
++impl KernelOverrides {
++    /// Parses a `LANCE_KERNELS` value; entries without a sign are preferred.
++    pub fn parse(spec: &str) -> Self {
++        let mut overrides = Self::default();
++        for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
++            match entry.strip_prefix('-') {
++                Some(name) => overrides.disable.push(name.to_string()),
++                None => overrides
++                    .prefer
++                    .push(entry.strip_prefix('+').unwrap_or(entry).to_string()),
++            }
++        }
++        overrides
++    }
++
++    /// Whether `name` was listed with `+`.
++    pub fn prefers(&self, name: &str) -> bool {
++        self.prefer.iter().any(|n| n == name)
++    }
++
++    /// Whether `name` was listed with `-`.
++    pub fn disables(&self, name: &str) -> bool {
++        self.disable.iter().any(|n| n == name)
++    }
++}
++
++/// The process-wide `LANCE_KERNELS` overrides, read once. Code that selects
++/// kernels without a [`Dispatch`] (per-width tables) should honour it too.
++pub fn kernel_overrides() -> &'static KernelOverrides {
++    static OVERRIDES: OnceLock<KernelOverrides> = OnceLock::new();
++    OVERRIDES.get_or_init(|| {
++        std::env::var("LANCE_KERNELS")
++            .map(|v| KernelOverrides::parse(&v))
++            .unwrap_or_default()
++    })
++}
++
+ /// Declares a kernel and a [`Candidate`] for it from one feature list.
+ ///
+ /// The kernel gets one `#[target_feature(enable = ...)]` per listed feature,
+@@ -274,6 +339,26 @@ macro_rules! dispatch {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn overrides_prefer_and_disable() {
++        let o = KernelOverrides::parse(" +b, -a ,c,,");
++        assert!(o.prefers("b") && o.prefers("c") && o.disables("a"));
++        assert!(!o.prefers("a") && !o.disables("b"));
++        let kernels = [
++            unsafe { Candidate::new("a", CpuFeatures::empty(), 0u8) },
++            unsafe { Candidate::new("b", CpuFeatures::AVX2, 1u8) },
++            unsafe { Candidate::new("z", CpuFeatures::empty(), 2u8) },
++        ];
++        let none = KernelOverrides::default();
++        assert_eq!(select_with(&kernels, CpuFeatures::empty(), &none), 0);
++        // "b" is preferred but unsupported: fall through, skipping disabled "a".
++        assert_eq!(select_with(&kernels, CpuFeatures::empty(), &o), 2);
++        assert_eq!(select_with(&kernels, CpuFeatures::AVX2, &o), 1);
++        // The portable fallback cannot be disabled.
++        let all = KernelOverrides::parse("-a,-z");
++        assert_eq!(select_with(&kernels, CpuFeatures::empty(), &all), 2);
++    }
++
+     type SumFn = unsafe fn(&[f32], &[f32]) -> f32;
+     type FillFn = unsafe fn(&[f32], &[f32], usize, &mut [f32]);
+     type ScaledFillFn = unsafe fn(&[f32], &[f32], usize, &[f32], &mut [f32]);
+diff --git a/rust/lance-index-bench/src/bin/assign_micro.rs b/rust/lance-index-bench/src/bin/assign_micro.rs
+index 264ebb4..6cf797f 100644
+--- a/rust/lance-index-bench/src/bin/assign_micro.rs
++++ b/rust/lance-index-bench/src/bin/assign_micro.rs
+@@ -72,7 +72,10 @@ fn fsl(values: Vec<f32>, dim: usize) -> FixedSizeListArray {
+ 
+ fn main() {
+     let a: Vec<String> = std::env::args().collect();
+-    assert!(a.len() == 7, "usage: assign_micro <bigann|gist> <data_dir> <rows> <k,..> <reps> <out_prefix>");
++    assert!(
++        a.len() == 7,
++        "usage: assign_micro <bigann|gist> <data_dir> <rows> <k,..> <reps> <out_prefix>"
++    );
+     let (kind, dir) = (a[1].as_str(), Path::new(&a[2]));
+     let rows: usize = a[3].parse().unwrap();
+     let ks: Vec<usize> = a[4].split(',').map(|k| k.parse().unwrap()).collect();
+@@ -92,13 +95,21 @@ fn main() {
+         }
+         let centroids = fsl(cent, dim);
+         // One warm-up, then `reps` timed calls.
+-        let (parts, _) =
+-            lance_index::vector::kmeans::compute_partitions_arrow_array(&centroids, &vectors, DistanceType::L2).unwrap();
++        let (parts, _) = lance_index::vector::kmeans::compute_partitions_arrow_array(
++            &centroids,
++            &vectors,
++            DistanceType::L2,
++        )
++        .unwrap();
+         let mut times = Vec::with_capacity(reps);
+         for _ in 0..reps {
+             let t = Instant::now();
+-            let r = lance_index::vector::kmeans::compute_partitions_arrow_array(&centroids, &vectors, DistanceType::L2)
+-                .unwrap();
++            let r = lance_index::vector::kmeans::compute_partitions_arrow_array(
++                &centroids,
++                &vectors,
++                DistanceType::L2,
++            )
++            .unwrap();
+             times.push(t.elapsed().as_secs_f64());
+             std::hint::black_box(r);
+         }
+@@ -106,7 +117,10 @@ fn main() {
+         sorted.sort_by(f64::total_cmp);
+         let median = sorted[reps / 2];
+         let mut f = File::create(format!("{out_prefix}-k{k}.u32")).unwrap();
+-        let ids: Vec<u8> = parts.iter().flat_map(|p| p.unwrap_or(u32::MAX).to_le_bytes()).collect();
++        let ids: Vec<u8> = parts
++            .iter()
++            .flat_map(|p| p.unwrap_or(u32::MAX).to_le_bytes())
++            .collect();
+         f.write_all(&ids).unwrap();
+         let pairs = (rows * k) as f64;
+         println!(
+diff --git a/rust/lance-index-bench/src/bin/stages.rs b/rust/lance-index-bench/src/bin/stages.rs
+index 351a5c7..2f071a0 100644
+--- a/rust/lance-index-bench/src/bin/stages.rs
++++ b/rust/lance-index-bench/src/bin/stages.rs
+@@ -430,6 +430,11 @@ fn main() {
+         "blocked_l2": lance_index::vector::blocked_l2_kernel_name(),
+         "l2_f32_batch": lance_linalg::distance::l2::l2_f32_batch_kernel_name(),
+         "l2_f32_pair": lance_linalg::distance::l2::l2_f32_kernel_name(),
++        "assign_backend": lance_index::vector::assign_backend().name(),
++        "sum_hacc": lance_linalg::simd::dist_table::sum_hacc_kernel_name(),
++        "sum_u16": lance_linalg::simd::dist_table::sum_u16_kernel_name(),
++        "ex_dot": (num_bits > 1).then(|| lance_index::vector::bq::ex_dot::ex_dot_kernel_name(num_bits - 1)),
++        "sve_vector_bytes": lance_linalg::kunpeng::sve_vector_bytes(),
+     });
+     let env: serde_json::Map<String, Value> = std::env::vars()
+         .filter(|(k, _)| {
+diff --git a/rust/lance-index-bench/src/main.rs b/rust/lance-index-bench/src/main.rs
+index b385f97..b8e19e4 100644
+--- a/rust/lance-index-bench/src/main.rs
++++ b/rust/lance-index-bench/src/main.rs
+@@ -213,7 +213,11 @@ impl BaseFile {
+ 
+     /// Rows `start..start + count` as row-major f32.
+     fn read_rows(&self, start: usize, count: usize) -> Vec<f32> {
+-        assert!(start + count <= self.rows, "rows {start}+{count} of {}", self.rows);
++        assert!(
++            start + count <= self.rows,
++            "rows {start}+{count} of {}",
++            self.rows
++        );
+         let row_bytes = self.dim * self.elem.bytes();
+         let mut raw = vec![0u8; count * row_bytes];
+         self.file
+@@ -352,13 +356,7 @@ fn exact_truth(base: &BaseFile, queries: &Matrix, nq: usize, k: usize) -> (Truth
+ }
+ 
+ /// [`exact_truth`], cached as `.ibin` next to the Lance dataset so it runs once.
+-fn cached_exact_truth(
+-    base: &BaseFile,
+-    queries: &Matrix,
+-    nq: usize,
+-    k: usize,
+-    uri: &str,
+-) -> Truth {
++fn cached_exact_truth(base: &BaseFile, queries: &Matrix, nq: usize, k: usize, uri: &str) -> Truth {
+     let cache = PathBuf::from(format!(
+         "{uri}.gt-{}x{}-q{nq}-k{}.ibin",
+         base.rows,
+@@ -655,8 +653,16 @@ fn check_targets(row: &Value) -> Option<Value> {
+     let mut checks = serde_json::Map::new();
+     for (name, max, actual) in [
+         ("build_secs", build_secs, row["build_secs"].as_f64()),
+-        ("index_gb", index_gb, row["index_bytes"].as_f64().map(|b| b / 1e9)),
+-        ("peak_rss_gb", mem_gb, row["peak_rss_bytes"].as_f64().map(|b| b / 1e9)),
++        (
++            "index_gb",
++            index_gb,
++            row["index_bytes"].as_f64().map(|b| b / 1e9),
++        ),
++        (
++            "peak_rss_gb",
++            mem_gb,
++            row["peak_rss_bytes"].as_f64().map(|b| b / 1e9),
++        ),
+     ] {
+         if let Some(max) = max {
+             let ok = actual.is_some_and(|a| a <= max);
+@@ -829,6 +835,7 @@ fn manifest(data: &Data, kind: &str, run_dir: &Path) -> Value {
+                     "INDEX",
+                     "ASSIGN",
+                     "MODE",
++                    "APPROX_MODE",
+                     "NUM_PARTITIONS",
+                     "NUM_BITS",
+                     "MAX_ITERS",
+@@ -870,6 +877,11 @@ fn manifest(data: &Data, kind: &str, run_dir: &Path) -> Value {
+             "l2_f32_batch": lance_linalg::distance::l2::l2_f32_batch_kernel_name(),
+             "l2_f32_pair": lance_linalg::distance::l2::l2_f32_kernel_name(),
+             "pipnn": pipnn_kernel(),
++            "assign_backend": lance_index::vector::assign_backend().name(),
++            "sum_hacc": lance_linalg::simd::dist_table::sum_hacc_kernel_name(),
++            "sum_u16": lance_linalg::simd::dist_table::sum_u16_kernel_name(),
++            "ex_dot": (1..=8u8).map(lance_index::vector::bq::ex_dot::ex_dot_kernel_name).collect::<Vec<_>>(),
++            "sve_vector_bytes": lance_linalg::kunpeng::sve_vector_bytes(),
+         },
+         "dataset": kind,
+         "base_rows": data.base.rows,
+@@ -1043,6 +1055,18 @@ async fn run_query(
+     scan.project(&["id"]).unwrap();
+     scan.nearest("vector", q, k).unwrap();
+     scan.minimum_nprobes(nprobes).maximum_nprobes(nprobes);
++    // APPROX_MODE=accurate routes the RQ binary scan through the high-accuracy
++    // (u16 LUT, SUM_HACC) kernel; fast / normal (default) keep the u8 scan.
++    static APPROX: std::sync::LazyLock<Option<lance_index::vector::ApproxMode>> =
++        std::sync::LazyLock::new(|| match std::env::var("APPROX_MODE").as_deref() {
++            Ok("accurate") => Some(lance_index::vector::ApproxMode::Accurate),
++            Ok("fast") => Some(lance_index::vector::ApproxMode::Fast),
++            Ok("normal") | Err(_) => None,
++            Ok(other) => panic!("APPROX_MODE={other}: expected fast, normal or accurate"),
++        });
++    if let Some(mode) = *APPROX {
++        scan.approx_mode(mode);
++    }
+     if let Some(ef) = ef {
+         scan.ef(ef);
+     }
+diff --git a/rust/lance-index/src/vector.rs b/rust/lance-index/src/vector.rs
+index fa218f1..9c21b70 100644
+--- a/rust/lance-index/src/vector.rs
++++ b/rust/lance-index/src/vector.rs
+@@ -30,6 +30,9 @@ pub mod assignment_tree;
+ pub(crate) mod blocked_l2;
+ /// Tile kernel used by exact blocked L2 assignment (`None`: per-vector path).
+ pub use blocked_l2::kernel_name as blocked_l2_kernel_name;
++pub use blocked_l2::{
++    Backend as AssignBackend, backend as assign_backend, l2_argmin_with as blocked_l2_argmin_with,
++};
+ pub mod bq;
+ pub mod distributed;
+ pub(crate) mod exact_buffers;
+diff --git a/rust/lance-index/src/vector/blocked_l2.rs b/rust/lance-index/src/vector/blocked_l2.rs
+index 6bd0119..a1410cc 100644
+--- a/rust/lance-index/src/vector/blocked_l2.rs
++++ b/rust/lance-index/src/vector/blocked_l2.rs
+@@ -29,6 +29,19 @@
+ //! The 4x4 tile kernel is [`lance_linalg::distance::tile::dot_tile`]
+ //! (AVX-512 / AVX2+FMA on x86_64, SVE / NEON on aarch64). Hosts where only the
+ //! portable tile exists keep the per-vector path.
++//!
++//! [`Backend`] chooses how the expansion scores are produced; every backend
++//! shares the shortlist, exact re-score, bias and tie handling above, so the
++//! returned centroid ids and unbiased distances keep the same contract:
++//! - `tile`: the 4x4 register tile (default);
++//! - `f32mm`: SVE `FMMLA` 8x4 blocks over pair-packed rows and centroids
++//!   (packing is counted in the call);
++//! - `kml`: Kunpeng Math Library `cblas_sgemm` on row block x centroid tile;
++//! - `krl` / `krl_ny`: Kunpeng Retrieval Library fp32 squared-L2 distances,
++//!   through a per-thread distance handle or one-vs-many calls.
++//!
++//! `LANCE_ASSIGN_BACKEND` selects one; a backend this build or host cannot
++//! run falls back to `tile` with a warning.
+ 
+ use std::sync::LazyLock;
+ 
+@@ -54,10 +67,144 @@ static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+     std::env::var_os("LANCE_DISABLE_BLOCKED_L2").is_none() && dot_tile_is_accelerated()
+ });
+ 
+-/// Tile kernel used by blocked assignment on this host, or `None` when the
++/// How expansion scores are computed; see the module docs.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Backend {
++    Tile,
++    F32mm,
++    Kml,
++    Krl,
++    KrlNy,
++}
++
++impl Backend {
++    pub const ALL: [Self; 5] = [Self::Tile, Self::F32mm, Self::Kml, Self::Krl, Self::KrlNy];
++
++    pub fn name(self) -> &'static str {
++        match self {
++            Self::Tile => "tile",
++            Self::F32mm => "f32mm",
++            Self::Kml => "kml",
++            Self::Krl => "krl",
++            Self::KrlNy => "krl_ny",
++        }
++    }
++
++    pub fn parse(name: &str) -> Option<Self> {
++        Self::ALL.into_iter().find(|b| b.name() == name)
++    }
++
++    /// Whether this build and host can run the backend.
++    pub fn available(self) -> bool {
++        match self {
++            Self::Tile => dot_tile_is_accelerated(),
++            Self::F32mm => lance_linalg::kunpeng::f32mm_available(),
++            Self::Kml => lance_linalg::kunpeng::KML_AVAILABLE,
++            Self::Krl | Self::KrlNy => lance_linalg::kunpeng::KRL_AVAILABLE,
++        }
++    }
++}
++
++static BACKEND: LazyLock<Backend> = LazyLock::new(|| {
++    let Ok(requested) = std::env::var("LANCE_ASSIGN_BACKEND") else {
++        return Backend::Tile;
++    };
++    match Backend::parse(&requested) {
++        Some(b) if b.available() => b,
++        _ => {
++            log::warn!(
++                "LANCE_ASSIGN_BACKEND={requested} is not available in this build/host; using tile"
++            );
++            Backend::Tile
++        }
++    }
++});
++
++/// The backend [`l2_argmin`] uses.
++pub fn backend() -> Backend {
++    *BACKEND
++}
++
++/// Kernel used by blocked assignment on this host, or `None` when the
+ /// per-vector path is used for every shape. Recorded in benchmark manifests.
+ pub fn kernel_name() -> Option<&'static str> {
+-    ENABLED.then(dot_tile_kernel_name)
++    ENABLED.then(|| match backend() {
++        Backend::Tile => dot_tile_kernel_name(),
++        Backend::F32mm => "f32mm_8x4",
++        Backend::Kml => "kml_sgemm",
++        Backend::Krl => "krl_l2sqr_handle",
++        Backend::KrlNy => "krl_l2sqr_ny",
++    })
++}
++
++/// Inserts `score` for centroid `cj` into a row's ascending shortlist; ties
++/// keep the earlier (lower) centroid first.
++#[inline(always)]
++fn push_shortlist(
++    scores: &mut [f32; SHORTLIST],
++    ids: &mut [u32; SHORTLIST],
++    score: f32,
++    cj: usize,
++) {
++    if score < scores[SHORTLIST - 1] {
++        let mut at = SHORTLIST - 1;
++        while at > 0 && score < scores[at - 1] {
++            scores[at] = scores[at - 1];
++            ids[at] = ids[at - 1];
++            at -= 1;
++        }
++        scores[at] = score;
++        ids[at] = cj as u32;
++    }
++}
++
++/// Re-scores a row's shortlist exactly and applies the selection rule.
++#[inline]
++#[allow(clippy::too_many_arguments)]
++fn finish_row(
++    x: &[f32],
++    x_norm: f32,
++    scores: &[f32; SHORTLIST],
++    ids: &[u32; SHORTLIST],
++    centroids: &[f32],
++    dimension: usize,
++    biases: Option<&[f32]>,
++    relative_error: f32,
++    max_c_norm: f32,
++) -> Option<(u32, f32)> {
++    if ids[0] == u32::MAX {
++        return None;
++    }
++    let margin = relative_error * (x_norm + max_c_norm);
++    let mut best: Option<(u32, f32, f32)> = None; // (id, dist, score)
++    for (&score, &id) in scores.iter().zip(ids) {
++        if id == u32::MAX || score > scores[0] + margin {
++            break;
++        }
++        let c = &centroids[id as usize * dimension..][..dimension];
++        let dist = f32::l2(x, c);
++        let exact = dist + biases.map_or(0.0, |b| b[id as usize]);
++        if best.is_none_or(|(best_id, _, best_score)| {
++            exact < best_score || (exact == best_score && id < best_id)
++        }) {
++            best = Some((id, dist, exact));
++        }
++    }
++    best.map(|(id, dist, _)| (id, dist))
++}
++
++/// Expansion score from a dot product, as the tile path computes it.
++#[inline(always)]
++fn expansion_score(x_norm: f32, c_norm: f32, dot: f32, bias: Option<&[f32]>, cj: usize) -> f32 {
++    let mut dist = x_norm + c_norm - 2.0 * dot;
++    // Keep NaN (f32::max would drop it).
++    if dist < 0.0 {
++        dist = 0.0;
++    }
++    match bias {
++        Some(bias) => dist + bias[cj],
++        None => dist,
++    }
+ }
+ 
+ /// Whether the blocked path will be used for this shape.
+@@ -76,6 +223,27 @@ pub fn l2_argmin(
+     if !*ENABLED {
+         return None;
+     }
++    l2_argmin_with(backend(), centroids, data, dimension, biases)
++}
++
++/// [`l2_argmin`] with an explicit backend, ignoring `LANCE_ASSIGN_BACKEND`
++/// and the kill switch, for side-by-side benchmarks and parity tests.
++/// `None` when the backend is not [`Backend::available`].
++pub fn l2_argmin_with(
++    backend: Backend,
++    centroids: &[f32],
++    data: &[f32],
++    dimension: usize,
++    biases: Option<&[f32]>,
++) -> Option<Vec<Option<(u32, f32)>>> {
++    if !backend.available() {
++        return None;
++    }
++    if backend != Backend::Tile {
++        return Some(l2_argmin_matrix(
++            backend, centroids, data, dimension, biases,
++        ));
++    }
+     let k = centroids.len() / dimension;
+     debug_assert_eq!(centroids.len(), k * dimension);
+     debug_assert_eq!(data.len() % dimension, 0);
+@@ -140,28 +308,19 @@ pub fn l2_argmin(
+                                     if cj >= k {
+                                         break;
+                                     }
+-                                    let mut dist =
+-                                        x_norms[row] + c_norms[cj] - 2.0 * out[a * NR + b];
+-                                    // Keep NaN (f32::max would drop it).
+-                                    if dist < 0.0 {
+-                                        dist = 0.0;
+-                                    }
+-                                    let score = match biases {
+-                                        Some(bias) => dist + bias[cj],
+-                                        None => dist,
+-                                    };
+-                                    let scores = &mut short_score[row];
+-                                    if score < scores[SHORTLIST - 1] {
+-                                        let ids = &mut short_idx[row];
+-                                        let mut at = SHORTLIST - 1;
+-                                        while at > 0 && score < scores[at - 1] {
+-                                            scores[at] = scores[at - 1];
+-                                            ids[at] = ids[at - 1];
+-                                            at -= 1;
+-                                        }
+-                                        scores[at] = score;
+-                                        ids[at] = cj as u32;
+-                                    }
++                                    let score = expansion_score(
++                                        x_norms[row],
++                                        c_norms[cj],
++                                        out[a * NR + b],
++                                        biases,
++                                        cj,
++                                    );
++                                    push_shortlist(
++                                        &mut short_score[row],
++                                        &mut short_idx[row],
++                                        score,
++                                        cj,
++                                    );
+                                 }
+                             }
+                         }
+@@ -169,34 +328,215 @@ pub fn l2_argmin(
+                 }
+                 (0..n)
+                     .map(|row| {
+-                        let x = &rows[row * dimension..(row + 1) * dimension];
+-                        let (scores, ids) = (&short_score[row], &short_idx[row]);
+-                        if ids[0] == u32::MAX {
+-                            return None;
++                        finish_row(
++                            &rows[row * dimension..(row + 1) * dimension],
++                            x_norms[row],
++                            &short_score[row],
++                            &short_idx[row],
++                            centroids,
++                            dimension,
++                            biases,
++                            relative_error,
++                            max_c_norm,
++                        )
++                    })
++                    .collect::<Vec<_>>()
++            },
++        )
++        .flatten_iter()
++        .collect();
++    Some(results)
++}
++
++/// Rows per block of the matrix backends (a multiple of the f32mm tile).
++const MATRIX_ROW_BLOCK: usize = 64;
++
++/// Per-worker state of the matrix backends.
++struct MatrixScratch {
++    rows: lance_linalg::kunpeng::F32mmBlock,
++    dots: Vec<f32>,
++    short_score: Vec<[f32; SHORTLIST]>,
++}
++
++/// The non-tile backends: a row block's expansion scores (or KRL distances)
++/// against a centroid tile are written to a scratch matrix, then folded into
++/// the shared shortlist and exact re-score.
++fn l2_argmin_matrix(
++    backend: Backend,
++    centroids: &[f32],
++    data: &[f32],
++    dimension: usize,
++    biases: Option<&[f32]>,
++) -> Vec<Option<(u32, f32)>> {
++    use lance_linalg::kunpeng::{F32MM_COLS, F32MM_ROWS, F32mmBlock, KrlL2Handle};
++
++    let k = centroids.len() / dimension;
++    debug_assert_eq!(centroids.len(), k * dimension);
++    debug_assert_eq!(data.len() % dimension, 0);
++    let c_norms: Vec<f32> = centroids
++        .chunks_exact(dimension)
++        .map(|c| c.iter().map(|v| v * v).sum())
++        .collect();
++    let max_c_norm = c_norms.iter().copied().fold(0.0f32, f32::max);
++    let relative_error = 8.0 * f32::EPSILON * (dimension as f32).sqrt();
++
++    // f32mm packs the centroid table once per call (counted in the call).
++    let packed_centroids =
++        (backend == Backend::F32mm).then(|| F32mmBlock::pack(centroids, dimension, F32MM_COLS));
++    let k_cols = packed_centroids.as_ref().map_or(k, |p| p.rows());
++    let tile = match backend {
++        // KRL computes a row against every centroid in one call.
++        Backend::Krl | Backend::KrlNy => k_cols,
++        _ => ((TILE_BYTES / (dimension * 4)) / F32MM_COLS * F32MM_COLS).max(F32MM_COLS),
++    };
++    // One KRL handle per rayon thread, created on that thread's first block:
++    // KRL documents no concurrency guarantee for a shared handle.
++    let threads = rayon::current_num_threads().max(1);
++    let krl_handles: Vec<std::sync::OnceLock<std::sync::Mutex<KrlL2Handle>>> =
++        if backend == Backend::Krl {
++            (0..threads + 1)
++                .map(|_| std::sync::OnceLock::new())
++                .collect()
++        } else {
++            Vec::new()
++        };
++
++    data.par_chunks(MATRIX_ROW_BLOCK * dimension)
++        .map_init(
++            || MatrixScratch {
++                rows: F32mmBlock::pack(&[], dimension.max(1), F32MM_ROWS),
++                dots: vec![0.0; MATRIX_ROW_BLOCK * tile],
++                short_score: Vec::new(),
++            },
++            |scratch, rows| {
++                let n = rows.len() / dimension;
++                let x_norms: Vec<f32> = rows
++                    .chunks_exact(dimension)
++                    .map(|x| x.iter().map(|v| v * v).sum())
++                    .collect();
++                scratch.short_score.clear();
++                scratch.short_score.resize(n, [f32::INFINITY; SHORTLIST]);
++                let mut short_idx = vec![[u32::MAX; SHORTLIST]; n];
++                let dots = &mut scratch.dots;
++                match backend {
++                    Backend::Krl | Backend::KrlNy => {
++                        let slot =
++                            rayon::current_thread_index().map_or(threads, |i| i.min(threads));
++                        for row in 0..n {
++                            let x = &rows[row * dimension..(row + 1) * dimension];
++                            let status = if backend == Backend::Krl {
++                                let handle = krl_handles[slot].get_or_init(|| {
++                                    let h = KrlL2Handle::new(centroids, dimension)
++                                        .expect("KRL is available")
++                                        .unwrap_or_else(|e| {
++                                            panic!("krl_create_distance_handle failed: {e}")
++                                        });
++                                    std::sync::Mutex::new(h)
++                                });
++                                let handle = handle.lock().unwrap();
++                                handle.distances(x, &mut dots[..handle.padded_len()])
++                            } else {
++                                lance_linalg::kunpeng::krl_l2sqr_ny(x, centroids, &mut dots[..k])
++                                    .expect("KRL is available")
++                            };
++                            if let Err(e) = status {
++                                panic!("KRL L2 distance call failed: {e}");
++                            }
++                            for cj in 0..k {
++                                let mut dist = dots[cj];
++                                if dist < 0.0 {
++                                    dist = 0.0;
++                                }
++                                let score = biases.map_or(dist, |b| dist + b[cj]);
++                                push_shortlist(
++                                    &mut scratch.short_score[row],
++                                    &mut short_idx[row],
++                                    score,
++                                    cj,
++                                );
++                            }
+                         }
+-                        let margin = relative_error * (x_norms[row] + max_c_norm);
+-                        let mut best: Option<(u32, f32, f32)> = None; // (id, dist, score)
+-                        for (&score, &id) in scores.iter().zip(ids) {
+-                            if id == u32::MAX || score > scores[0] + margin {
+-                                break;
++                    }
++                    Backend::F32mm | Backend::Kml => {
++                        if backend == Backend::F32mm {
++                            scratch.rows.repack(rows, dimension, F32MM_ROWS);
++                        }
++                        let n_pad = n.div_ceil(F32MM_ROWS) * F32MM_ROWS;
++                        for tile_start in (0..k_cols).step_by(tile) {
++                            let cols = tile.min(k_cols - tile_start);
++                            if backend == Backend::F32mm {
++                                let ok = lance_linalg::kunpeng::dot_block_f32mm(
++                                    &scratch.rows,
++                                    0,
++                                    n_pad,
++                                    packed_centroids.as_ref().unwrap(),
++                                    tile_start,
++                                    cols,
++                                    dots,
++                                    tile,
++                                );
++                                assert!(ok, "f32mm is available");
++                            } else {
++                                let ok = lance_linalg::kunpeng::kml_sgemm_nt(
++                                    n,
++                                    cols,
++                                    dimension,
++                                    rows,
++                                    &centroids
++                                        [tile_start * dimension..(tile_start + cols) * dimension],
++                                    &mut dots[..n * cols],
++                                );
++                                assert!(ok, "KML is available");
+                             }
+-                            let c = &centroids[id as usize * dimension..][..dimension];
+-                            let dist = f32::l2(x, c);
+-                            let exact = dist + biases.map_or(0.0, |b| b[id as usize]);
+-                            if best.is_none_or(|(best_id, _, best_score)| {
+-                                exact < best_score || (exact == best_score && id < best_id)
+-                            }) {
+-                                best = Some((id, dist, exact));
++                            let ldo = if backend == Backend::F32mm {
++                                tile
++                            } else {
++                                cols
++                            };
++                            for row in 0..n {
++                                for b in 0..cols {
++                                    let cj = tile_start + b;
++                                    if cj >= k {
++                                        break;
++                                    }
++                                    let score = expansion_score(
++                                        x_norms[row],
++                                        c_norms[cj],
++                                        dots[row * ldo + b],
++                                        biases,
++                                        cj,
++                                    );
++                                    push_shortlist(
++                                        &mut scratch.short_score[row],
++                                        &mut short_idx[row],
++                                        score,
++                                        cj,
++                                    );
++                                }
+                             }
+                         }
+-                        best.map(|(id, dist, _)| (id, dist))
++                    }
++                    Backend::Tile => unreachable!("tile backend uses the fused path"),
++                }
++                (0..n)
++                    .map(|row| {
++                        finish_row(
++                            &rows[row * dimension..(row + 1) * dimension],
++                            x_norms[row],
++                            &scratch.short_score[row],
++                            &short_idx[row],
++                            centroids,
++                            dimension,
++                            biases,
++                            relative_error,
++                            max_c_norm,
++                        )
+                     })
+                     .collect::<Vec<_>>()
+             },
+         )
+         .flatten_iter()
+-        .collect();
+-    Some(results)
++        .collect()
+ }
+ 
+ #[cfg(test)]
+@@ -274,6 +614,76 @@ mod tests {
+         }
+     }
+ 
++    /// Every backend this build and host can run returns the same centroid
++    /// and the exact unbiased distance as the per-vector reference, with and
++    /// without bias, including near ties at large magnitude.
++    #[test]
++    fn every_available_backend_matches_per_vector_assignment() {
++        let mut rng = SmallRng::seed_from_u64(5);
++        for &(n, k, dim) in &[
++            (1, 8, 32),
++            (67, 13, 33),
++            (130, 101, 960),
++            (70, 257, 1024),
++            (9, 9, 1536),
++        ] {
++            let x: Vec<f32> = (0..n * dim).map(|_| rng.random::<f32>()).collect();
++            let c: Vec<f32> = (0..k * dim).map(|_| rng.random::<f32>()).collect();
++            let bias: Vec<f32> = (0..k).map(|_| rng.random::<f32>() * 0.01).collect();
++            for b in [None, Some(bias.as_slice())] {
++                let want = reference(&c, &x, dim, b);
++                for backend in Backend::ALL {
++                    let Some(got) = l2_argmin_with(backend, &c, &x, dim, b) else {
++                        continue;
++                    };
++                    for (row, (g, w)) in got.iter().zip(&want).enumerate() {
++                        let (idx, dist) = g.unwrap();
++                        assert_eq!(Some(idx), *w, "{backend:?} n={n} k={k} dim={dim} row={row}");
++                        let exact =
++                            f32::l2(&x[row * dim..][..dim], &c[idx as usize * dim..][..dim]);
++                        assert_eq!(
++                            dist, exact,
++                            "{backend:?}: distance must be the exact unbiased one"
++                        );
++                    }
++                }
++            }
++        }
++        // Large common offset: cancellation in the expansion.
++        let (n, k, dim) = (64, 8, 128);
++        let x: Vec<f32> = (0..n * dim).map(|_| 1000.0 + rng.random::<f32>()).collect();
++        let mut c = Vec::new();
++        for j in 0..k {
++            let offset = if j < 2 {
++                0.5 + 0.01 * j as f32
++            } else {
++                50.0 * j as f32
++            };
++            c.extend((0..dim).map(|_| 1000.0 + offset + 0.01 * rng.random::<f32>()));
++        }
++        let want = reference(&c, &x, dim, None);
++        for backend in Backend::ALL {
++            if let Some(got) = l2_argmin_with(backend, &c, &x, dim, None) {
++                for (g, w) in got.iter().zip(&want) {
++                    assert_eq!(g.map(|g| g.0), *w, "{backend:?} near tie");
++                }
++            }
++        }
++        // Duplicate centroids: the lowest index wins on every backend.
++        let c: Vec<f32> = (0..dim)
++            .map(|_| rng.random::<f32>())
++            .collect::<Vec<_>>()
++            .repeat(9);
++        for backend in Backend::ALL {
++            if let Some(got) = l2_argmin_with(backend, &c, &x[..8 * dim], dim, None) {
++                assert!(
++                    got.iter().all(|g| g.unwrap().0 == 0),
++                    "{backend:?} duplicates"
++                );
++            }
++        }
++    }
++
+     #[test]
+     fn nan_row_is_unassigned() {
+         let dim = 32;
+diff --git a/rust/lance-index/src/vector/bq/ex_dot.rs b/rust/lance-index/src/vector/bq/ex_dot.rs
+index 7393804..90c46ae 100644
+--- a/rust/lance-index/src/vector/bq/ex_dot.rs
++++ b/rust/lance-index/src/vector/bq/ex_dot.rs
+@@ -315,6 +315,13 @@ pub fn ex_dot_kernel_variants(ex_bits: u8) -> Vec<(&'static str, ExDotFn)> {
+         ("scalar", scalar_kernel(ex_bits)),
+         ("dispatched", ex_dot_kernel(ex_bits)),
+     ];
++    #[cfg(target_arch = "aarch64")]
++    {
++        kernels.push(("neon", neon::kernel(ex_bits)));
++        if let Some(kernel) = sve::available(ex_bits) {
++            kernels.push(("sve", kernel));
++        }
++    }
+     #[cfg(target_arch = "x86_64")]
+     {
+         if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+@@ -344,6 +351,9 @@ fn select_ex_dot_kernel(ex_bits: u8) -> ExDotFn {
+     }
+     #[cfg(target_arch = "aarch64")]
+     {
++        if let Some(kernel) = sve::kernel(ex_bits) {
++            return kernel;
++        }
+         // NEON is part of the aarch64 baseline.
+         return neon::kernel(ex_bits);
+     }
+@@ -351,6 +361,90 @@ fn select_ex_dot_kernel(ex_bits: u8) -> ExDotFn {
+     scalar_kernel(ex_bits)
+ }
+ 
++/// SVE ex-code kernels (C objects in `lance-linalg`): the NEON unpack layout
++/// read with zero-extending byte loads into 8 x u32 lanes, one convert and
++/// one FMA per 8 dims. Selected on SVE hosts with >= 256-bit vectors for
++/// `ex_bits` in {2, 3, 4, 5, 8} unless `LANCE_KERNELS` lists `-ex_dot_sve` or
++/// `-ex_dot_u<bits>_sve`; other widths keep NEON. The kernels keep NEON's
++/// lane assignment and reduction order, so results are bit-identical to NEON
++/// (which the fused prefix kernels also reproduce).
++#[cfg(target_arch = "aarch64")]
++mod sve {
++    use super::ExDotFn;
++    use lance_linalg::kunpeng::{ex_dot_sve, ex_dot_sve_supported};
++
++    pub(super) fn name(ex_bits: u8) -> String {
++        format!("ex_dot_u{ex_bits}_sve")
++    }
++
++    /// The SVE kernel when supported and not disabled.
++    pub(super) fn kernel(ex_bits: u8) -> Option<ExDotFn> {
++        let overrides = lance_core::utils::cpu::kernel_overrides();
++        if overrides.disables("ex_dot_sve") || overrides.disables(&name(ex_bits)) {
++            return None;
++        }
++        available(ex_bits)
++    }
++
++    /// The SVE kernel when the host can run it, ignoring overrides.
++    pub(super) fn available(ex_bits: u8) -> Option<ExDotFn> {
++        if !ex_dot_sve_supported(ex_bits) {
++            return None;
++        }
++        Some(match ex_bits {
++            2 => dot_u2_sve,
++            3 => dot_u3_sve,
++            4 => dot_u4_sve,
++            5 => dot_u5_sve,
++            8 => dot_u8_sve,
++            _ => return None,
++        })
++    }
++
++    macro_rules! sve_kernel {
++        ($name:ident, $bits:literal) => {
++            fn $name(ex_query: &[f32], codes: &[u8]) -> f32 {
++                // `None` only if the thread's vector length dropped below
++                // 256 bits after selection; NEON then computes the result.
++                ex_dot_sve::<$bits>(ex_query, codes)
++                    .unwrap_or_else(|| super::neon::kernel($bits)(ex_query, codes))
++            }
++        };
++    }
++    sve_kernel!(dot_u2_sve, 2);
++    sve_kernel!(dot_u3_sve, 3);
++    sve_kernel!(dot_u4_sve, 4);
++    sve_kernel!(dot_u5_sve, 5);
++    sve_kernel!(dot_u8_sve, 8);
++}
++
++/// Name of the ex-code kernel [`ex_dot_kernel`] selects for `ex_bits`, for
++/// benchmark records.
++pub fn ex_dot_kernel_name(ex_bits: u8) -> String {
++    #[cfg(target_arch = "aarch64")]
++    {
++        if sve::kernel(ex_bits).is_some() {
++            return sve::name(ex_bits);
++        }
++        return format!("ex_dot_u{ex_bits}_neon");
++    }
++    #[allow(unreachable_code)]
++    {
++        #[cfg(target_arch = "x86_64")]
++        {
++            if std::arch::is_x86_feature_detected!("avx512f") {
++                return format!("ex_dot_u{ex_bits}_avx512");
++            }
++            if std::arch::is_x86_feature_detected!("avx2")
++                && std::arch::is_x86_feature_detected!("fma")
++            {
++                return format!("ex_dot_u{ex_bits}_avx2");
++            }
++        }
++        format!("ex_dot_u{ex_bits}_scalar")
++    }
++}
++
+ fn scalar_kernel(ex_bits: u8) -> ExDotFn {
+     match ex_bits {
+         1 => ex_dot_scalar::<1>,
+@@ -1928,6 +2022,81 @@ mod tests {
+         }
+     }
+ 
++    /// With small-integer queries every partial sum is exact in f32, so all
++    /// kernels (whatever their lane count or summation order) must agree
++    /// exactly, also on rows shorter than the padded layout (legacy rows).
++    #[test]
++    fn test_ex_dot_variants_exact_on_integer_queries() {
++        let mut rng = SmallRng::seed_from_u64(99);
++        for ex_bits in 1..=8u8 {
++            let max_code = ((1u16 << ex_bits) - 1) as u8;
++            for dim in [1usize, 15, 16, 17, 63, 64, 65, 960, 1024, 1536] {
++                let values: Vec<u8> = (0..dim).map(|_| rng.random_range(0..=max_code)).collect();
++                let query: Vec<f32> = (0..dim)
++                    .map(|_| rng.random_range(-8i32..=8) as f32)
++                    .collect();
++                let expected: i64 = query
++                    .iter()
++                    .zip(&values)
++                    .map(|(q, &c)| *q as i64 * c as i64)
++                    .sum();
++                let codes = kernel_codes(&values, dim, ex_bits);
++                let mut ex_query = vec![0.0; padded_query_len(dim)];
++                pad_query_into(&query, &mut ex_query);
++                let variants = ex_dot_kernel_variants(ex_bits);
++                #[cfg(target_arch = "aarch64")]
++                if lance_linalg::kunpeng::ex_dot_sve_supported(ex_bits) {
++                    assert!(variants.iter().any(|(n, _)| *n == "sve"));
++                }
++                for (name, kernel) in &variants {
++                    assert_eq!(
++                        kernel(&ex_query, &codes) as i64,
++                        expected,
++                        "ex_bits={ex_bits} dim={dim} {name}"
++                    );
++                    // Dropping trailing all-zero-code bytes must not change the sum.
++                    let mut trimmed = codes.clone();
++                    while trimmed.last() == Some(&0) {
++                        trimmed.pop();
++                    }
++                    assert_eq!(
++                        kernel(&ex_query, &trimmed) as i64,
++                        expected,
++                        "trimmed ex_bits={ex_bits} dim={dim} {name}"
++                    );
++                }
++            }
++        }
++    }
++
++    /// SVE and NEON must agree bit for bit on ordinary float queries.
++    #[cfg(target_arch = "aarch64")]
++    #[test]
++    fn test_ex_dot_sve_is_bit_identical_to_neon() {
++        let mut rng = SmallRng::seed_from_u64(3);
++        for ex_bits in [2u8, 3, 4, 5, 8] {
++            let Some(sve) = sve::available(ex_bits) else {
++                continue;
++            };
++            let max_code = ((1u16 << ex_bits) - 1) as u8;
++            for dim in [7usize, 16, 64, 100, 960, 1024, 1536] {
++                let values: Vec<u8> = (0..dim).map(|_| rng.random_range(0..=max_code)).collect();
++                let query: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0f32..1.0)).collect();
++                let codes = kernel_codes(&values, dim, ex_bits);
++                let mut q = vec![0.0; padded_query_len(dim)];
++                pad_query_into(&query, &mut q);
++                for len in [codes.len(), codes.len().saturating_sub(3)] {
++                    let c = &codes[..len];
++                    assert_eq!(
++                        sve(&q, c).to_bits(),
++                        neon::kernel(ex_bits)(&q, c).to_bits(),
++                        "ex_bits={ex_bits} dim={dim} len={len}"
++                    );
++                }
++            }
++        }
++    }
++
+     #[test]
+     fn test_pad_query_pads_with_zeros() {
+         let query = vec![1.0f32; 100];
+diff --git a/rust/lance-linalg/build.rs b/rust/lance-linalg/build.rs
+index 1b7bf73..6b80e32 100644
+--- a/rust/lance-linalg/build.rs
++++ b/rust/lance-linalg/build.rs
+@@ -20,10 +20,25 @@ fn main() -> Result<(), String> {
+         "cargo::rustc-check-cfg=cfg(kernel_support, values(\"avx512_f16\", \"avx512_bf16\", \"avx512_dist_table\", \"amx_fp16\"))"
+     );
+     println!("cargo::rustc-check-cfg=cfg(simd_fallback)");
+-    println!("cargo::rustc-check-cfg=cfg(kernel_support, values(\"sve\", \"sve2\"))");
++    println!(
++        "cargo::rustc-check-cfg=cfg(kernel_support, values(\"sve\", \"sve2\", \"sve_f32mm\", \"kml\", \"krl\"))"
++    );
+     println!("cargo:rerun-if-env-changed=LANCE_DISABLE_SVE_BUILD");
+     println!("cargo:rerun-if-changed=src/simd/sve.c");
+     println!("cargo:rerun-if-changed=src/simd/sve2.c");
++    println!("cargo:rerun-if-changed=src/simd/sve_f32mm.c");
++    for var in [
++        "LANCE_KML_DIR",
++        "LANCE_KML_LIBDIR",
++        "LANCE_KML_LIBS",
++        "LANCE_KRL_DIR",
++        "LANCE_KRL_LIBDIR",
++        "LANCE_KRL_LIBS",
++    ] {
++        println!("cargo:rerun-if-env-changed={var}");
++    }
++    println!("cargo:rerun-if-changed=src/simd/vendor_kml.c");
++    println!("cargo:rerun-if-changed=src/simd/vendor_krl.c");
+ 
+     println!("cargo:rerun-if-changed=src/simd/f16.c");
+     println!("cargo:rerun-if-changed=src/simd/bf16.c");
+@@ -58,6 +73,38 @@ fn main() -> Result<(), String> {
+                 Err(err) => println!("cargo:warning=Skipping {isa} kernels: {err}"),
+             }
+         }
++        // FMMLA (FEAT_F32MM); the Rust caller also checks the host capability.
++        let result = cc::Build::new()
++            .std("c11")
++            .file("src/simd/sve_f32mm.c")
++            .flag("-march=armv8.2-a+sve+f32mm")
++            .flag("-msve-vector-bits=scalable")
++            .flag("-fno-fast-math")
++            .flag("-ffp-contract=off")
++            .opt_level(3)
++            .try_compile("lance_sve_f32mm");
++        match result {
++            Ok(()) => println!("cargo:rustc-cfg=kernel_support=\"sve_f32mm\""),
++            Err(err) => println!("cargo:warning=Skipping SVE f32mm kernels: {err}"),
++        }
++    }
++
++    // Optional Huawei Kunpeng library adapters (benchmark arms only). They are
++    // never built unless the install directory is given explicitly.
++    if target_arch == "aarch64" && target_os == "linux" {
++        build_vendor(
++            "kml",
++            "LANCE_KML_DIR",
++            "kblas.h",
++            &[
++                "lib/kblas/nolocking",
++                "lib/neon/kblas/nolocking",
++                "lib/kblas",
++                "lib",
++            ],
++            "kblas",
++        );
++        build_vendor("krl", "LANCE_KRL_DIR", "krl.h", &["lib"], "krl");
+     }
+ 
+     // Architectures without SIMD kernels back the vector types with plain arrays.
+@@ -352,3 +399,48 @@ fn cc_supports_amx_fp16(cc: &str, flags: &[&str]) -> bool {
+     }
+     child.wait().map(|s| s.success()).unwrap_or(false)
+ }
++
++/// Compiles `src/simd/vendor_<name>.c` against `$<dir_var>/include/<header>`
++/// and links `$<NAME>_LIBS` (comma list, default `default_libs`) from
++/// `$<NAME>_LIBDIR` or the first existing `lib_dirs` entry under the install
++/// directory. Emits `kernel_support="<name>"` on success.
++fn build_vendor(name: &str, dir_var: &str, header: &str, lib_dirs: &[&str], default_libs: &str) {
++    let Some(dir) = env::var_os(dir_var).map(std::path::PathBuf::from) else {
++        return;
++    };
++    let upper = name.to_uppercase();
++    let include = dir.join("include");
++    if !include.join(header).exists() {
++        println!(
++            "cargo:warning=Skipping {name} adapter: {} not found",
++            include.join(header).display()
++        );
++        return;
++    }
++    let lib_dir = env::var_os(format!("LANCE_{upper}_LIBDIR"))
++        .map(std::path::PathBuf::from)
++        .or_else(|| lib_dirs.iter().map(|d| dir.join(d)).find(|d| d.is_dir()));
++    let Some(lib_dir) = lib_dir else {
++        println!(
++            "cargo:warning=Skipping {name} adapter: no library directory under {}",
++            dir.display()
++        );
++        return;
++    };
++    let result = cc::Build::new()
++        .std("c11")
++        .file(format!("src/simd/vendor_{name}.c"))
++        .include(&include)
++        .opt_level(2)
++        .try_compile(&format!("lance_vendor_{name}"));
++    if let Err(err) = result {
++        println!("cargo:warning=Skipping {name} adapter: {err}");
++        return;
++    }
++    println!("cargo:rustc-link-search=native={}", lib_dir.display());
++    let libs = env::var(format!("LANCE_{upper}_LIBS")).unwrap_or_else(|_| default_libs.to_string());
++    for lib in libs.split(',').map(str::trim).filter(|l| !l.is_empty()) {
++        println!("cargo:rustc-link-lib=dylib={lib}");
++    }
++    println!("cargo:rustc-cfg=kernel_support=\"{name}\"");
++}
+diff --git a/rust/lance-linalg/src/distance/dot.rs b/rust/lance-linalg/src/distance/dot.rs
+index 26a2bfa..9205978 100644
+--- a/rust/lance-linalg/src/distance/dot.rs
++++ b/rust/lance-linalg/src/distance/dot.rs
+@@ -399,9 +399,8 @@ lance_core::dispatch! {
+ 
+ // Opt-in SVE kernels; see `f32_sve_opt_in`.
+ #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
+-static DOT_F32_SVE_OPT_IN: std::sync::LazyLock<
+-    Option<lance_core::utils::cpu::Kernel<PairKernel>>,
+-> = std::sync::LazyLock::new(|| super::f32_sve_opt_in(&DOT_F32_SVE));
++static DOT_F32_SVE_OPT_IN: std::sync::LazyLock<Option<lance_core::utils::cpu::Kernel<PairKernel>>> =
++    std::sync::LazyLock::new(|| super::f32_sve_opt_in(&DOT_F32_SVE));
+ #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
+ static DOT_F32_BATCH_SVE_OPT_IN: std::sync::LazyLock<
+     Option<lance_core::utils::cpu::Kernel<BatchKernel>>,
+diff --git a/rust/lance-linalg/src/distance/l2.rs b/rust/lance-linalg/src/distance/l2.rs
+index d7b3b54..17a3de8 100644
+--- a/rust/lance-linalg/src/distance/l2.rs
++++ b/rust/lance-linalg/src/distance/l2.rs
+@@ -383,8 +383,7 @@ impl L2 for f32 {
+ static L2_F32_BATCH_AVX512_OPT_IN: std::sync::LazyLock<
+     Option<lance_core::utils::cpu::Kernel<BatchKernel>>,
+ > = std::sync::LazyLock::new(|| {
+-    std::env::var_os("LANCE_L2_BATCH_AVX512")
+-        .and_then(|_| x86::L2_F32_BATCH_AVX512.kernel())
++    std::env::var_os("LANCE_L2_BATCH_AVX512").and_then(|_| x86::L2_F32_BATCH_AVX512.kernel())
+ });
+ 
+ /// Name of the f32 L2 batch kernel `l2_distance_batch` uses on this host, for
+@@ -451,9 +450,8 @@ lance_core::dispatch! {
+ 
+ // Opt-in SVE kernels; see `f32_sve_opt_in`.
+ #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
+-static L2_F32_SVE_OPT_IN: std::sync::LazyLock<
+-    Option<lance_core::utils::cpu::Kernel<PairKernel>>,
+-> = std::sync::LazyLock::new(|| super::f32_sve_opt_in(&L2_F32_SVE));
++static L2_F32_SVE_OPT_IN: std::sync::LazyLock<Option<lance_core::utils::cpu::Kernel<PairKernel>>> =
++    std::sync::LazyLock::new(|| super::f32_sve_opt_in(&L2_F32_SVE));
+ #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
+ static L2_F32_BATCH_SVE_OPT_IN: std::sync::LazyLock<
+     Option<lance_core::utils::cpu::Kernel<BatchKernel>>,
+@@ -1215,7 +1213,9 @@ mod tests {
+         };
+         let n = 37;
+         let x: Vec<f32> = (0..dimension).map(|i| (i as f32 * 0.37).sin()).collect();
+-        let batch: Vec<f32> = (0..dimension * n).map(|i| (i as f32 * 0.73).cos() * 2.0).collect();
++        let batch: Vec<f32> = (0..dimension * n)
++            .map(|i| (i as f32 * 0.73).cos() * 2.0)
++            .collect();
+         let mut got = vec![f32::NAN; n];
+         batch512.call(&x, &batch, dimension, &mut got);
+         let mut want = vec![f32::NAN; n];
+diff --git a/rust/lance-linalg/src/kunpeng.rs b/rust/lance-linalg/src/kunpeng.rs
+new file mode 100644
+index 0000000..a66bd6e
+--- /dev/null
++++ b/rust/lance-linalg/src/kunpeng.rs
+@@ -0,0 +1,444 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright The Lance Authors
++
++//! ARM / Kunpeng kernel backends that callers outside this crate select
++//! explicitly (they are not behind a [`lance_core::utils::cpu::Dispatch`]):
++//!
++//! - SVE RaBitQ extra-bit dot products ([`ex_dot_sve`]);
++//! - SVE FP32 matrix-multiply (`FMMLA`) dot blocks for nearest-centroid
++//!   search ([`F32mmBlock`]);
++//! - Huawei Kunpeng Math Library SGEMM ([`kml_sgemm_nt`]) and Kunpeng
++//!   Retrieval Library L2 distances ([`KrlL2Handle`], [`krl_l2sqr_ny`]),
++//!   compiled only when `LANCE_KML_DIR` / `LANCE_KRL_DIR` name an install.
++//!
++//! Every entry point reports unavailability (`None` / `false`) instead of
++//! failing, so callers keep their existing kernels as the fallback. On other
++//! targets everything here is unavailable.
++
++/// The calling thread's SVE vector length in bytes, if this build has the SVE
++/// objects and the host supports SVE.
++pub fn sve_vector_bytes() -> Option<usize> {
++    #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++    {
++        use lance_core::utils::cpu::CpuFeatures;
++        if CpuFeatures::host().contains(CpuFeatures::SVE) {
++            // SAFETY: the host supports SVE.
++            return Some(unsafe { crate::simd::arm::lance_sve_vector_bytes() });
++        }
++    }
++    None
++}
++
++/// Code group geometry of the blocked ex-code layout (`lance-index`
++/// `bq/ex_dot.rs`): (dims, bytes) per group.
++#[cfg_attr(
++    not(all(target_arch = "aarch64", kernel_support = "sve")),
++    allow(dead_code)
++)]
++const fn ex_group(ex_bits: u8) -> (usize, usize) {
++    match ex_bits {
++        4 => (16, 8),
++        8 => (16, 16),
++        _ => (64, 64 * ex_bits as usize / 8),
++    }
++}
++
++/// Whether [`ex_dot_sve`] has a kernel for `ex_bits` on this host: SVE with
++/// vectors of at least 256 bits, and `ex_bits` in {2, 3, 4, 5, 8}.
++pub fn ex_dot_sve_supported(ex_bits: u8) -> bool {
++    matches!(ex_bits, 2 | 3 | 4 | 5 | 8) && sve_vector_bytes().is_some_and(|b| b >= 32)
++}
++
++/// `sum_d query[d] * code[d]` with the contract of `lance-index`'s `ExDotFn`:
++/// `query` covers whole 64-dim blocks and `codes` is one blocked row, treated
++/// as zero-padded when shorter. `None` when no SVE kernel can run (see
++/// [`ex_dot_sve_supported`]); the caller then uses its NEON kernel.
++#[inline]
++pub fn ex_dot_sve<const EX_BITS: u8>(query: &[f32], codes: &[u8]) -> Option<f32> {
++    #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++    {
++        use crate::simd::arm;
++        type Raw = unsafe extern "C" fn(*const f32, *const u8, usize, *const u8, *mut f32) -> i32;
++        let raw: Raw = match EX_BITS {
++            2 => arm::lance_ex_dot_u2_sve,
++            3 => arm::lance_ex_dot_u3_sve,
++            4 => arm::lance_ex_dot_u4_sve,
++            5 => arm::lance_ex_dot_u5_sve,
++            8 => arm::lance_ex_dot_u8_sve,
++            _ => return None,
++        };
++        let (group_dims, group_bytes) = const { ex_group(EX_BITS) };
++        assert_eq!(
++            query.len() % group_dims,
++            0,
++            "query is not padded to whole groups"
++        );
++        let groups = query.len() / group_dims;
++        let full = (codes.len() / group_bytes).min(groups);
++        let consumed = full * group_bytes;
++        // A partial final group is zero-padded and accumulated in place, as
++        // the NEON kernels do, so the result matches them bit for bit.
++        let mut padded = [0u8; 64];
++        let tail = if consumed < codes.len() && full < groups {
++            let avail = (codes.len() - consumed).min(group_bytes);
++            padded[..avail].copy_from_slice(&codes[consumed..consumed + avail]);
++            padded.as_ptr()
++        } else {
++            std::ptr::null()
++        };
++        let mut sum = 0.0f32;
++        // SAFETY: `full` groups of codes plus the optional padded group, and
++        // their query runs, are in bounds.
++        if unsafe { raw(query.as_ptr(), codes.as_ptr(), full, tail, &mut sum) } != 0 {
++            return None;
++        }
++        Some(sum)
++    }
++    #[cfg(not(all(target_arch = "aarch64", kernel_support = "sve")))]
++    {
++        let _ = (query, codes);
++        None
++    }
++}
++
++/// Rows of a [`F32mmBlock`] tile; row blocks are padded to a multiple.
++pub const F32MM_ROWS: usize = 8;
++/// Centroids of a [`F32mmBlock`] tile; centroid sets are padded to a multiple.
++pub const F32MM_COLS: usize = 4;
++
++/// Whether the SVE `FMMLA` dot blocks can run on this host.
++pub fn f32mm_available() -> bool {
++    #[cfg(all(target_arch = "aarch64", kernel_support = "sve_f32mm"))]
++    {
++        use lance_core::utils::cpu::CpuFeatures;
++        return CpuFeatures::host().contains(CpuFeatures::F32MM);
++    }
++    #[allow(unreachable_code)]
++    false
++}
++
++/// A matrix in the pair-packed layout of the `FMMLA` kernel: rows `2p` and
++/// `2p + 1` interleaved in two-float granules, every 128-bit segment a 2x2
++/// block. Rows are zero-padded to `pad_rows` and the dimension to even.
++pub struct F32mmBlock {
++    data: Vec<f32>,
++    rows: usize,
++    kp: usize,
++}
++
++impl F32mmBlock {
++    /// Packs `rows.len() / dim` rows, zero-padding to a multiple of `pad_rows`
++    /// (which must be even).
++    pub fn pack(rows: &[f32], dim: usize, pad_rows: usize) -> Self {
++        let mut block = Self {
++            data: Vec::new(),
++            rows: 0,
++            kp: 0,
++        };
++        block.repack(rows, dim, pad_rows);
++        block
++    }
++
++    /// [`Self::pack`] into the existing allocation.
++    pub fn repack(&mut self, rows: &[f32], dim: usize, pad_rows: usize) {
++        assert!(dim > 0 && pad_rows.is_multiple_of(2) && rows.len().is_multiple_of(dim));
++        let n = rows.len() / dim;
++        let n_pad = n.div_ceil(pad_rows) * pad_rows;
++        let half = dim.div_ceil(2);
++        let kp = 4 * half;
++        self.data.clear();
++        self.data.resize(n_pad / 2 * kp, 0.0);
++        for (r, row) in rows.chunks_exact(dim).enumerate() {
++            let base = (r / 2) * kp + 2 * (r % 2);
++            for (k2, pair) in row.chunks(2).enumerate() {
++                self.data[base + 4 * k2] = pair[0];
++                if let Some(&v) = pair.get(1) {
++                    self.data[base + 4 * k2 + 1] = v;
++                }
++            }
++        }
++        self.rows = n_pad;
++        self.kp = kp;
++    }
++
++    /// Padded row count.
++    pub fn rows(&self) -> usize {
++        self.rows
++    }
++
++    /// Packed floats per row pair.
++    pub fn pair_len(&self) -> usize {
++        self.kp
++    }
++
++    /// The packed rows `start..start + count` (both even) as a sub-block view.
++    fn pairs(&self, start: usize, count: usize) -> &[f32] {
++        &self.data[start / 2 * self.kp..(start + count) / 2 * self.kp]
++    }
++}
++
++/// `out[r * ldo + c] = <x[x_start + r], cent[c_start + c]>` for
++/// `r < x_count`, `c < c_count`, with `x_count` a multiple of
++/// [`F32MM_ROWS`] and `c_count` of [`F32MM_COLS`]. Returns `false` (writing
++/// nothing) when [`f32mm_available`] is false.
++#[allow(clippy::too_many_arguments)]
++pub fn dot_block_f32mm(
++    x: &F32mmBlock,
++    x_start: usize,
++    x_count: usize,
++    cent: &F32mmBlock,
++    c_start: usize,
++    c_count: usize,
++    out: &mut [f32],
++    ldo: usize,
++) -> bool {
++    if !f32mm_available() {
++        return false;
++    }
++    assert_eq!(x.kp, cent.kp, "row and centroid dimensions differ");
++    assert!(x_count.is_multiple_of(F32MM_ROWS) && c_count.is_multiple_of(F32MM_COLS));
++    assert!(x_start.is_multiple_of(2) && c_start.is_multiple_of(2));
++    assert!(x_start + x_count <= x.rows && c_start + c_count <= cent.rows);
++    assert!(c_count <= ldo && out.len() >= x_count.saturating_sub(1) * ldo + c_count);
++    #[cfg(all(target_arch = "aarch64", kernel_support = "sve_f32mm"))]
++    {
++        let xs = x.pairs(x_start, x_count);
++        let cs = cent.pairs(c_start, c_count);
++        // SAFETY: the host supports F32MM; the slices hold exactly the pairs
++        // the kernel reads and `out` covers every row/column it writes.
++        unsafe {
++            crate::simd::arm::lance_dot_block_f32mm(
++                xs.as_ptr(),
++                x_count / 2,
++                cs.as_ptr(),
++                c_count / 2,
++                x.kp,
++                out.as_mut_ptr(),
++                ldo,
++            )
++        };
++        return true;
++    }
++    #[allow(unreachable_code)]
++    {
++        let _ = (x.pairs(0, 0), cent, out);
++        false
++    }
++}
++
++/// Whether the KML adapter was built (`LANCE_KML_DIR`).
++pub const KML_AVAILABLE: bool = cfg!(all(target_arch = "aarch64", kernel_support = "kml"));
++/// Whether the KRL adapter was built (`LANCE_KRL_DIR`).
++pub const KRL_AVAILABLE: bool = cfg!(all(target_arch = "aarch64", kernel_support = "krl"));
++
++/// KML `cblas_sgemm`: `c[m x n] = a[m x k] * b[n x k]^T`, row-major with
++/// leading dimensions `k`, `k` and `n`. Returns `false` when KML is not built.
++/// KML threading follows `BLAS_NUM_THREADS`; set it to 1 inside rayon workers.
++pub fn kml_sgemm_nt(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) -> bool {
++    assert!(a.len() >= m * k && b.len() >= n * k && c.len() >= m * n);
++    #[cfg(all(target_arch = "aarch64", kernel_support = "kml"))]
++    {
++        let to_i32 = |v: usize| i32::try_from(v).expect("sgemm dimension exceeds i32");
++        // SAFETY: the slices cover the m x k, n x k and m x n operands.
++        unsafe {
++            crate::simd::arm::lance_kml_sgemm_nt(
++                to_i32(m),
++                to_i32(n),
++                to_i32(k),
++                a.as_ptr(),
++                to_i32(k),
++                b.as_ptr(),
++                to_i32(k),
++                c.as_mut_ptr(),
++                to_i32(n),
++            )
++        };
++        return true;
++    }
++    #[allow(unreachable_code)]
++    false
++}
++
++/// KRL `krl_L2sqr_ny`: squared L2 from `x` to each of the `y.len() / x.len()`
++/// rows of `y`. `None` when KRL is not built; `Err` carries a KRL status.
++pub fn krl_l2sqr_ny(x: &[f32], y: &[f32], out: &mut [f32]) -> Option<Result<(), i32>> {
++    let d = x.len();
++    assert!(d > 0 && y.len().is_multiple_of(d) && out.len() >= y.len() / d);
++    #[cfg(all(target_arch = "aarch64", kernel_support = "krl"))]
++    {
++        // SAFETY: `out` holds one distance per row of `y`.
++        let status = unsafe {
++            crate::simd::arm::lance_krl_l2sqr_ny(
++                out.as_mut_ptr(),
++                x.as_ptr(),
++                y.as_ptr(),
++                y.len() / d,
++                d,
++            )
++        };
++        return Some(if status == 0 { Ok(()) } else { Err(status) });
++    }
++    #[allow(unreachable_code)]
++    {
++        let _ = out;
++        None
++    }
++}
++
++/// A KRL fp32 squared-L2 distance handle over a fixed base set (one query
++/// per call). The base is zero-padded to a multiple of the KRL block size;
++/// padded entries are returned too and must be ignored by the caller.
++/// Each handle is used from one thread at a time (KRL documents no
++/// concurrency guarantee), hence `!Sync`.
++pub struct KrlL2Handle {
++    #[cfg(all(target_arch = "aarch64", kernel_support = "krl"))]
++    raw: *mut std::ffi::c_void,
++    padded: usize,
++    dim: usize,
++}
++
++// SAFETY: the handle owns its KRL state and may move between threads; it is
++// not `Sync`, so it is never used concurrently.
++unsafe impl Send for KrlL2Handle {}
++
++impl KrlL2Handle {
++    /// Builds a handle over `base` (`base.len() / dim` rows). `None` when KRL
++    /// is not built; `Err` carries a KRL status.
++    pub fn new(base: &[f32], dim: usize) -> Option<Result<Self, i32>> {
++        assert!(dim > 0 && base.len().is_multiple_of(dim));
++        #[cfg(all(target_arch = "aarch64", kernel_support = "krl"))]
++        {
++            let n = base.len() / dim;
++            let blocksize = if n % 64 == 0 {
++                64
++            } else if n % 32 == 0 {
++                32
++            } else {
++                16
++            };
++            let padded = n.div_ceil(blocksize) * blocksize;
++            let mut owned;
++            let data = if padded == n {
++                base
++            } else {
++                owned = vec![0.0f32; padded * dim];
++                owned[..base.len()].copy_from_slice(base);
++                owned.as_slice()
++            };
++            let mut raw = std::ptr::null_mut();
++            // SAFETY: `data` holds `padded * dim` floats; KRL copies the base.
++            let status = unsafe {
++                crate::simd::arm::lance_krl_create_l2_handle(
++                    &mut raw,
++                    blocksize,
++                    padded,
++                    dim,
++                    data.as_ptr(),
++                )
++            };
++            return Some(if status == 0 && !raw.is_null() {
++                Ok(Self { raw, padded, dim })
++            } else {
++                Err(status)
++            });
++        }
++        #[allow(unreachable_code)]
++        None
++    }
++
++    /// Base rows including padding: the length `distances` writes.
++    pub fn padded_len(&self) -> usize {
++        self.padded
++    }
++
++    /// Squared L2 from `x` to every (padded) base row.
++    pub fn distances(&self, x: &[f32], out: &mut [f32]) -> Result<(), i32> {
++        assert!(x.len() == self.dim && out.len() >= self.padded);
++        #[cfg(all(target_arch = "aarch64", kernel_support = "krl"))]
++        {
++            // SAFETY: `out` holds `padded` distances, `x` one query.
++            let status = unsafe {
++                crate::simd::arm::lance_krl_l2_with_handle(
++                    self.raw,
++                    out.as_mut_ptr(),
++                    self.padded,
++                    x.as_ptr(),
++                    self.dim,
++                )
++            };
++            return if status == 0 { Ok(()) } else { Err(status) };
++        }
++        #[allow(unreachable_code)]
++        Err(-1)
++    }
++}
++
++impl Drop for KrlL2Handle {
++    fn drop(&mut self) {
++        #[cfg(all(target_arch = "aarch64", kernel_support = "krl"))]
++        // SAFETY: `raw` came from `lance_krl_create_l2_handle` and is dropped once.
++        unsafe {
++            crate::simd::arm::lance_krl_clean_handle(self.raw)
++        };
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn f32mm_block_matches_scalar_dots() {
++        if !f32mm_available() {
++            return;
++        }
++        for dim in [1usize, 2, 3, 7, 32, 33, 960] {
++            let (n, k) = (13usize, 9usize);
++            let x: Vec<f32> = (0..n * dim)
++                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 7.0)
++                .collect();
++            let c: Vec<f32> = (0..k * dim)
++                .map(|i| ((i * 53 % 97) as f32 - 48.0) / 5.0)
++                .collect();
++            let xp = F32mmBlock::pack(&x, dim, F32MM_ROWS);
++            let cp = F32mmBlock::pack(&c, dim, F32MM_COLS);
++            let ldo = cp.rows();
++            let mut out = vec![f32::NAN; xp.rows() * ldo];
++            assert!(dot_block_f32mm(
++                &xp,
++                0,
++                xp.rows(),
++                &cp,
++                0,
++                cp.rows(),
++                &mut out,
++                ldo
++            ));
++            for r in 0..n {
++                for j in 0..k {
++                    let want: f64 = (0..dim)
++                        .map(|d| x[r * dim + d] as f64 * c[j * dim + d] as f64)
++                        .sum();
++                    let got = out[r * ldo + j] as f64;
++                    let scale: f64 = (0..dim)
++                        .map(|d| (x[r * dim + d] * c[j * dim + d]).abs() as f64)
++                        .sum();
++                    assert!(
++                        (got - want).abs() <= 1e-5 * scale.max(1.0),
++                        "dim={dim} r={r} j={j} {got} vs {want}"
++                    );
++                }
++            }
++            // Offset sub-blocks agree with the full block.
++            let mut sub = vec![0.0; F32MM_ROWS * ldo];
++            assert!(dot_block_f32mm(&xp, 8, 8, &cp, 4, 4, &mut sub, ldo));
++            for r in 0..5 {
++                for j in 0..4 {
++                    if 4 + j < k {
++                        assert_eq!(sub[r * ldo + j], out[(8 + r) * ldo + 4 + j]);
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/rust/lance-linalg/src/lib.rs b/rust/lance-linalg/src/lib.rs
+index 0d7654c..f73d5a0 100644
+--- a/rust/lance-linalg/src/lib.rs
++++ b/rust/lance-linalg/src/lib.rs
+@@ -11,6 +11,7 @@ use arrow_schema::ArrowError;
+ mod clustering;
+ pub mod distance;
+ pub mod kernels;
++pub mod kunpeng;
+ pub mod simd;
+ 
+ #[cfg(test)]
+diff --git a/rust/lance-linalg/src/simd.rs b/rust/lance-linalg/src/simd.rs
+index 15963e4..e6ba387 100644
+--- a/rust/lance-linalg/src/simd.rs
++++ b/rust/lance-linalg/src/simd.rs
+@@ -17,7 +17,13 @@ use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
+ pub mod amx_fp16;
+ #[cfg(all(
+     target_arch = "aarch64",
+-    any(kernel_support = "sve", kernel_support = "sve2")
++    any(
++        kernel_support = "sve",
++        kernel_support = "sve2",
++        kernel_support = "sve_f32mm",
++        kernel_support = "kml",
++        kernel_support = "krl"
++    )
+ ))]
+ pub(crate) mod arm;
+ pub mod dist_table;
+diff --git a/rust/lance-linalg/src/simd/arm.rs b/rust/lance-linalg/src/simd/arm.rs
+index 7951b3c..92c6fc0 100644
+--- a/rust/lance-linalg/src/simd/arm.rs
++++ b/rust/lance-linalg/src/simd/arm.rs
+@@ -23,6 +23,22 @@ unsafe extern "C" {
+     );
+     pub(crate) fn lance_dot_u8_sve(x: *const u8, y: *const u8, n: usize) -> u32;
+     pub(crate) fn lance_l2_u8_sve(x: *const u8, y: *const u8, n: usize) -> u32;
++    /// Returns -1 (writing nothing) when the vector is shorter than 256 bits.
++    pub(crate) fn lance_sum_hacc_sve(
++        codes: *const u8,
++        tables: *const u8,
++        code_len: usize,
++        n: usize,
++        out: *mut u32,
++    ) -> i32;
++    /// Returns -1 (writing nothing) when the vector is shorter than 256 bits.
++    pub(crate) fn lance_sum_u16_sve(
++        codes: *const u8,
++        tables: *const u8,
++        code_len: usize,
++        n: usize,
++        out: *mut u16,
++    ) -> i32;
+     pub(crate) fn lance_sum_f32_rows_sve(
+         codes: *const u8,
+         tables: *const f32,
+@@ -44,3 +60,113 @@ unsafe extern "C" {
+         out: *mut u32,
+     );
+ }
++
++// RaBitQ ex-code dot products (`lance-index` `bq/ex_dot.rs` blocked layout)
++// over `groups` whole code groups; -1 when the vector is shorter than 256 bits.
++#[cfg(kernel_support = "sve")]
++unsafe extern "C" {
++    pub(crate) fn lance_sve_vector_bytes() -> usize;
++    pub(crate) fn lance_ex_dot_u2_sve(
++        q: *const f32,
++        codes: *const u8,
++        groups: usize,
++        tail: *const u8,
++        out: *mut f32,
++    ) -> i32;
++    pub(crate) fn lance_ex_dot_u3_sve(
++        q: *const f32,
++        codes: *const u8,
++        groups: usize,
++        tail: *const u8,
++        out: *mut f32,
++    ) -> i32;
++    pub(crate) fn lance_ex_dot_u4_sve(
++        q: *const f32,
++        codes: *const u8,
++        groups: usize,
++        tail: *const u8,
++        out: *mut f32,
++    ) -> i32;
++    pub(crate) fn lance_ex_dot_u5_sve(
++        q: *const f32,
++        codes: *const u8,
++        groups: usize,
++        tail: *const u8,
++        out: *mut f32,
++    ) -> i32;
++    pub(crate) fn lance_ex_dot_u8_sve(
++        q: *const f32,
++        codes: *const u8,
++        groups: usize,
++        tail: *const u8,
++        out: *mut f32,
++    ) -> i32;
++}
++
++#[cfg(kernel_support = "sve_f32mm")]
++unsafe extern "C" {
++    /// Pair-packed FMMLA dot block; see `sve_f32mm.c`.
++    pub(crate) fn lance_dot_block_f32mm(
++        xp: *const f32,
++        row_pairs: usize,
++        cp: *const f32,
++        col_pairs: usize,
++        kp: usize,
++        out: *mut f32,
++        ldo: usize,
++    );
++}
++
++#[cfg(kernel_support = "kml")]
++unsafe extern "C" {
++    pub(crate) fn lance_kml_sgemm_nt(
++        m: i32,
++        n: i32,
++        k: i32,
++        a: *const f32,
++        lda: i32,
++        b: *const f32,
++        ldb: i32,
++        c: *mut f32,
++        ldc: i32,
++    );
++}
++
++#[cfg(kernel_support = "krl")]
++unsafe extern "C" {
++    pub(crate) fn lance_krl_l2sqr_ny(
++        dis: *mut f32,
++        x: *const f32,
++        y: *const f32,
++        ny: usize,
++        d: usize,
++    ) -> i32;
++    pub(crate) fn lance_krl_create_l2_handle(
++        handle: *mut *mut std::ffi::c_void,
++        blocksize: usize,
++        codes_num: usize,
++        dim: usize,
++        base: *const f32,
++    ) -> i32;
++    pub(crate) fn lance_krl_l2_with_handle(
++        handle: *const std::ffi::c_void,
++        dis: *mut f32,
++        codes_num: usize,
++        x: *const f32,
++        dim: usize,
++    ) -> i32;
++    pub(crate) fn lance_krl_clean_handle(handle: *mut std::ffi::c_void);
++    pub(crate) fn lance_krl_fast_scan_bs32(
++        nsq: i32,
++        codes: *const u8,
++        lut: *const u8,
++        dis: *mut u16,
++    ) -> i32;
++    pub(crate) fn lance_krl_pack_codes_4b(
++        codes: *const u8,
++        ncode: usize,
++        nsq: usize,
++        blocks: *mut u8,
++        batchsize: usize,
++    ) -> i32;
++}
+diff --git a/rust/lance-linalg/src/simd/dist_table.rs b/rust/lance-linalg/src/simd/dist_table.rs
+index e8d4d35..7b9f330 100644
+--- a/rust/lance-linalg/src/simd/dist_table.rs
++++ b/rust/lance-linalg/src/simd/dist_table.rs
+@@ -30,7 +30,19 @@ lance_core::dispatch! {
+         {
+             &[SUM_U16_AVX2, SUM_U16_SCALAR]
+         }
+-        #[cfg(target_arch = "aarch64")]
++        #[cfg(all(target_arch = "aarch64", kernel_support = "sve", kernel_support = "krl"))]
++        {
++            &[SUM_U16_SVE, SUM_U16_NEON, SUM_U16_KRL, SUM_U16_SCALAR]
++        }
++        #[cfg(all(target_arch = "aarch64", kernel_support = "sve", not(kernel_support = "krl")))]
++        {
++            &[SUM_U16_SVE, SUM_U16_NEON, SUM_U16_SCALAR]
++        }
++        #[cfg(all(target_arch = "aarch64", not(kernel_support = "sve"), kernel_support = "krl"))]
++        {
++            &[SUM_U16_NEON, SUM_U16_KRL, SUM_U16_SCALAR]
++        }
++        #[cfg(all(target_arch = "aarch64", not(kernel_support = "sve"), not(kernel_support = "krl")))]
+         {
+             &[SUM_U16_NEON, SUM_U16_SCALAR]
+         }
+@@ -51,11 +63,23 @@ lance_core::dispatch! {
+         {
+             &[SUM_HACC_AVX2, SUM_HACC_SCALAR]
+         }
+-        #[cfg(all(target_arch = "aarch64", kernel_support = "sve2"))]
++        #[cfg(all(target_arch = "aarch64", kernel_support = "sve2", kernel_support = "sve"))]
++        {
++            &[SUM_HACC_SVE2, SUM_HACC_SVE, SUM_HACC_NEON, SUM_HACC_SCALAR]
++        }
++        #[cfg(all(target_arch = "aarch64", kernel_support = "sve2", not(kernel_support = "sve")))]
+         {
+-            &[SUM_HACC_SVE2, SUM_HACC_SCALAR]
++            &[SUM_HACC_SVE2, SUM_HACC_NEON, SUM_HACC_SCALAR]
+         }
+-        #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", kernel_support = "sve2"))))]
++        #[cfg(all(target_arch = "aarch64", not(kernel_support = "sve2"), kernel_support = "sve"))]
++        {
++            &[SUM_HACC_SVE, SUM_HACC_NEON, SUM_HACC_SCALAR]
++        }
++        #[cfg(all(target_arch = "aarch64", not(kernel_support = "sve2"), not(kernel_support = "sve")))]
++        {
++            &[SUM_HACC_NEON, SUM_HACC_SCALAR]
++        }
++        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+         {
+             &[SUM_HACC_SCALAR]
+         }
+@@ -434,6 +458,80 @@ pub fn sum_4bit_hacc_dist_table_uninit(
+         .call(codes, hacc_dist_table, code_len, &mut dists[..n]);
+ }
+ 
++/// Name of the [`sum_4bit_hacc_dist_table`] kernel selected for this host.
++pub fn sum_hacc_kernel_name() -> &'static str {
++    SUM_HACC.selected().name()
++}
++
++/// Name of the `u16` 4-bit scan kernel selected for this host.
++pub fn sum_u16_kernel_name() -> &'static str {
++    SUM_U16.selected().name()
++}
++
++/// A host-supported [`sum_4bit_hacc_dist_table`] kernel: `(n, code_len, codes, table, dists)`.
++pub type HaccVariantFn = fn(usize, usize, &[u8], &[u8], &mut [u32]);
++/// A host-supported `u16` scan kernel: `(codes, dist_table, code_len, dists)`.
++pub type U16VariantFn = fn(&[u8], &[u8], usize, &mut [u16]);
++
++/// Every high-accuracy scan kernel this host can run, by candidate name, for
++/// parity tests and side-by-side benchmarks. Each has the contract of
++/// [`sum_4bit_hacc_dist_table`].
++pub fn sum_hacc_variants() -> Vec<(&'static str, HaccVariantFn)> {
++    fn wrap<const I: usize>(
++        n: usize,
++        code_len: usize,
++        codes: &[u8],
++        table: &[u8],
++        dists: &mut [u32],
++    ) {
++        let kernel = SUM_HACC.candidates()[I]
++            .kernel()
++            .expect("host-supported variant");
++        // A `u32` slice is a valid `MaybeUninit<u32>` slice.
++        let dists = unsafe {
++            std::slice::from_raw_parts_mut(
++                dists.as_mut_ptr().cast::<MaybeUninit<u32>>(),
++                dists.len(),
++            )
++        };
++        kernel.call(codes, table, code_len, &mut dists[..n]);
++    }
++    const WRAPS: [HaccVariantFn; 4] = [wrap::<0>, wrap::<1>, wrap::<2>, wrap::<3>];
++    SUM_HACC
++        .candidates()
++        .iter()
++        .enumerate()
++        .filter(|(_, c)| c.kernel().is_some())
++        .map(|(i, c)| (c.name(), WRAPS[i]))
++        .collect()
++}
++
++/// Every `u16` 4-bit scan kernel this host can run, by candidate name:
++/// `(codes, dist_table, code_len, dists)` sums `dists.len()` rows (a multiple
++/// of [`BATCH_SIZE`]) with wrapping `u16` arithmetic.
++pub fn sum_u16_variants() -> Vec<(&'static str, U16VariantFn)> {
++    fn wrap<const I: usize>(codes: &[u8], table: &[u8], code_len: usize, dists: &mut [u16]) {
++        let kernel = SUM_U16.candidates()[I]
++            .kernel()
++            .expect("host-supported variant");
++        let dists = unsafe {
++            std::slice::from_raw_parts_mut(
++                dists.as_mut_ptr().cast::<MaybeUninit<u16>>(),
++                dists.len(),
++            )
++        };
++        kernel.call(codes, table, code_len, dists);
++    }
++    const WRAPS: [U16VariantFn; 4] = [wrap::<0>, wrap::<1>, wrap::<2>, wrap::<3>];
++    SUM_U16
++        .candidates()
++        .iter()
++        .enumerate()
++        .filter(|(_, c)| c.kernel().is_some())
++        .map(|(i, c)| (c.name(), WRAPS[i]))
++        .collect()
++}
++
+ lance_core::target_kernel! {
+     #[target_features()]
+     #[candidate(SUM_HACC_SCALAR: SumHaccFn)]
+@@ -2543,6 +2641,106 @@ unsafe extern "C" {
+     );
+ }
+ 
++#[cfg(target_arch = "aarch64")]
++lance_core::target_kernel! {
++    #[target_features("neon")]
++    #[candidate(SUM_HACC_NEON: SumHaccFn)]
++    fn sum_hacc_neon(codes: &[u8], tables: &[u8], code_len: usize, dists: &mut [MaybeUninit<u32>]) {
++        let n = dists.len();
++        assert_row_major_bounds(n, code_len, codes, tables, 64);
++        for i in (0..n).step_by(BATCH_SIZE) {
++            // The bounds asserted above cover every load of the batch.
++            unsafe {
++                sum_hacc_batch_neon(
++                    &codes[i * code_len..(i + BATCH_SIZE) * code_len],
++                    tables,
++                    code_len,
++                    &mut dists[i..i + BATCH_SIZE],
++                )
++            }
++        }
++    }
++}
++
++/// One batch of 32 rows of the high-accuracy scan. Widening adds keep each
++/// `u16` lane to two table bytes per code column, so columns are summed in
++/// chunks of [`SAFE_U16_CODE_LEN`] (`2 * 128 * 255 < 2^16`) and widened into
++/// `u32`. Lane `l` of the bytes-0..8 accumulator holds row `PERM0[l]` and of
++/// the bytes-8..16 one row `PERM0[8 + l]`, so one `uzp` per chunk restores
++/// natural row order.
++#[cfg(target_arch = "aarch64")]
++#[inline]
++#[target_feature(enable = "neon")]
++unsafe fn sum_hacc_batch_neon(
++    codes: &[u8],
++    tables: &[u8],
++    code_len: usize,
++    dists: &mut [MaybeUninit<u32>],
++) {
++    let mask = vdupq_n_u8(0x0f);
++    let cp = codes.as_ptr();
++    let tp = tables.as_ptr();
++    // acc[q] holds rows 4q..4q+4.
++    let mut acc = [vdupq_n_u32(0); 8];
++    for chunk_start in (0..code_len).step_by(SAFE_U16_CODE_LEN) {
++        let chunk_end = (chunk_start + SAFE_U16_CODE_LEN).min(code_len);
++        // Per nibble half: [low plane bytes 0..8, low plane bytes 8..16,
++        // high plane bytes 0..8, high plane bytes 8..16].
++        let mut rows = [[vdupq_n_u16(0); 4]; 2];
++        for col in chunk_start..chunk_end {
++            let (c_cur, c_next, tl_cur, tl_next, th_cur, th_next) = unsafe {
++                (
++                    vld1q_u8(cp.add(col * 32)),
++                    vld1q_u8(cp.add(col * 32 + 16)),
++                    vld1q_u8(tp.add(col * 64)),
++                    vld1q_u8(tp.add(col * 64 + 16)),
++                    vld1q_u8(tp.add(col * 64 + 32)),
++                    vld1q_u8(tp.add(col * 64 + 48)),
++                )
++            };
++            let idx = [
++                (vandq_u8(c_cur, mask), vandq_u8(c_next, mask)),
++                (vshrq_n_u8::<4>(c_cur), vshrq_n_u8::<4>(c_next)),
++            ];
++            for (r, (idx_cur, idx_next)) in rows.iter_mut().zip(idx) {
++                let l0 = vqtbl1q_u8(tl_cur, idx_cur);
++                let l1 = vqtbl1q_u8(tl_next, idx_next);
++                let h0 = vqtbl1q_u8(th_cur, idx_cur);
++                let h1 = vqtbl1q_u8(th_next, idx_next);
++                r[0] = vaddw_u8(vaddw_u8(r[0], vget_low_u8(l0)), vget_low_u8(l1));
++                r[1] = vaddw_high_u8(vaddw_high_u8(r[1], l0), l1);
++                r[2] = vaddw_u8(vaddw_u8(r[2], vget_low_u8(h0)), vget_low_u8(h1));
++                r[3] = vaddw_high_u8(vaddw_high_u8(r[3], h0), h1);
++            }
++        }
++        for (half, r) in rows.iter().enumerate() {
++            // uzp1 / uzp2 of (PERM0[0..8], PERM0[8..16]) rows = rows 0..8 / 8..16.
++            let groups = [
++                (vuzp1q_u16(r[0], r[1]), vuzp1q_u16(r[2], r[3])),
++                (vuzp2q_u16(r[0], r[1]), vuzp2q_u16(r[2], r[3])),
++            ];
++            for (q, (low, high)) in groups.into_iter().enumerate() {
++                let slot = 4 * half + 2 * q;
++                acc[slot] = vaddq_u32(
++                    acc[slot],
++                    vaddq_u32(
++                        vmovl_u16(vget_low_u16(low)),
++                        vshll_n_u16::<8>(vget_low_u16(high)),
++                    ),
++                );
++                acc[slot + 1] = vaddq_u32(
++                    acc[slot + 1],
++                    vaddq_u32(vmovl_high_u16(low), vshll_high_n_u16::<8>(high)),
++                );
++            }
++        }
++    }
++    let out = dists.as_mut_ptr().cast::<u32>();
++    for (q, a) in acc.iter().enumerate() {
++        // `dists` holds BATCH_SIZE slots.
++        unsafe { vst1q_u32(out.add(4 * q), *a) };
++    }
++}
+ #[cfg(all(target_arch = "aarch64", kernel_support = "sve2"))]
+ lance_core::target_kernel! {
+     #[target_features("sve2")]
+@@ -2557,6 +2755,114 @@ lance_core::target_kernel! {
+     }
+ }
+ 
++#[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++lance_core::target_kernel! {
++    #[target_features("sve")]
++    #[candidate(SUM_HACC_SVE: SumHaccFn)]
++    fn sum_hacc_sve(codes: &[u8], tables: &[u8], code_len: usize, dists: &mut [MaybeUninit<u32>]) {
++        assert_row_major_bounds(dists.len(), code_len, codes, tables, 64);
++        // SAFETY: validated packed batches and tables; on success the kernel
++        // writes every output slot. It checks the calling thread's vector
++        // length and refuses (-1, nothing written) below 256 bits.
++        let status = unsafe {
++            crate::simd::arm::lance_sum_hacc_sve(
++                codes.as_ptr(), tables.as_ptr(), code_len, dists.len(), dists.as_mut_ptr().cast(),
++            )
++        };
++        if status != 0 {
++            // SAFETY: NEON is part of every SVE host.
++            sum_hacc_neon(codes, tables, code_len, dists)
++        }
++    }
++}
++
++#[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++lance_core::target_kernel! {
++    #[target_features("sve")]
++    #[candidate(SUM_U16_SVE: SumU16Fn)]
++    fn sum_u16_sve(codes: &[u8], dist_table: &[u8], code_len: usize, dists: &mut [MaybeUninit<u16>]) {
++        assert_row_major_bounds(dists.len(), code_len, codes, dist_table, BATCH_SIZE);
++        // SAFETY: as for `sum_hacc_sve`.
++        let status = unsafe {
++            crate::simd::arm::lance_sum_u16_sve(
++                codes.as_ptr(), dist_table.as_ptr(), code_len, dists.len(), dists.as_mut_ptr().cast(),
++            )
++        };
++        if status != 0 {
++            sum_u16_neon(codes, dist_table, code_len, dists)
++        }
++    }
++}
++
++/// Whether KRL's FastScan returns Lance's sums when given Lance's packed
++/// codes and tables unchanged (the layouts both derive from Faiss's PERM0
++/// block order, but KRL documents only its own packer). Checked once against
++/// the portable kernel on random full-range inputs; until it passes, the KRL
++/// candidate runs NEON.
++#[cfg(all(target_arch = "aarch64", kernel_support = "krl"))]
++pub fn krl_fast_scan_matches_lance_layout() -> bool {
++    static OK: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
++        let mut state = 0x9e37_79b9_7f4a_7c15u64;
++        let mut next = || {
++            state ^= state << 13;
++            state ^= state >> 7;
++            state ^= state << 17;
++            state as u8
++        };
++        for code_len in [1usize, 2, 7, 64, 128] {
++            let codes: Vec<u8> = (0..BATCH_SIZE * code_len).map(|_| next()).collect();
++            // Keep sums below 2^16 so saturation and wrapping agree.
++            let table: Vec<u8> = (0..BATCH_SIZE * code_len).map(|_| next() / 2).collect();
++            let mut want = vec![0u16; BATCH_SIZE];
++            sum_4bit_dist_table_scalar(code_len, &codes, &table, &mut want);
++            let mut got = [0u16; 64];
++            let status = unsafe {
++                crate::simd::arm::lance_krl_fast_scan_bs32(
++                    (2 * code_len) as i32,
++                    codes.as_ptr(),
++                    table.as_ptr(),
++                    got.as_mut_ptr(),
++                )
++            };
++            if status != 0 || got[..BATCH_SIZE] != want[..] {
++                return false;
++            }
++        }
++        true
++    });
++    *OK
++}
++
++#[cfg(all(target_arch = "aarch64", kernel_support = "krl"))]
++lance_core::target_kernel! {
++    #[target_features("neon")]
++    #[candidate(SUM_U16_KRL: SumU16Fn)]
++    fn sum_u16_krl(codes: &[u8], dist_table: &[u8], code_len: usize, dists: &mut [MaybeUninit<u16>]) {
++        let n = dists.len();
++        assert_row_major_bounds(n, code_len, codes, dist_table, BATCH_SIZE);
++        // KRL's documented FastScan shape: an even table count of at most 256.
++        if code_len == 0 || code_len > SAFE_U16_CODE_LEN || !krl_fast_scan_matches_lance_layout() {
++            return unsafe { sum_u16_neon(codes, dist_table, code_len, dists) };
++        }
++        let mut out = [0u16; 64];
++        for i in (0..n).step_by(BATCH_SIZE) {
++            // SAFETY: one validated 32-row block; KRL writes at most 64 sums.
++            let status = unsafe {
++                crate::simd::arm::lance_krl_fast_scan_bs32(
++                    (2 * code_len) as i32,
++                    codes.as_ptr().add(i * code_len),
++                    dist_table.as_ptr(),
++                    out.as_mut_ptr(),
++                )
++            };
++            assert_eq!(status, 0, "krl_L2_table_lookup_fast_scan_bs32 failed: {status}");
++            for (d, v) in dists[i..i + BATCH_SIZE].iter_mut().zip(out) {
++                d.write(v);
++            }
++        }
++    }
++}
++
+ #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
+ lance_core::target_kernel! {
+     #[target_features("sve")]
+@@ -2595,6 +2901,124 @@ mod tests {
+ 
+     use super::*;
+ 
++    fn xorshift(seed: u64) -> impl FnMut() -> u64 {
++        let mut state = seed | 1;
++        move || {
++            state ^= state << 13;
++            state ^= state >> 7;
++            state ^= state << 17;
++            state
++        }
++    }
++
++    /// Every high-accuracy kernel the host runs must equal the scalar
++    /// reference exactly: integer `u16` entries, `u32` sums, including
++    /// all-maximum tables and code lengths past the 128/256-column chunking.
++    #[test]
++    fn hacc_variants_match_scalar_exactly() {
++        let variants = sum_hacc_variants();
++        let names: Vec<_> = variants.iter().map(|(name, _)| *name).collect();
++        assert!(names.contains(&SUM_HACC_SCALAR.name()));
++        #[cfg(target_arch = "aarch64")]
++        assert!(names.contains(&SUM_HACC_NEON.name()), "{names:?}");
++        #[cfg(all(target_arch = "aarch64", kernel_support = "sve"))]
++        if lance_core::utils::cpu::CpuFeatures::host()
++            .contains(lance_core::utils::cpu::CpuFeatures::SVE)
++        {
++            assert!(names.contains(&SUM_HACC_SVE.name()), "{names:?}");
++            assert!(
++                sum_u16_variants()
++                    .iter()
++                    .any(|(n, _)| *n == SUM_U16_SVE.name())
++            );
++        }
++        let mut next = xorshift(42);
++        for code_len in [1usize, 2, 3, 16, 127, 128, 129, 255, 256, 257, 300, 512] {
++            for table_kind in ["random", "max", "zero", "low_only", "high_only"] {
++                let n = 3 * BATCH_SIZE;
++                let codes: Vec<u8> = (0..n * code_len).map(|_| next() as u8).collect();
++                let table_u16: Vec<u16> = (0..32 * code_len)
++                    .map(|_| match table_kind {
++                        "max" => u16::MAX,
++                        "zero" => 0,
++                        "low_only" => next() as u16 & 0xff,
++                        "high_only" => next() as u16 & 0xff00,
++                        _ => next() as u16,
++                    })
++                    .collect();
++                let mut hacc = Vec::new();
++                transfer_4bit_dist_table_u16(&table_u16, &mut hacc);
++                let mut want = vec![0u32; n];
++                sum_4bit_hacc_dist_table_scalar(code_len, &codes, &hacc, &mut want);
++                // Independent reference straight from the u16 table.
++                let mut direct = vec![0u32; n];
++                sum_4bit_dist_table_u16_scalar(code_len, &codes, &table_u16, &mut direct);
++                assert_eq!(want, direct, "code_len={code_len} {table_kind}");
++                for (name, kernel) in &variants {
++                    let mut got = vec![u32::MAX; n];
++                    kernel(n, code_len, &codes, &hacc, &mut got);
++                    assert_eq!(got, want, "{name} code_len={code_len} table={table_kind}");
++                }
++            }
++        }
++    }
++
++    /// Each row's 4-bit index selects exactly one table entry: one-hot tables
++    /// pin down the PERM0 row mapping of every kernel.
++    #[test]
++    fn hacc_variants_follow_perm0_row_order() {
++        let code_len = 2;
++        let n = BATCH_SIZE;
++        // Row r uses code (r % 16) in every table.
++        let mut codes = vec![0u8; n * code_len];
++        for col in 0..code_len {
++            for j in 0..16 {
++                let lo = PERM0[j] % 16;
++                let hi = (PERM0[j] + 16) % 16;
++                codes[col * 32 + j] = (lo | (hi << 4)) as u8;
++                codes[col * 32 + 16 + j] = (lo | (hi << 4)) as u8;
++            }
++        }
++        let table_u16: Vec<u16> = (0..32 * code_len).map(|i| 1000 + i as u16 * 7).collect();
++        let mut hacc = Vec::new();
++        transfer_4bit_dist_table_u16(&table_u16, &mut hacc);
++        let mut want = vec![0u32; n];
++        sum_4bit_hacc_dist_table_scalar(code_len, &codes, &hacc, &mut want);
++        for (name, kernel) in sum_hacc_variants() {
++            let mut got = vec![0u32; n];
++            kernel(n, code_len, &codes, &hacc, &mut got);
++            assert_eq!(got, want, "{name}");
++        }
++    }
++
++    /// The `u16` scan kernels agree bit for bit (wrapping sums) with NEON /
++    /// AVX2 and, where sums fit, with the saturating scalar reference.
++    #[test]
++    fn u16_variants_match_scalar() {
++        let variants = sum_u16_variants();
++        let mut next = xorshift(7);
++        for code_len in [1usize, 2, 5, 64, 128] {
++            let n = 4 * BATCH_SIZE;
++            let codes: Vec<u8> = (0..n * code_len).map(|_| next() as u8).collect();
++            for max in [u8::MAX, 127, 1] {
++                let table: Vec<u8> = (0..BATCH_SIZE * code_len)
++                    .map(|_| {
++                        let v = next() as u8;
++                        if max == u8::MAX { v } else { v % (max + 1) }
++                    })
++                    .collect();
++                let mut want = vec![0u16; n];
++                sum_4bit_dist_table_scalar(code_len, &codes, &table, &mut want);
++                for (name, kernel) in &variants {
++                    let mut got = vec![0xdead; n];
++                    kernel(&codes, &table, code_len, &mut got);
++                    // 2 * 128 * 255 < 2^16: no wrap at these code lengths.
++                    assert_eq!(got, want, "{name} code_len={code_len} max={max}");
++                }
++            }
++        }
++    }
++
+     #[test]
+     fn test_perm0_inverse_matches_perm0() {
+         for (idx, &value) in PERM0.iter().enumerate() {
+diff --git a/rust/lance-linalg/src/simd/sve.c b/rust/lance-linalg/src/simd/sve.c
+index 1c9454a..794313e 100644
+--- a/rust/lance-linalg/src/simd/sve.c
++++ b/rust/lance-linalg/src/simd/sve.c
+@@ -183,3 +183,272 @@ uint32_t lance_l2_u8_sve(const uint8_t *x, const uint8_t *y, size_t n) {
+   }
+   return svaddv_u32(svptrue_b32(), sum);
+ }
++
++// ---------------------------------------------------------------------------
++// 4-bit LUT scans over the PERM0 row-major layout (dist_table.rs).
++//
++// A 32-byte code block for one batch of 32 rows and one code byte column holds
++// the current table's indices in bytes 0..16 and the next table's in bytes
++// 16..32 (low nibble: row PERM0[j], high nibble: row PERM0[j] + 16). The two
++// tables are contiguous too, so ONE 32-byte TBL looks up both once the
++// indices of bytes 16..32 are offset by 16. That needs a vector of at least
++// 256 bits; the functions return -1 without writing for a shorter vector and
++// the Rust candidate falls back to NEON.
++//
++// Each u16 lane k of a looked-up vector holds bytes 2k (row PERM0[2k mod 16]
++// = k mod 8) and 2k+1 (row 8 + k mod 8); lanes k and k + 8 hold the current
++// and next table of the same row. Even/odd bytes are accumulated with the
++// "bleed" trick: E += lane, O += lane >> 8, then E - (O << 8) is the even-byte
++// sum modulo 2^16.
++// ---------------------------------------------------------------------------
++
++#define LANCE_LUT_MIN_VL_BYTES 32
++
++static inline svuint8_t lance_lut_index_offsets(void) {
++  // 0 for bytes 0..16, 16 for bytes 16..32 (bytes >= 32 are never read back).
++  return svand_n_u8_x(svptrue_b8(), svindex_u8(0, 1), 16);
++}
++
++#define LANCE_BLEED_ADD(e, o, bytes)                                           \
++  do {                                                                         \
++    svuint16_t w_ = svreinterpret_u16_u8(bytes);                               \
++    e = svadd_u16_x(all16, e, w_);                                             \
++    o = svadd_u16_x(all16, o, svlsr_n_u16_x(all16, w_, 8));                    \
++  } while (0)
++
++// Even-byte and odd-byte sums of the first 16 u16 lanes.
++static inline void lance_bleed_store(svuint16_t e, svuint16_t o, uint16_t *ev,
++                                     uint16_t *od) {
++  svbool_t pg16 = svwhilelt_b16((uint64_t)0, (uint64_t)16);
++  svbool_t all16 = svptrue_b16();
++  svst1_u16(pg16, ev, svsub_u16_x(all16, e, svlsl_n_u16_x(all16, o, 8)));
++  svst1_u16(pg16, od, o);
++}
++
++// Rows 0..16 from the even/odd lane sums: row r < 8 is ev[r] + ev[r + 8],
++// row 8 + r is od[r] + od[r + 8].
++static inline uint32_t lance_row_sum(const uint16_t *ev, const uint16_t *od,
++                                     int row) {
++  return row < 8 ? (uint32_t)ev[row] + ev[row + 8]
++                 : (uint32_t)od[row - 8] + od[row];
++}
++
++// High-accuracy table: per code column, 64 bytes = [cur_low|next_low]
++// [cur_high|next_high]; entry = low + (high << 8), summed exactly into u32.
++// Columns are processed in chunks of 256 so that no u16 lane (one byte per
++// column) can exceed 256 * 255 < 2^16.
++int lance_sum_hacc_sve(const uint8_t *codes, const uint8_t *tables,
++                       size_t code_len, size_t n, uint32_t *out) {
++  if (svcntb() < LANCE_LUT_MIN_VL_BYTES) return -1;
++  const svbool_t pg32 = svwhilelt_b8((uint64_t)0, (uint64_t)32);
++  const svbool_t all16 = svptrue_b16();
++  const svuint8_t off = lance_lut_index_offsets();
++  const size_t chunk = 256;
++  for (size_t batch = 0; batch < n; batch += 32) {
++    uint32_t sums[32] = {0};
++    const uint8_t *batch_codes = codes + batch * code_len;
++    for (size_t c0 = 0; c0 < code_len; c0 += chunk) {
++      size_t c1 = c0 + chunk < code_len ? c0 + chunk : code_len;
++      svuint16_t el_lo = svdup_u16(0), ol_lo = svdup_u16(0);  // low plane, rows 0..16
++      svuint16_t eh_lo = svdup_u16(0), oh_lo = svdup_u16(0);  // high plane, rows 0..16
++      svuint16_t el_hi = svdup_u16(0), ol_hi = svdup_u16(0);  // low plane, rows 16..32
++      svuint16_t eh_hi = svdup_u16(0), oh_hi = svdup_u16(0);  // high plane, rows 16..32
++      for (size_t col = c0; col < c1; ++col) {
++        svuint8_t c = svld1_u8(pg32, batch_codes + col * 32);
++        svuint8_t tl = svld1_u8(pg32, tables + col * 64);
++        svuint8_t th = svld1_u8(pg32, tables + col * 64 + 32);
++        svuint8_t lo = svorr_u8_x(pg32, svand_n_u8_x(pg32, c, 15), off);
++        svuint8_t hi = svorr_u8_x(pg32, svlsr_n_u8_x(pg32, c, 4), off);
++        LANCE_BLEED_ADD(el_lo, ol_lo, svtbl_u8(tl, lo));
++        LANCE_BLEED_ADD(eh_lo, oh_lo, svtbl_u8(th, lo));
++        LANCE_BLEED_ADD(el_hi, ol_hi, svtbl_u8(tl, hi));
++        LANCE_BLEED_ADD(eh_hi, oh_hi, svtbl_u8(th, hi));
++      }
++      uint16_t a[16], b[16], c[16], d[16];
++      lance_bleed_store(el_lo, ol_lo, a, b);
++      lance_bleed_store(eh_lo, oh_lo, c, d);
++      for (int r = 0; r < 16; ++r)
++        sums[r] += lance_row_sum(a, b, r) + (lance_row_sum(c, d, r) << 8);
++      lance_bleed_store(el_hi, ol_hi, a, b);
++      lance_bleed_store(eh_hi, oh_hi, c, d);
++      for (int r = 0; r < 16; ++r)
++        sums[16 + r] += lance_row_sum(a, b, r) + (lance_row_sum(c, d, r) << 8);
++    }
++    for (int r = 0; r < 32; ++r) out[batch + r] = sums[r];
++  }
++  return 0;
++}
++
++// u8 tables (32 bytes per code column), u16 sums with wrapping arithmetic,
++// bit-identical to the NEON kernel for every input.
++int lance_sum_u16_sve(const uint8_t *codes, const uint8_t *tables,
++                      size_t code_len, size_t n, uint16_t *out) {
++  if (svcntb() < LANCE_LUT_MIN_VL_BYTES) return -1;
++  const svbool_t pg32 = svwhilelt_b8((uint64_t)0, (uint64_t)32);
++  const svbool_t all16 = svptrue_b16();
++  const svuint8_t off = lance_lut_index_offsets();
++  for (size_t batch = 0; batch < n; batch += 32) {
++    const uint8_t *batch_codes = codes + batch * code_len;
++    svuint16_t e_lo = svdup_u16(0), o_lo = svdup_u16(0);
++    svuint16_t e_hi = svdup_u16(0), o_hi = svdup_u16(0);
++    for (size_t col = 0; col < code_len; ++col) {
++      svuint8_t c = svld1_u8(pg32, batch_codes + col * 32);
++      svuint8_t t = svld1_u8(pg32, tables + col * 32);
++      svuint8_t lo = svorr_u8_x(pg32, svand_n_u8_x(pg32, c, 15), off);
++      svuint8_t hi = svorr_u8_x(pg32, svlsr_n_u8_x(pg32, c, 4), off);
++      LANCE_BLEED_ADD(e_lo, o_lo, svtbl_u8(t, lo));
++      LANCE_BLEED_ADD(e_hi, o_hi, svtbl_u8(t, hi));
++    }
++    uint16_t a[16], b[16];
++    lance_bleed_store(e_lo, o_lo, a, b);
++    for (int r = 0; r < 16; ++r) out[batch + r] = (uint16_t)lance_row_sum(a, b, r);
++    lance_bleed_store(e_hi, o_hi, a, b);
++    for (int r = 0; r < 16; ++r) out[batch + 16 + r] = (uint16_t)lance_row_sum(a, b, r);
++  }
++  return 0;
++}
++#undef LANCE_BLEED_ADD
++
++// ---------------------------------------------------------------------------
++// RaBitQ extra-bit dot products, sum_d query[d] * code[d], over the blocked
++// layout of lance-index `bq/ex_dot.rs`. Codes are loaded with zero-extending
++// byte loads straight into 32-bit lanes (8 lanes per vector), so the unpack is
++// shifts and masks on u32 lanes followed by one convert and one FMA per 8 dims.
++//
++// The result is bit-identical to the NEON kernels, which other kernels (the
++// fused layered/prefix kernels) must reproduce exactly: accumulator A holds
++// dims 0..8 and B dims 8..16 of every 16-dim run, which are lane for lane the
++// four 4-lane NEON accumulators, runs are fed in the same order, a partial
++// final group (`tail`, zero padded by the caller, or NULL) is accumulated in
++// place, and the final reduction follows vaddvq((a0 + a1) + (a2 + a3)).
++// Needs >= 256-bit vectors (returns -1 otherwise).
++// ---------------------------------------------------------------------------
++
++#define LANCE_EXDOT_PROLOGUE                                                   \
++  if (svcntb() < 32) return -1;                                                \
++  const svbool_t pg = svwhilelt_b32((uint64_t)0, (uint64_t)8);                 \
++  svfloat32_t acc_a = svdup_f32(0), acc_b = svdup_f32(0)
++// One 16-dim run: `lo` holds dims 0..8, `hi` dims 8..16 as u32 lanes.
++#define LANCE_EXDOT_RUN(lo, hi, q)                                             \
++  do {                                                                         \
++    acc_a = svmla_f32_x(pg, acc_a, svcvt_f32_u32_x(pg, lo), svld1_f32(pg, q)); \
++    acc_b = svmla_f32_x(pg, acc_b, svcvt_f32_u32_x(pg, hi),                    \
++                        svld1_f32(pg, (q) + 8));                               \
++  } while (0)
++#define LANCE_EXDOT_GROUPS(body, group_bytes, group_dims)                      \
++  do {                                                                         \
++    for (size_t g = 0; g < groups; ++g) {                                      \
++      const uint8_t *c = codes + g * (group_bytes);                            \
++      const float *qq = q + g * (group_dims);                                  \
++      body;                                                                    \
++    }                                                                          \
++    if (tail) {                                                                \
++      const uint8_t *c = tail;                                                 \
++      const float *qq = q + groups * (group_dims);                             \
++      body;                                                                    \
++    }                                                                          \
++  } while (0)
++#define LANCE_EXDOT_EPILOGUE                                                   \
++  do {                                                                         \
++    float a[8], b[8], u[4];                                                    \
++    svst1_f32(pg, a, acc_a);                                                   \
++    svst1_f32(pg, b, acc_b);                                                   \
++    for (int i = 0; i < 4; ++i) u[i] = (a[i] + a[i + 4]) + (b[i] + b[i + 4]);  \
++    *out = (u[0] + u[1]) + (u[2] + u[3]);                                      \
++    return 0;                                                                  \
++  } while (0)
++
++// 8 bits: group = 16 dims = 16 bytes, identity.
++int lance_ex_dot_u8_sve(const float *q, const uint8_t *codes, size_t groups,
++                        const uint8_t *tail, float *out) {
++  LANCE_EXDOT_PROLOGUE;
++  LANCE_EXDOT_GROUPS(
++      LANCE_EXDOT_RUN(svld1ub_u32(pg, c), svld1ub_u32(pg, c + 8), qq), 16, 16);
++  LANCE_EXDOT_EPILOGUE;
++}
++
++// 4 bits: group = 16 dims = 8 bytes; byte b = dim b (low) | dim 8 + b (high).
++int lance_ex_dot_u4_sve(const float *q, const uint8_t *codes, size_t groups,
++                        const uint8_t *tail, float *out) {
++  LANCE_EXDOT_PROLOGUE;
++  LANCE_EXDOT_GROUPS(
++      {
++        svuint32_t v = svld1ub_u32(pg, c);
++        LANCE_EXDOT_RUN(svand_n_u32_x(pg, v, 15), svlsr_n_u32_x(pg, v, 4), qq);
++      },
++      8, 16);
++  LANCE_EXDOT_EPILOGUE;
++}
++
++// Top bit `bit` of run k from a top-bit plane: the top bit of dim 16k + b is
++// bit 2k + b / 8 of plane byte b % 8 (`p` = plane bytes, `pb` = p >> 1).
++#define LANCE_TOP(plane, k, bit)                                               \
++  svand_n_u32_x(pg, svlsl_n_u32_x(pg, svlsr_n_u32_x(pg, plane, 2 * (k)), bit), \
++                1u << (bit))
++
++// 2 and 3 bits: group = 64 dims; byte b (< 16) holds dims b + 16k at bits 2k;
++// 3 bits adds the top-bit plane (8 bytes after the 16).
++#define LANCE_U23_GROUP(top)                                                   \
++  {                                                                            \
++    svuint32_t a = svld1ub_u32(pg, c), b = svld1ub_u32(pg, c + 8);             \
++    svuint32_t p = (top) ? svld1ub_u32(pg, c + 16) : svdup_u32(0);             \
++    svuint32_t pb = svlsr_n_u32_x(pg, p, 1);                                   \
++    for (int k = 0; k < 4; ++k) {                                              \
++      svuint32_t lo = svand_n_u32_x(pg, svlsr_n_u32_x(pg, a, 2 * k), 3);       \
++      svuint32_t hi = svand_n_u32_x(pg, svlsr_n_u32_x(pg, b, 2 * k), 3);       \
++      if (top) {                                                               \
++        lo = svorr_u32_x(pg, lo, LANCE_TOP(p, k, 2));                          \
++        hi = svorr_u32_x(pg, hi, LANCE_TOP(pb, k, 2));                         \
++      }                                                                        \
++      LANCE_EXDOT_RUN(lo, hi, qq + 16 * k);                                    \
++    }                                                                          \
++  }
++
++int lance_ex_dot_u2_sve(const float *q, const uint8_t *codes, size_t groups,
++                        const uint8_t *tail, float *out) {
++  LANCE_EXDOT_PROLOGUE;
++  LANCE_EXDOT_GROUPS(LANCE_U23_GROUP(0), 16, 64);
++  LANCE_EXDOT_EPILOGUE;
++}
++
++int lance_ex_dot_u3_sve(const float *q, const uint8_t *codes, size_t groups,
++                        const uint8_t *tail, float *out) {
++  LANCE_EXDOT_PROLOGUE;
++  LANCE_EXDOT_GROUPS(LANCE_U23_GROUP(1), 24, 64);
++  LANCE_EXDOT_EPILOGUE;
++}
++
++// 5 bits: group = 64 dims = 40 bytes; byte b of the first 16 = dims b (low) |
++// 16 + b (high), of the next 16 = dims 32 + b | 48 + b; then the top-bit
++// plane (bit 4). Runs in order 0..4 as NEON feeds them.
++int lance_ex_dot_u5_sve(const float *q, const uint8_t *codes, size_t groups,
++                        const uint8_t *tail, float *out) {
++  LANCE_EXDOT_PROLOGUE;
++  LANCE_EXDOT_GROUPS(
++      {
++        svuint32_t p = svld1ub_u32(pg, c + 32);
++        svuint32_t pb = svlsr_n_u32_x(pg, p, 1);
++        for (int blk = 0; blk < 2; ++blk) {
++          svuint32_t lo = svld1ub_u32(pg, c + 16 * blk);
++          svuint32_t hi = svld1ub_u32(pg, c + 16 * blk + 8);
++          int k = 2 * blk;
++          LANCE_EXDOT_RUN(svorr_u32_x(pg, svand_n_u32_x(pg, lo, 15), LANCE_TOP(p, k, 4)),
++                          svorr_u32_x(pg, svand_n_u32_x(pg, hi, 15), LANCE_TOP(pb, k, 4)),
++                          qq + 16 * k);
++          LANCE_EXDOT_RUN(svorr_u32_x(pg, svlsr_n_u32_x(pg, lo, 4), LANCE_TOP(p, k + 1, 4)),
++                          svorr_u32_x(pg, svlsr_n_u32_x(pg, hi, 4), LANCE_TOP(pb, k + 1, 4)),
++                          qq + 16 * (k + 1));
++        }
++      },
++      40, 64);
++  LANCE_EXDOT_EPILOGUE;
++}
++#undef LANCE_U23_GROUP
++#undef LANCE_TOP
++#undef LANCE_EXDOT_PROLOGUE
++#undef LANCE_EXDOT_RUN
++#undef LANCE_EXDOT_GROUPS
++#undef LANCE_EXDOT_EPILOGUE
++
++// The calling thread's SVE vector length in bytes.
++size_t lance_sve_vector_bytes(void) { return svcntb(); }
+diff --git a/rust/lance-linalg/src/simd/sve_f32mm.c b/rust/lance-linalg/src/simd/sve_f32mm.c
+new file mode 100644
+index 0000000..60f895e
+--- /dev/null
++++ b/rust/lance-linalg/src/simd/sve_f32mm.c
+@@ -0,0 +1,76 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright The Lance Authors
++
++// SVE FP32 matrix-multiply (FMMLA, FEAT_F32MM) dot-product blocks for blocked
++// nearest-centroid search. Built with -march=armv8.2-a+sve+f32mm; the Rust
++// caller checks the `f32mm` host capability.
++//
++// Inputs are "pair packed": rows 2p and 2p+1 of a matrix are interleaved in
++// two-float granules, so pair p is `kp = 2 * dim_even` floats laid out as
++//   r0[0] r0[1] r1[0] r1[1] | r0[2] r0[3] r1[2] r1[3] | ...
++// and every 128-bit segment is a 2x2 block. FMMLA multiplies a 2x2 block of
++// rows by the transpose of a 2x2 block of centroids per segment and adds it to
++// a 2x2 accumulator, so a 256-bit FMMLA performs 16 multiply-adds. Summing the
++// segments of an accumulator gives the 2x2 tile of dot products.
++
++#include <arm_sve.h>
++#include <stddef.h>
++#include <stdint.h>
++
++static inline void lance_store_pair_tile(svfloat32_t acc, float *out,
++                                         size_t ldo, size_t row, size_t col) {
++  float buf[64];  // up to 2048-bit vectors
++  svst1_f32(svptrue_b32(), buf, acc);
++  float s00 = 0, s01 = 0, s10 = 0, s11 = 0;
++  for (size_t seg = 0; seg < svcntw(); seg += 4) {
++    s00 += buf[seg];
++    s01 += buf[seg + 1];
++    s10 += buf[seg + 2];
++    s11 += buf[seg + 3];
++  }
++  out[row * ldo + col] = s00;
++  out[row * ldo + col + 1] = s01;
++  out[(row + 1) * ldo + col] = s10;
++  out[(row + 1) * ldo + col + 1] = s11;
++}
++
++// out[r * ldo + c] = <x[r], cent[c]> for r < 2 * row_pairs, c < 2 * col_pairs.
++// row_pairs must be a multiple of 4 and col_pairs a multiple of 2 (8 x 4
++// register tile); kp is a multiple of 4.
++void lance_dot_block_f32mm(const float *xp, size_t row_pairs, const float *cp,
++                           size_t col_pairs, size_t kp, float *out,
++                           size_t ldo) {
++  for (size_t rp = 0; rp < row_pairs; rp += 4) {
++    const float *x0 = xp + rp * kp, *x1 = x0 + kp, *x2 = x1 + kp,
++                *x3 = x2 + kp;
++    for (size_t cpi = 0; cpi < col_pairs; cpi += 2) {
++      const float *c0 = cp + cpi * kp, *c1 = c0 + kp;
++      svfloat32_t a00 = svdup_f32(0), a01 = svdup_f32(0), a10 = svdup_f32(0),
++                  a11 = svdup_f32(0), a20 = svdup_f32(0), a21 = svdup_f32(0),
++                  a30 = svdup_f32(0), a31 = svdup_f32(0);
++      for (size_t i = 0; i < kp; i += svcntw()) {
++        svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)kp);
++        svfloat32_t b0 = svld1_f32(pg, c0 + i), b1 = svld1_f32(pg, c1 + i);
++        svfloat32_t v0 = svld1_f32(pg, x0 + i), v1 = svld1_f32(pg, x1 + i);
++        a00 = svmmla_f32(a00, v0, b0);
++        a01 = svmmla_f32(a01, v0, b1);
++        a10 = svmmla_f32(a10, v1, b0);
++        a11 = svmmla_f32(a11, v1, b1);
++        svfloat32_t v2 = svld1_f32(pg, x2 + i), v3 = svld1_f32(pg, x3 + i);
++        a20 = svmmla_f32(a20, v2, b0);
++        a21 = svmmla_f32(a21, v2, b1);
++        a30 = svmmla_f32(a30, v3, b0);
++        a31 = svmmla_f32(a31, v3, b1);
++      }
++      size_t r = 2 * rp, c = 2 * cpi;
++      lance_store_pair_tile(a00, out, ldo, r, c);
++      lance_store_pair_tile(a01, out, ldo, r, c + 2);
++      lance_store_pair_tile(a10, out, ldo, r + 2, c);
++      lance_store_pair_tile(a11, out, ldo, r + 2, c + 2);
++      lance_store_pair_tile(a20, out, ldo, r + 4, c);
++      lance_store_pair_tile(a21, out, ldo, r + 4, c + 2);
++      lance_store_pair_tile(a30, out, ldo, r + 6, c);
++      lance_store_pair_tile(a31, out, ldo, r + 6, c + 2);
++    }
++  }
++}
+diff --git a/rust/lance-linalg/src/simd/vendor_kml.c b/rust/lance-linalg/src/simd/vendor_kml.c
+new file mode 100644
+index 0000000..80a9dcf
+--- /dev/null
++++ b/rust/lance-linalg/src/simd/vendor_kml.c
+@@ -0,0 +1,16 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright The Lance Authors
++
++// Benchmark adapter for Huawei's Kunpeng Math Library (KML_BLAS). Compiled
++// only when LANCE_KML_DIR is set, against the installed <kblas.h>, so the
++// CBLAS types and enum values come from the vendor header. The Rust side sees
++// plain C types only.
++
++#include <kblas.h>
++
++// c[m x n] = a[m x k] * b[n x k]^T, all row-major.
++void lance_kml_sgemm_nt(int m, int n, int k, const float *a, int lda,
++                        const float *b, int ldb, float *c, int ldc) {
++  cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, m, n, k, 1.0f, a, lda,
++              b, ldb, 0.0f, c, ldc);
++}
+diff --git a/rust/lance-linalg/src/simd/vendor_krl.c b/rust/lance-linalg/src/simd/vendor_krl.c
+new file mode 100644
+index 0000000..bc6125e
+--- /dev/null
++++ b/rust/lance-linalg/src/simd/vendor_krl.c
+@@ -0,0 +1,80 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright The Lance Authors
++
++// Benchmark adapter for Huawei's Kunpeng Retrieval Library (KRL). Compiled
++// only when LANCE_KRL_DIR is set, against the installed <krl.h>; the Rust side
++// sees plain C types only. Every function returns KRL's status (0 = success).
++
++#include <stddef.h>
++#include <stdint.h>
++#include <krl.h>
++
++// One query against ny contiguous base vectors, fp32 squared L2.
++int lance_krl_l2sqr_ny(float *dis, const float *x, const float *y, size_t ny,
++                       size_t d) {
++  return krl_L2sqr_ny(dis, x, y, ny, d, ny);
++}
++
++// fp32 (accu_level 3) squared-L2 handle over codes_num base vectors, one
++// query per call (num_base 1). codes_num must be divisible by blocksize.
++int lance_krl_create_l2_handle(void **handle, size_t blocksize,
++                               size_t codes_num, size_t dim,
++                               const float *base) {
++  KRLDistanceHandle *kdh = NULL;
++  int ret = krl_create_distance_handle(&kdh, 3, blocksize, codes_num, dim, 1,
++                                       1, (const uint8_t *)base,
++                                       codes_num * dim * sizeof(float));
++  *handle = kdh;
++  return ret;
++}
++
++int lance_krl_l2_with_handle(const void *handle, float *dis, size_t codes_num,
++                             const float *x, size_t dim) {
++  return krl_L2sqr_ny_with_handle((const KRLDistanceHandle *)handle, dis, x,
++                                  codes_num, dim);
++}
++
++void lance_krl_clean_handle(void *handle) {
++  KRLDistanceHandle *kdh = (KRLDistanceHandle *)handle;
++  krl_clean_distance_handle(&kdh);
++}
++
++// 4-bit FastScan over one block of 32 rows: nsq 16-entry u8 tables, codes as
++// nsq / 2 * 32 bytes, u16 sums into dis (room for 64). The documented
++// dis_size / lt_mask_size for bs32 disagree between the parameter table (64,
++// 2) and the sample (32, 1); both are tried once and the accepted pair kept.
++int lance_krl_fast_scan_bs32(int nsq, const uint8_t *codes, const uint8_t *lut,
++                             uint16_t *dis) {
++  static int variant = -1;
++  uint32_t mask[2] = {0, 0};
++  const size_t codes_size = (size_t)nsq / 2 * 32, lut_size = (size_t)nsq * 16;
++  if (variant < 0) {
++    int ret = krl_L2_table_lookup_fast_scan_bs32(
++        nsq, codes, lut, dis, 65535, mask, codes_size, lut_size, 32, 1);
++    if (ret == 0) {
++      variant = 0;
++      return 0;
++    }
++    ret = krl_L2_table_lookup_fast_scan_bs32(nsq, codes, lut, dis, 65535, mask,
++                                             codes_size, lut_size, 64, 2);
++    if (ret == 0) variant = 1;
++    return ret;
++  }
++  return variant == 0
++             ? krl_L2_table_lookup_fast_scan_bs32(nsq, codes, lut, dis, 65535,
++                                                  mask, codes_size, lut_size,
++                                                  32, 1)
++             : krl_L2_table_lookup_fast_scan_bs32(nsq, codes, lut, dis, 65535,
++                                                  mask, codes_size, lut_size,
++                                                  64, 2);
++}
++
++// Repack raw per-vector 4-bit codes (nsq nibbles per vector, two per byte)
++// into KRL's FastScan block layout.
++int lance_krl_pack_codes_4b(const uint8_t *codes, size_t ncode, size_t nsq,
++                            uint8_t *blocks, size_t batchsize) {
++  size_t blocks_size = (ncode + batchsize - 1) / batchsize * batchsize *
++                       ((nsq + 1) / 2);
++  return krl_pack_codes_4b(codes, ncode, nsq, blocks, batchsize, 0,
++                           ncode * nsq / 2, blocks_size);
++}
+-- 
+2.53.0
+
